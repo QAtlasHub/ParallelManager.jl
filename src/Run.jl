@@ -23,15 +23,17 @@ Execution options for [`run!`](@ref).
 
 # Fields
 
-- `workers::Symbol = :auto` — reserved for future dispatch. Currently
-  [`run!`](@ref) iterates sequentially and relies on the caller having
-  already invoked [`init_workers!`](@ref) as needed.
+- `workers::Symbol = :auto` — dispatch mode. `:auto` fans out over the
+  Distributed `WorkerPool(workers())` via `pmap` when `nprocs() > 1`, and runs
+  sequentially otherwise. `:sequential` forces the sequential path even when
+  worker processes are present (useful for debugging a serialization issue).
 - `max_attempts::Int = 3` — per-key retry budget. Set to `1` to disable
   retry (a failed `work_fn` is logged as `:error` instead of `:gave_up`).
-- `stale_after::Float64 = 600.0` — seconds before another master can
-  reclaim a held lock as stale. Passed through to [`KeyLock`](@ref).
-- `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat
-  task refreshes its `heartbeat` file. Must be `<` `stale_after`.
+- `stale_after::Float64 = 600.0` — seconds before another master can reclaim a
+  held lock as stale. Passed through to `DataVault.acquire_running!`.
+- `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat task
+  refreshes DataVault's `.running` file. Enforced to be `<` `stale_after`
+  (otherwise a live holder's lock could be reclaimed mid-work).
 - `stop_flag::Union{String,Nothing} = nothing` — path to a sentinel file.
   When `isfile(stop_flag)` becomes true, [`run!`](@ref) and
   [`run_loop!`](@ref) stop dispatching new keys and return early. This is
@@ -62,6 +64,18 @@ function RunOpts(;
     heartbeat_interval::Real=60.0,
     stop_flag::Union{String,Nothing}=nothing,
 )
+    workers in (:auto, :sequential) || throw(
+        ArgumentError(
+            "RunOpts: workers must be :auto or :sequential, got $(repr(workers))"
+        ),
+    )
+    heartbeat_interval < stale_after || throw(
+        ArgumentError(
+            "RunOpts: heartbeat_interval ($heartbeat_interval) must be < " *
+            "stale_after ($stale_after), else a live holder's lock can be " *
+            "reclaimed mid-work.",
+        ),
+    )
     return RunOpts(
         workers, max_attempts, Float64(stale_after), Float64(heartbeat_interval), stop_flag
     )
@@ -126,7 +140,7 @@ If `nprocs() > 1` (i.e. `init_workers!(mode=:distributed|:slurm)` has added
 worker processes), `run!` automatically fans out over the Distributed
 `WorkerPool(workers())` via `pmap`.  Each worker runs the per-key
 lock-acquire → `work_fn` → `DataVault.save!` → `mark_done!` pipeline
-independently.  All filesystem operations (lock mkdir, atomic JLD2 write,
+independently.  All filesystem operations (the `.running` lock, atomic JLD2 write,
 JSONL event log) are already NFS-safe, so concurrent workers inside one
 master are structurally consistent with multi-master operation.
 
@@ -140,7 +154,7 @@ valid in three modes:
 
 Multi-master locking (several separate julia processes writing to the
 same vault) continues to work underneath either path because the lock
-layer uses `mkdir` / atomic `rename` only.
+layer (DataVault's `.running`) uses POSIX `link()` / atomic `rename` only.
 """
 function run!(
     work_fn::Function, vault::Vault, keys::AbstractVector{DataKey}; opts::RunOpts=RunOpts()
@@ -160,9 +174,9 @@ function run!(
 
     log_event(log, :stage_start; stage=stage, total=length(keys), todo=length(todo))
 
-    # Dispatch strategy: use pmap when Distributed workers are present,
-    # otherwise the current sequential loop.
-    outcomes = if nprocs() > 1
+    # Dispatch strategy: pmap when Distributed workers are present (unless the
+    # caller forced `workers=:sequential`), otherwise the sequential loop.
+    outcomes = if opts.workers !== :sequential && nprocs() > 1
         _run_pmap!(work_fn, vault, todo, stage, log, opts)
     else
         _run_sequential!(work_fn, vault, todo, stage, log, opts)
@@ -276,7 +290,16 @@ function _run_one_with_lock!(
     # the stop signal thread-safe; a short sleep tick keeps finally
     # cleanup responsive (the earlier fixed 60-s sleep would block the
     # whole shutdown until the next heartbeat tick).
+    # `lost[]` is raised by the heartbeat task if it observes that a sibling
+    # reclaimed our lock (we stalled past `stale_after`). `_run_one_with_retry!`
+    # checks it before `save!`, and the `finally` below skips `clear_running!`
+    # when lost, so we neither commit on top of nor delete the lock now owned by
+    # the reclaiming master. Detection is BEST-EFFORT: `refresh_running!` is
+    # existence-based, so a reclaim is reliably caught only via stale-reclaim or
+    # the brief window the lock file is absent. A fully race-free guarantee needs
+    # owner-stamped locks in DataVault (see PR notes).
     hb_stop = Threads.Atomic{Bool}(false)
+    lost = Threads.Atomic{Bool}(false)
     hb_task = Threads.@spawn begin
         tick = 0.1
         elapsed = 0.0
@@ -285,25 +308,38 @@ function _run_one_with_lock!(
             hb_stop[] && break
             elapsed += tick
             if elapsed >= opts.heartbeat_interval
-                DataVault.refresh_running!(vault, key)
+                # A `false` return (sibling reclaimed) OR a throw (un-refreshable
+                # lock, e.g. NFS hiccup) both mean "treat as lost": stop
+                # heartbeating and signal it, rather than silently dying.
+                alive = try
+                    DataVault.refresh_running!(vault, key)
+                catch
+                    false
+                end
+                if !alive
+                    lost[] = true
+                    break
+                end
                 elapsed = 0.0
             end
         end
     end
 
     outcome = try
-        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts)
+        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, lost)
     finally
         hb_stop[] = true
         try
             wait(hb_task)
         catch
         end
-        # On `:ok` `mark_done!` already removed `.running`; on any
-        # other outcome, release explicitly so the key is immediately
-        # retriable by a sibling master without waiting for
-        # `stale_after` to elapse.  `clear_running!` is idempotent.
-        DataVault.clear_running!(vault, key)
+        # Release the lock so the key is immediately retriable by a sibling
+        # without waiting for `stale_after` — BUT NOT if we lost it. When
+        # `lost[]`, the `.running` file is now the RECLAIMING master's, and
+        # `clear_running!` is owner-blind (`isfile && rm`), so clearing it would
+        # delete THEIR lock and re-open double-execution. On `:ok`, `mark_done!`
+        # already removed our `.running`; `clear_running!` is otherwise idempotent.
+        lost[] || DataVault.clear_running!(vault, key)
     end
 
     return (key, outcome)
@@ -342,7 +378,9 @@ Failures inside `work_fn` are already caught by `_run_one_with_retry!`
 and turned into `(key, :gave_up)` / `(key, :error)`; we additionally set
 `pmap`'s `on_error = identity` so an unexpected thrown exception bubbles
 up as an `Exception` value in the outcomes vector rather than bringing
-down the whole fan-out, and we log + convert those to `:error`.
+down the whole fan-out, and we log + convert those to `:error`. A worker
+that *dies* mid-key (`ProcessExitedException`, e.g. SLURM preemption) is
+re-dispatched to a live worker via `retry_check`.
 """
 function _run_pmap!(
     work_fn::Function,
@@ -353,7 +391,16 @@ function _run_pmap!(
     opts::RunOpts,
 )
     pool = WorkerPool(workers())
-    raw = pmap(pool, todo; on_error=identity) do key
+    # `retry_check` re-dispatches a key whose worker DIED
+    # (`ProcessExitedException`) to a live worker; `work_fn` errors are handled
+    # inside `_run_one_with_lock!` and never escape, so they are not retried.
+    raw = pmap(
+        pool,
+        todo;
+        on_error=identity,
+        retry_delays=ExponentialBackOff(; n=2),
+        retry_check=(s, e) -> (s, e isa ProcessExitedException),
+    ) do key
         return _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
     end
 
@@ -367,7 +414,7 @@ function _run_pmap!(
             # `pmap(; on_error = identity)` returns the exception value at
             # this slot.  Log it and mark the key as :error.
             kstr = canonical(todo[i])
-            err = sprint(showerror, item)
+            err = _short_err(item)
             log_event(log, :error; stage=stage, key=kstr, attempt=0, err=err)
             out[i] = (todo[i], :error)
         end
@@ -376,12 +423,14 @@ function _run_pmap!(
 end
 
 """
-    _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts) -> Symbol
+    _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, lost) -> Symbol
 
 Execute `work_fn(key)` up to `opts.max_attempts` times. Returns:
-  :ok       — payload saved and mark_done! called
-  :gave_up  — all attempts failed, final `:gave_up` event logged
-  :error    — single-attempt config (`max_attempts == 1`) that failed once
+  :ok        — payload saved and mark_done! called
+  :gave_up   — all attempts failed, final `:gave_up` event logged
+  :error     — single-attempt config (`max_attempts == 1`) that failed once
+  :lock_busy — `lost[]` was set (a sibling reclaimed our lock); the result is
+               discarded before `save!` so the reclaiming master's result wins
 """
 function _run_one_with_retry!(
     work_fn,
@@ -391,6 +440,7 @@ function _run_one_with_retry!(
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
+    lost::Threads.Atomic{Bool},
 )
     last_err = nothing
     for attempt in 1:opts.max_attempts
@@ -402,6 +452,12 @@ function _run_one_with_retry!(
                 "work_fn must return a Dict (got $(typeof(payload))). " *
                 "Wrap scalars as e.g. Dict(\"value\" => x).",
             )
+            if lost[]
+                # A sibling master reclaimed our lock while work_fn ran; it now
+                # owns this key. Discard our result rather than double-committing.
+                log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                return :lock_busy
+            end
             DataVault.save!(vault, key, payload)
             DataVault.mark_done!(vault, key)
             log_event(
@@ -409,7 +465,7 @@ function _run_one_with_retry!(
             )
             return :ok
         catch e
-            last_err = sprint(showerror, e)
+            last_err = _short_err(e)
             log_event(log, :error; stage=stage, key=kstr, attempt=attempt, err=last_err)
             if attempt < opts.max_attempts
                 log_event(log, :retry; stage=stage, key=kstr, next_attempt=attempt + 1)
@@ -421,6 +477,14 @@ function _run_one_with_retry!(
         log, :gave_up; stage=stage, key=kstr, attempts=opts.max_attempts, err=last_err
     )
     return opts.max_attempts == 1 ? :error : :gave_up
+end
+
+# Truncate a (potentially huge, e.g. full-stacktrace) error string so a single
+# JSONL event line stays under PIPE_BUF, preserving the O_APPEND cross-process
+# atomicity of the event log.
+function _short_err(e)::String
+    s = sprint(showerror, e)
+    return length(s) > 2000 ? string(first(s, 2000), " …[truncated]") : s
 end
 
 """

@@ -10,7 +10,7 @@ module-scope piece. This page explains how they fit together and why.
 │  your project (templateHPC or similar)          │
 ├─────────────────────────────────────────────────┤
 │  ParallelManager (this package)                 │
-│  init_workers! / run! / Manifest / KeyLock /    │
+│  init_workers! / run! / Manifest /              │
 │  EventLog / AtomicIO                            │
 ├─────────────────────┬───────────────────────────┤
 │  DataVault          │  ParamIO                  │
@@ -49,7 +49,7 @@ and owns the coordination story separately.
 | [`src/AtomicIO.jl`](https://github.com/sotashimozono/ParallelManager.jl/blob/main/src/AtomicIO.jl)   | `atomic_write` / `atomic_touch` — tmp + fsync + POSIX rename, NFS-safe                               |
 | [`src/EventLog.jl`](https://github.com/sotashimozono/ParallelManager.jl/blob/main/src/EventLog.jl)   | JSONL structured log; single-write atomic lines for multi-process append safety                     |
 | [`src/Manifest.jl`](https://github.com/sotashimozono/ParallelManager.jl/blob/main/src/Manifest.jl)   | Stage-level rollup of `canonical(key)` strings for O(1) early-skip                                   |
-| [`src/KeyLock.jl`](https://github.com/sotashimozono/ParallelManager.jl/blob/main/src/KeyLock.jl)     | `mkdir` advisory lock + heartbeat + stale reclaim                                                    |
+| _(per-key lock)_                                    | moved to DataVault's `.running` (`acquire_running!`, POSIX `link()`) as of v0.3; `Run.jl` calls into it                |
 | [`src/InitWorkers.jl`](https://github.com/sotashimozono/ParallelManager.jl/blob/main/src/InitWorkers.jl) | Unified `:auto` / `:sequential` / `:threads` / `:distributed` / `:slurm` bootstrap                   |
 | [`src/Run.jl`](https://github.com/sotashimozono/ParallelManager.jl/blob/main/src/Run.jl)             | [`run!(work_fn, vault, keys; opts)`](@ref ParallelManager.run!) facade                               |
 
@@ -57,8 +57,8 @@ and owns the coordination story separately.
 
 `ParamIO.canonical` returns a deterministic, order-independent,
 Julia-version-stable string form of a `DataKey`. `Manifest` uses it as
-the index key, and `KeyLock` uses it in the lock directory path, so both
-layers agree on the identity of each parameter point without touching
+the index key, and the per-key `.running` lock uses it as the lock identity,
+so both layers agree on the identity of each parameter point without touching
 filesystem encodings.
 
 ## The `run!` pipeline
@@ -72,14 +72,14 @@ When you call `run!(work_fn, vault, keys)`, it does:
    and return.
 3. Emit `:stage_start`.
 4. For each key in `todo`:
-   - Acquire a [`KeyLock`](@ref ParallelManager.KeyLock) under
-     `vault.outdir/locks/...`. If another master has it, emit `:lock_busy`
-     and move on.
+   - Acquire the per-key lock via `DataVault.acquire_running!` (atomic on
+     NFS, POSIX `link()`). If another master holds a fresh `.running`,
+     emit `:lock_busy` and move on.
    - Re-check `DataVault.is_done(vault, key)` **after** acquiring the lock
      — another master may have finished this key between our manifest
      read and lock acquisition.
-   - `DataVault.mark_running!(vault, key)`, then call `work_fn(key)` up
-     to `opts.max_attempts` times. On success, `DataVault.save!` +
+   - Call `work_fn(key)` up to `opts.max_attempts` times, with a heartbeat
+     task refreshing `.running`. On success, `DataVault.save!` +
      `DataVault.mark_done!` + `Manifest.add_complete!`.
 5. `save_manifest(manifest)`.
 6. Emit `:stage_done` and return the aggregate counts.
@@ -93,7 +93,7 @@ master A:  acquire(K1)  work(K1)  release(K1)  acquire(K2)  busy → next  acqui
 master B:                                      acquire(K2)  work(K2)  release(K2)  busy → next ...
 ```
 
-Both masters iterate the same `todo`. `mkdir`-based locking ensures only
+Both masters iterate the same `todo`. The `.running` (POSIX `link()`) lock ensures only
 one enters `work_fn` for any given key at any time. A master that tries
 to lock a key another master already owns simply logs `:lock_busy` and
 moves on — no blocking, no waiting, no central queue.
