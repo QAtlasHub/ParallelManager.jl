@@ -54,9 +54,16 @@ end
     with_vault_l() do v, outdir
         keys = allk(v)
         work_fn = k -> (sleep(0.02); Dict{String,Any}("x" => 1))
+        # :lock_busy is a :debug event — opt into it via log_level=:debug to assert it.
         tasks = [
-            Threads.@spawn(run!(work_fn, v, keys; opts=RunOpts(heartbeat_interval=10.0)))
-            for _ in 1:4
+            Threads.@spawn(
+                run!(
+                    work_fn,
+                    v,
+                    keys;
+                    opts=RunOpts(; heartbeat_interval=10.0, log_level=:debug),
+                )
+            ) for _ in 1:4
         ]
         foreach(wait, tasks)
 
