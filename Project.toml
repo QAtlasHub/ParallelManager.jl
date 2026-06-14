@@ -19,7 +19,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [sources]
 DataVault = {rev = "main", url = "https://github.com/sotashimozono/DataVault.jl.git"}
-ParamIO = {rev = "feat/canonical", url = "https://github.com/sotashimozono/ParamIO.jl.git"}
+ParamIO = {rev = "main", url = "https://github.com/sotashimozono/ParamIO.jl.git"}
 
 [compat]
 DataVault = "0.7"
