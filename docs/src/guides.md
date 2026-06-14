@@ -42,7 +42,7 @@ done
 wait
 ```
 
-[`KeyLock`](@ref ParallelManager.KeyLock) arbitrates. Expect `:lock_busy`
+The per-key `.running` lock arbitrates. Expect `:lock_busy`
 events in proportion to contention. Eventually every key is done,
 regardless of which master happened to win each race.
 

@@ -102,22 +102,24 @@ julia --project --threads=8 run.jl
 ```
 
 `init_workers!(mode=:auto)` detects `Threads.nthreads() > 1` and returns
-`:threads`; the caller's own `Threads.@threads` loop (if any) is all you
-need — `ParallelManager.run!` itself iterates sequentially, so parallelism
-is either "multi-thread inside one `work_fn`" or "multi-master":
+`:threads`. For process-level parallelism, `run!` automatically fans out over
+Distributed workers via `pmap` when `nprocs() > 1` (use
+`init_workers!(mode=:distributed|:slurm)`); with only the master it runs
+sequentially. Several independent masters can also share one vault:
 
 ```bash
 # Master A
 julia --project run.jl &
 
-# Master B, same vault, same time — KeyLock arbitrates
+# Master B, same vault, same time — the .running lock arbitrates
 julia --project run.jl &
 
 wait
 ```
 
-Both masters will hit the same vault, `KeyLock` prevents double execution,
-and events from both processes interleave safely in `out/events.jsonl`.
+Both masters will hit the same vault, the per-key `.running` lock (DataVault's
+`acquire_running!`) prevents double execution, and events from both processes
+interleave safely in `out/events.jsonl`.
 
 ## SLURM
 

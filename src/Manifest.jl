@@ -43,7 +43,7 @@ rehydrates to a `Set{String}` for O(1) lookup.
 - **Corrupt file = empty.** If a manifest file exists but cannot be parsed
   by JLD2, [`load_manifest`](@ref) returns an empty `Manifest`. The worst
   outcome is re-running already-complete keys, which is idempotent thanks
-  to [`KeyLock`](@ref) and the `is_done` re-check in [`run!`](@ref).
+  to the per-key `.running` lock and the `is_done` re-check in [`run!`](@ref).
 
 # Typical use from inside `run!`
 
@@ -88,7 +88,7 @@ Read `manifest.jld2` if present; otherwise return an empty [`Manifest`](@ref).
 
 A corrupted manifest (any `JLD2.load` failure) is treated as empty. This
 prefers making progress over refusing to run — the runtime's `is_done`
-re-check inside [`KeyLock`](@ref) makes accidental re-processing harmless.
+re-check after lock-acquire makes accidental re-processing harmless.
 
 The second form is a convenience defined in `Run.jl` that derives
 `(root, stage)` from a `DataVault.Vault` (see [`manifest_root`](@ref)).
@@ -104,7 +104,7 @@ function load_manifest(root::AbstractString, stage::Symbol)::Manifest
         return Manifest(stage, String(root), Set{String}(items))
     catch
         # Treat corrupted manifest as empty — worst case we re-run some keys,
-        # which the KeyLock + is_done re-check makes safe.
+        # which the lock-acquire + is_done re-check makes safe.
         return Manifest(stage, String(root))
     end
 end
@@ -186,7 +186,7 @@ each master would overwrite the others' newly completed keys.
 There is a small TOCTOU window between the `load_manifest` and the
 `save_manifest`; in the worst case a concurrent saver's keys are not
 included in this write, but they will be re-processed on the next
-invocation (safe due to `is_done` re-check inside [`KeyLock`](@ref)).
+invocation (safe due to the `is_done` re-check after lock-acquire).
 """
 function merge_and_save_manifest!(m::Manifest)
     on_disk = load_manifest(m.root, m.stage)

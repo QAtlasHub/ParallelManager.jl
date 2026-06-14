@@ -18,7 +18,7 @@ Depth = 2
 ## Highlights
 
 - **Multi-master safe** — several `julia` processes can hit the same vault
-  root without double-executing any key (mkdir-based advisory lock).
+  root without double-executing any key (DataVault `.running` advisory lock).
 - **Crash recovery** — `kill -9` a master mid-run and the next `run!` picks
   up where it left off via heartbeat-based stale lock reclaim.
 - **Early skip** — full-done re-runs take O(1) filesystem operations
@@ -56,8 +56,8 @@ exits in milliseconds regardless of `length(keys)`.
 | :--- | :--- |
 | `.done` files rescanned every job (3600 files, ~10 min) | [`Manifest`](@ref ParallelManager.Manifest) rollup, one JLD2 read |
 | 300 MB of per-item `println` logs | [`EventLog`](@ref ParallelManager.EventLog) (JSONL); per-item `println` is not part of the API |
-| Killed samples silently wedge the queue | Heartbeat + [`is_stale`](@ref ParallelManager.is_stale) + [`reclaim!`](@ref ParallelManager.reclaim!) auto-recover |
-| Multiple masters double-execute the same key | [`KeyLock`](@ref ParallelManager.KeyLock) (`mkdir` advisory) + post-lock `is_done` re-check |
+| Killed samples silently wedge the queue | Heartbeat + stale-lock reclaim (DataVault `.running`) auto-recover |
+| Multiple masters double-execute the same key | Per-key `.running` advisory lock (`acquire_running!`) + post-lock `is_done` re-check |
 | Half-written JLD2 files after crash | [`atomic_write`](@ref ParallelManager.atomic_write) (tmp + fsync + rename) |
 | Every project reinvents SLURM / Distributed bootstrap | [`init_workers!`](@ref ParallelManager.init_workers!)`(mode=:auto)` |
 

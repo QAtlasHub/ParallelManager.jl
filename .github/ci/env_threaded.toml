@@ -3,4 +3,4 @@
 mode = "threaded"
 n_workers = 0
 n_masters = 4
-test_dirs = ["atomicio", "eventlog", "manifest", "keylock", "init_workers", "run"]
+test_dirs = ["atomicio", "eventlog", "manifest", "init_workers", "run"]

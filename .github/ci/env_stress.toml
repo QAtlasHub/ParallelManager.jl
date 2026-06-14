@@ -3,4 +3,4 @@
 mode = "threaded"
 n_workers = 0
 n_masters = 10
-test_dirs = ["run", "keylock"]
+test_dirs = ["run"]

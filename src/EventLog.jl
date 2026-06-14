@@ -37,7 +37,8 @@ one `write(io, line)` call to stay within that guarantee.
 | `stage_done`    | once at the bottom of `run!` when `todo` was non-empty            |
 | `key_start`     | before each `work_fn(key)` attempt (includes `attempt` field)     |
 | `key_done`      | after a successful `work_fn(key)` (includes `secs`, `attempt`)    |
-| `lock_busy`     | `KeyLock.try_acquire` returned `false`                            |
+| `lock_busy`     | another master holds the `.running` lock (acquire = `:busy`)      |
+| `lock_lost`     | our lock was reclaimed mid-work; result discarded (no double-run) |
 | `lock_reclaimed`| (reserved, not currently emitted)                                 |
 | `error`         | `work_fn` threw on this attempt                                   |
 | `retry`         | another attempt will follow                                       |

@@ -27,20 +27,6 @@ ParallelManager.todo_keys
 ParallelManager.manifest_root
 ```
 
-## KeyLock
-
-```@docs
-ParallelManager.KeyLock
-ParallelManager.try_acquire
-ParallelManager.release!
-ParallelManager.with_key_lock
-ParallelManager.touch_heartbeat
-ParallelManager.is_stale
-ParallelManager.reclaim!
-ParallelManager.holder_path
-ParallelManager.heartbeat_path
-```
-
 ## InitWorkers
 
 ```@docs
