@@ -45,8 +45,11 @@ one `write(io, line)` call to stay within that guarantee.
 | `gave_up`       | all `max_attempts` attempts exhausted                             |
 | `skip_complete` | full-done early exit (manifest had every key)                     |
 
-Downstream analysis (`jq`, DataFrame-based) can filter and aggregate over
-these kinds without ever parsing freeform text.
+`:key_start` and `:lock_busy` are emitted at `:debug` level and are suppressed
+unless the `EventLog` is created with `min_level=:debug` (see `RunOpts.log_level`);
+their totals still appear in `:stage_done`. Downstream analysis (`jq`,
+DataFrame-based) can filter and aggregate over these kinds without ever parsing
+freeform text.
 
 # Example
 
@@ -60,9 +63,28 @@ log_event(log, :stage_done; stage=:phase1, done=3600, err=0)
 struct EventLog
     path::String
     lock::ReentrantLock
+    min_level::Int
 end
 
-EventLog(path::AbstractString) = EventLog(String(path), ReentrantLock())
+function EventLog(path::AbstractString; min_level::Symbol=:info)
+    return EventLog(String(path), ReentrantLock(), _level_value(min_level))
+end
+
+# Severity ladder (à la Julia logging). Events below an `EventLog`'s `min_level`
+# are dropped — used to keep high-churn `:debug` events (per-key `:lock_busy`,
+# `:key_start`) out of the log by default while preserving the aggregate counts
+# carried in `:stage_done`.
+function _level_value(l::Symbol)::Int
+    l === :debug && return 10
+    l === :info && return 20
+    l === :warn && return 30
+    l === :error && return 40
+    throw(
+        ArgumentError(
+            "EventLog: unknown level $(repr(l)) (use :debug/:info/:warn/:error)"
+        ),
+    )
+end
 
 """
     log_event(log, kind; kwargs...)
@@ -88,7 +110,10 @@ produces one line like:
 
 Returns `nothing`.
 """
-function log_event(log::EventLog, kind::Symbol; kwargs...)
+function log_event(log::EventLog, kind::Symbol; level::Symbol=:info, kwargs...)
+    # Drop events below the log's threshold. `level` is consumed here (a filter
+    # decision); it is NOT written into the JSON — the `kind` already implies it.
+    _level_value(level) < log.min_level && return nothing
     rec = (; ts=string(now()), kind=String(kind), kwargs...)
     # Build the full line with newline so a single `write` is one atomic
     # append on POSIX (given `O_APPEND` and size < PIPE_BUF).

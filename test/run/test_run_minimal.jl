@@ -50,7 +50,8 @@ end
         kinds = [JSON3.read(l).kind for l in lines]
         @test "stage_start" in kinds
         @test "stage_done" in kinds
-        @test count(==("key_start"), kinds) == length(keys)
+        # key_start is :debug — suppressed by default; key_done (:info) is the per-key signal
+        @test count(==("key_start"), kinds) == 0
         @test count(==("key_done"), kinds) == length(keys)
     end
 end

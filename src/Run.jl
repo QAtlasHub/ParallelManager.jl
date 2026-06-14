@@ -34,6 +34,11 @@ Execution options for [`run!`](@ref).
 - `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat task
   refreshes DataVault's `.running` file. Enforced to be `<` `stale_after`
   (otherwise a live holder's lock could be reclaimed mid-work).
+- `log_level::Symbol = :info` — event-log verbosity. At `:info` (default) the
+  high-churn per-key `:lock_busy` and `:key_start` events are suppressed (their
+  totals still ride in the `:stage_done` summary), keeping the JSONL log
+  O(computed keys) instead of O(masters × keys) under multi-master contention.
+  Set `:debug` to log them (e.g. to debug lock contention).
 - `stop_flag::Union{String,Nothing} = nothing` — path to a sentinel file.
   When `isfile(stop_flag)` becomes true, [`run!`](@ref) and
   [`run_loop!`](@ref) stop dispatching new keys and return early. This is
@@ -55,6 +60,7 @@ struct RunOpts
     stale_after::Float64
     heartbeat_interval::Float64
     stop_flag::Union{String,Nothing}
+    log_level::Symbol
 end
 
 function RunOpts(;
@@ -63,10 +69,16 @@ function RunOpts(;
     stale_after::Real=600.0,
     heartbeat_interval::Real=60.0,
     stop_flag::Union{String,Nothing}=nothing,
+    log_level::Symbol=:info,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
             "RunOpts: workers must be :auto or :sequential, got $(repr(workers))"
+        ),
+    )
+    log_level in (:debug, :info, :warn, :error) || throw(
+        ArgumentError(
+            "RunOpts: log_level must be :debug/:info/:warn/:error, got $(repr(log_level))"
         ),
     )
     heartbeat_interval < stale_after || throw(
@@ -77,7 +89,12 @@ function RunOpts(;
         ),
     )
     return RunOpts(
-        workers, max_attempts, Float64(stale_after), Float64(heartbeat_interval), stop_flag
+        workers,
+        max_attempts,
+        Float64(stale_after),
+        Float64(heartbeat_interval),
+        stop_flag,
+        log_level,
     )
 end
 
@@ -161,7 +178,7 @@ function run!(
 )
     stage = Symbol(vault.run)
     log_name = "events_$(gethostname())_$(getpid()).jsonl"
-    log = EventLog(joinpath(vault.outdir, log_name))
+    log = EventLog(joinpath(vault.outdir, log_name); min_level=opts.log_level)
 
     # Early skip: load manifest, subtract completed keys
     m = load_manifest(vault)
@@ -272,7 +289,7 @@ function _run_one_with_lock!(
     # `:ok` / `:reclaimed`; the losers see `:busy`.
     acq = DataVault.acquire_running!(vault, key; stale_after=opts.stale_after)
     if acq === :busy
-        log_event(log, :lock_busy; stage=stage, key=kstr)
+        log_event(log, :lock_busy; level=:debug, stage=stage, key=kstr)
         return (key, :lock_busy)
     end
     # acq ∈ (:ok, :reclaimed) — we own the lock.
@@ -444,7 +461,7 @@ function _run_one_with_retry!(
 )
     last_err = nothing
     for attempt in 1:opts.max_attempts
-        log_event(log, :key_start; stage=stage, key=kstr, attempt=attempt)
+        log_event(log, :key_start; level=:debug, stage=stage, key=kstr, attempt=attempt)
         t0 = time()
         try
             payload = work_fn(key)
