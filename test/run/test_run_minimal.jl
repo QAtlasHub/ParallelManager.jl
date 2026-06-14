@@ -5,7 +5,7 @@ const FIXTURE_CFG = joinpath(@__DIR__, "fixtures", "study.toml")
 # Helper: read all lines from per-master event log files in a directory
 function _read_event_lines(outdir)
     logs = filter(f -> startswith(f, "events_") && endswith(f, ".jsonl"), readdir(outdir))
-    vcat([readlines(joinpath(outdir, f)) for f in logs]...)
+    return vcat([readlines(joinpath(outdir, f)) for f in logs]...)
 end
 
 function with_run_vault(f; run::AbstractString="phase1")
@@ -19,7 +19,7 @@ function with_run_vault(f; run::AbstractString="phase1")
 end
 
 function all_keys(v::DataVault.Vault)
-    ParamIO.expand(v.spec)
+    return ParamIO.expand(v.spec)
 end
 
 @testset "run! minimal: happy path" begin

@@ -4,7 +4,7 @@ const FIXTURE_CFG_M = joinpath(@__DIR__, "fixtures", "study.toml")
 
 function _read_event_lines_m(outdir)
     logs = filter(f -> startswith(f, "events_") && endswith(f, ".jsonl"), readdir(outdir))
-    vcat([readlines(joinpath(outdir, f)) for f in logs]...)
+    return vcat([readlines(joinpath(outdir, f)) for f in logs]...)
 end
 
 function with_vault_m(f; run::AbstractString="phase1")

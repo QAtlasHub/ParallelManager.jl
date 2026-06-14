@@ -74,7 +74,7 @@ function RunOpts(;
             "reclaimed mid-work.",
         ),
     )
-    RunOpts(
+    return RunOpts(
         workers, max_attempts, Float64(stale_after), Float64(heartbeat_interval), stop_flag
     )
 end
@@ -100,7 +100,7 @@ The layout is:
 Pure function; does not touch the filesystem.
 """
 function manifest_root(vault::Vault)
-    joinpath(vault.outdir, "manifest", vault.spec.study.project_name)
+    return joinpath(vault.outdir, "manifest", vault.spec.study.project_name)
 end
 
 """
@@ -386,7 +386,7 @@ function _run_pmap!(
         retry_delays=ExponentialBackOff(; n=2),
         retry_check=(s, e) -> (s, e isa ProcessExitedException),
     ) do key
-        _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
+        return _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
     end
 
     # Normalise any thrown exceptions back to (key, :error) tuples.

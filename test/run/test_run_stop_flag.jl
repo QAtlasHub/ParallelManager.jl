@@ -14,7 +14,7 @@ end
 
 function _read_event_lines_s(outdir)
     logs = filter(f -> startswith(f, "events_") && endswith(f, ".jsonl"), readdir(outdir))
-    vcat([readlines(joinpath(outdir, f)) for f in logs]...)
+    return vcat([readlines(joinpath(outdir, f)) for f in logs]...)
 end
 
 allk_s(v) = ParamIO.expand(v.spec)
