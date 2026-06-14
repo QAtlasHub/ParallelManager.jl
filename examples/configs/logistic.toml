@@ -1,0 +1,26 @@
+# Example config for the ParamIO → DataVault → ParallelManager stack.
+#
+# This single file is consumed by all three layers:
+#   ParamIO.load(this)   → ConfigSpec   (reads [study], [datavault], [[paramsets]])
+#   DataVault.Vault(this) → Vault        (reads [study] for project_name/outdir,
+#                                         [datavault] path_keys for directory names)
+#   ParallelManager.run! → uses the DataKeys ParamIO expands from it.
+
+[study]
+project_name  = "logistic"   # = the DataVault "study" name; top dir under data/
+total_samples = 3            # 3 initial conditions per r  ⇒  3 DataKeys per point
+outdir        = "out"        # default; overridden by --outdir kwarg or DATAVAULT_OUTDIR
+
+[datavault]
+# Which params go into the on-disk directory name + canonical key identity.
+# Use the DOTTED form "system.r" (group.leaf), matching the [paramsets.system] block.
+# Only `r` is swept and named; nothing else is needed in the path here.
+path_keys = ["system.r"]
+
+[[paramsets]]
+
+# A LIST value is a swept axis; a SCALAR value is fixed. Here only `r` is a list,
+# so expand() yields  length(r) × total_samples = 6 × 3 = 18 DataKeys.
+# In DataKey.params these become the dotted key "system.r".
+[paramsets.system]
+r = [2.8, 3.2, 3.5, 3.5699, 3.83, 4.0]   # period-1 → 2 → 4 → onset of chaos → chaos
