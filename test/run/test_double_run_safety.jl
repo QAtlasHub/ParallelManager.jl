@@ -25,7 +25,9 @@ end
     try
         v = DataVault.Vault(FIXTURE_CFG; run="phase1", outdir=outdir)
         keys = ParamIO.expand(v.spec)
-        r = run!(k -> Dict{String,Any}("ok" => 1), v, keys; opts=RunOpts(; workers=:sequential))
+        r = run!(
+            k -> Dict{String,Any}("ok" => 1), v, keys; opts=RunOpts(; workers=:sequential)
+        )
         @test r.done == length(keys)
     finally
         rm(outdir; recursive=true, force=true)
@@ -40,7 +42,7 @@ end
         lost = Threads.Atomic{Bool}(true)        # simulate: heartbeat saw a reclaim
         log = ParallelManager.EventLog(joinpath(outdir, "ev.jsonl"))
         ran = Ref(false)
-        wf = k -> (ran[] = true; Dict{String,Any}("x" => 1))
+        wf = k -> (ran[]=true; Dict{String,Any}("x" => 1))
         outcome = ParallelManager._run_one_with_retry!(
             wf, v, key, ParamIO.canonical(key), :phase1, log, RunOpts(), lost
         )
