@@ -23,9 +23,9 @@ include(joinpath(@__DIR__, "..", "src", "LogisticMap.jl"))
 using .LogisticMap
 
 const EXAMPLES = abspath(joinpath(@__DIR__, ".."))
-const CONFIG   = get(ARGS, 1, joinpath(EXAMPLES, "configs", "logistic.toml"))
+const CONFIG = get(ARGS, 1, joinpath(EXAMPLES, "configs", "logistic.toml"))
 # outdir precedence (DataVault resolves it): kwarg > ENV["DATAVAULT_OUTDIR"] > config.
-const OUTDIR   = get(ENV, "DATAVAULT_OUTDIR", joinpath(EXAMPLES, "out"))
+const OUTDIR = get(ENV, "DATAVAULT_OUTDIR", joinpath(EXAMPLES, "out"))
 
 # ── Layer 1 · ParamIO — parse the config and expand the sweep into DataKeys ──
 spec = ParamIO.load(CONFIG)
@@ -54,13 +54,13 @@ ParallelManager.init_workers!(; mode=:auto)
     work_fn depends ONLY on `key` (no closure over master-side globals), so the
     exact same function is correct under :sequential, :threads and :slurm. =#
 function work_fn(key::DataKey)
-    r  = Float64(key.params["system.r"])          # ← dotted key
+    r = Float64(key.params["system.r"])          # ← dotted key
     x0 = 0.1 + 0.13 * (key.sample - 1)            # per-sample initial condition
     return Dict{String,Any}(                       # ← RETURN the payload; do not save! it
-        "r"        => r,
-        "x0"       => x0,
+        "r" => r,
+        "x0" => x0,
         "lyapunov" => LogisticMap.lyapunov(r, x0),
-        "tail"     => LogisticMap.orbit_tail(r, x0),
+        "tail" => LogisticMap.orbit_tail(r, x0),
     )
 end
 

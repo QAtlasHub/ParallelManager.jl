@@ -52,7 +52,7 @@ function _fabricate_stale_running!(
     open(path, "w") do io
         println(io, "pid=", getpid())
         println(io, "started=", Dates.format(old_dt, "yyyy-mm-ddTHH:MM:SS"))
-        println(io, "heartbeat=", Dates.format(old_dt, "yyyy-mm-ddTHH:MM:SS"))
+        return println(io, "heartbeat=", Dates.format(old_dt, "yyyy-mm-ddTHH:MM:SS"))
     end
     return path
 end
@@ -111,9 +111,7 @@ end
         end
 
         work_fn = k -> Dict{String,Any}("sample" => k.sample)
-        opts = ParallelManager.RunOpts(;
-            stale_after=60.0, heartbeat_interval=5.0
-        )
+        opts = ParallelManager.RunOpts(; stale_after=60.0, heartbeat_interval=5.0)
         result = run!(work_fn, v, keys; opts=opts)
 
         @test result.done == length(keys)

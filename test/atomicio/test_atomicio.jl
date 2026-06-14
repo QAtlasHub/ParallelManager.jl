@@ -4,7 +4,7 @@ using ParallelManager, Test
     mktempdir() do dir
         path = joinpath(dir, "sub", "data.txt")
         atomic_write(path) do io
-            write(io, "hello")
+            return write(io, "hello")
         end
         @test isfile(path)
         @test read(path, String) == "hello"
@@ -28,7 +28,7 @@ end
         atomic_write(io -> write(io, "original"), path)
         @test_throws ErrorException atomic_write(path) do io
             write(io, "partial")
-            error("boom")
+            return error("boom")
         end
         @test read(path, String) == "original"
         # tmp cleaned up
@@ -41,7 +41,7 @@ end
         path = joinpath(dir, "data.txt")
         @test_throws ErrorException atomic_write(path) do io
             write(io, "partial")
-            error("boom")
+            return error("boom")
         end
         @test !isfile(path)
     end
@@ -62,7 +62,7 @@ end
         N = 20
         Threads.@threads for i in 1:N
             atomic_write(path) do io
-                write(io, string("writer-", i))
+                return write(io, string("writer-", i))
             end
         end
         @test isfile(path)

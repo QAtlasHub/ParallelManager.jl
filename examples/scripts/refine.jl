@@ -18,8 +18,8 @@
 using ParamIO, DataVault, ParallelManager
 
 const EXAMPLES = abspath(joinpath(@__DIR__, ".."))
-const CONFIG   = get(ARGS, 1, joinpath(EXAMPLES, "configs", "logistic.toml"))
-const OUTDIR   = get(ENV, "DATAVAULT_OUTDIR", joinpath(EXAMPLES, "out"))
+const CONFIG = get(ARGS, 1, joinpath(EXAMPLES, "configs", "logistic.toml"))
+const OUTDIR = get(ENV, "DATAVAULT_OUTDIR", joinpath(EXAMPLES, "out"))
 
 spec = ParamIO.load(CONFIG)
 keys = ParamIO.expand(spec)

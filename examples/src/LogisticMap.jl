@@ -46,7 +46,9 @@ end
 The last `ntail` iterates after discarding the transient — the attractor
 itself (a fixed point, a 2/4/8-cycle, or a chaotic band).
 """
-function orbit_tail(r::Float64, x0::Float64; transient::Int=1000, ntail::Int=64)::Vector{Float64}
+function orbit_tail(
+    r::Float64, x0::Float64; transient::Int=1000, ntail::Int=64
+)::Vector{Float64}
     x = x0
     for _ in 1:transient
         x = logistic_step(r, x)

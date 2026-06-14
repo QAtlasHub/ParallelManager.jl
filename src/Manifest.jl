@@ -77,7 +77,7 @@ Return the conventional on-disk location `"\$root/\$stage/manifest.jld2"`.
 Pure function; does not touch the filesystem.
 """
 function manifest_path(root::AbstractString, stage::Symbol)
-    joinpath(String(root), String(stage), "manifest.jld2")
+    return joinpath(String(root), String(stage), "manifest.jld2")
 end
 
 """
@@ -172,7 +172,7 @@ Cost is O(length(keys)) hash lookups — independent of filesystem state.
 On 3600 keys this takes ~6–12 ms in the benchmark.
 """
 function todo_keys(m::Manifest, keys::AbstractVector{DataKey})
-    [k for k in keys if !is_complete(m, k)]
+    return [k for k in keys if !is_complete(m, k)]
 end
 
 """
@@ -191,7 +191,7 @@ invocation (safe due to `is_done` re-check inside [`KeyLock`](@ref)).
 function merge_and_save_manifest!(m::Manifest)
     on_disk = load_manifest(m.root, m.stage)
     union!(m.complete, on_disk.complete)
-    save_manifest(m)
+    return save_manifest(m)
 end
 
 export Manifest, manifest_path, load_manifest, save_manifest, merge_and_save_manifest!

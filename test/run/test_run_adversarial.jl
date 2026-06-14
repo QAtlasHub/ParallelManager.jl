@@ -60,7 +60,7 @@ allk_a(v) = ParamIO.expand(v.spec)
         # break). Either way, fewer done+stop than length means some were
         # silently un-processed.
         @test counter[] == result.done  # work_fn only called for done keys
-        isfile(stop) && rm(stop; force=true)
+        return isfile(stop) && rm(stop; force=true)
     end
 end
 

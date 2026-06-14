@@ -62,7 +62,7 @@ function RunOpts(;
     heartbeat_interval::Real=60.0,
     stop_flag::Union{String,Nothing}=nothing,
 )
-    RunOpts(
+    return RunOpts(
         workers, max_attempts, Float64(stale_after), Float64(heartbeat_interval), stop_flag
     )
 end
@@ -88,7 +88,7 @@ The layout is:
 Pure function; does not touch the filesystem.
 """
 function manifest_root(vault::Vault)
-    joinpath(vault.outdir, "manifest", vault.spec.study.project_name)
+    return joinpath(vault.outdir, "manifest", vault.spec.study.project_name)
 end
 
 """
@@ -354,7 +354,7 @@ function _run_pmap!(
 )
     pool = WorkerPool(workers())
     raw = pmap(pool, todo; on_error=identity) do key
-        _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
+        return _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
     end
 
     # Normalise any thrown exceptions back to (key, :error) tuples.
