@@ -80,9 +80,7 @@ function _level_value(l::Symbol)::Int
     l === :warn && return 30
     l === :error && return 40
     throw(
-        ArgumentError(
-            "EventLog: unknown level $(repr(l)) (use :debug/:info/:warn/:error)"
-        ),
+        ArgumentError("EventLog: unknown level $(repr(l)) (use :debug/:info/:warn/:error)")
     )
 end
 

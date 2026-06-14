@@ -57,7 +57,12 @@ end
         # :lock_busy is a :debug event — opt into it via log_level=:debug to assert it.
         tasks = [
             Threads.@spawn(
-                run!(work_fn, v, keys; opts=RunOpts(; heartbeat_interval=10.0, log_level=:debug))
+                run!(
+                    work_fn,
+                    v,
+                    keys;
+                    opts=RunOpts(; heartbeat_interval=10.0, log_level=:debug),
+                )
             ) for _ in 1:4
         ]
         foreach(wait, tasks)

@@ -78,7 +78,7 @@ function RunOpts(;
     )
     log_level in (:debug, :info, :warn, :error) || throw(
         ArgumentError(
-            "RunOpts: log_level must be :debug/:info/:warn/:error, got $(repr(log_level))"
+            "RunOpts: log_level must be :debug/:info/:warn/:error, got $(repr(log_level))",
         ),
     )
     heartbeat_interval < stale_after || throw(
