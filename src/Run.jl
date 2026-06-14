@@ -288,9 +288,14 @@ function _run_one_with_lock!(
     # the stop signal thread-safe; a short sleep tick keeps finally
     # cleanup responsive (the earlier fixed 60-s sleep would block the
     # whole shutdown until the next heartbeat tick).
-    # `lost[]` is raised by the heartbeat task if a sibling master reclaims our
-    # lock (we stalled past `stale_after`); `_run_one_with_retry!` checks it
-    # before `save!` so we never commit on top of the master that now owns the key.
+    # `lost[]` is raised by the heartbeat task if it observes that a sibling
+    # reclaimed our lock (we stalled past `stale_after`). `_run_one_with_retry!`
+    # checks it before `save!`, and the `finally` below skips `clear_running!`
+    # when lost, so we neither commit on top of nor delete the lock now owned by
+    # the reclaiming master. Detection is BEST-EFFORT: `refresh_running!` is
+    # existence-based, so a reclaim is reliably caught only via stale-reclaim or
+    # the brief window the lock file is absent. A fully race-free guarantee needs
+    # owner-stamped locks in DataVault (see PR notes).
     hb_stop = Threads.Atomic{Bool}(false)
     lost = Threads.Atomic{Bool}(false)
     hb_task = Threads.@spawn begin
@@ -301,9 +306,15 @@ function _run_one_with_lock!(
             hb_stop[] && break
             elapsed += tick
             if elapsed >= opts.heartbeat_interval
-                # refresh_running! returns false once a sibling has reclaimed
-                # this key's lock — stop heartbeating and signal the loss.
-                if !DataVault.refresh_running!(vault, key)
+                # A `false` return (sibling reclaimed) OR a throw (un-refreshable
+                # lock, e.g. NFS hiccup) both mean "treat as lost": stop
+                # heartbeating and signal it, rather than silently dying.
+                alive = try
+                    DataVault.refresh_running!(vault, key)
+                catch
+                    false
+                end
+                if !alive
                     lost[] = true
                     break
                 end
@@ -320,11 +331,13 @@ function _run_one_with_lock!(
             wait(hb_task)
         catch
         end
-        # On `:ok` `mark_done!` already removed `.running`; on any
-        # other outcome, release explicitly so the key is immediately
-        # retriable by a sibling master without waiting for
-        # `stale_after` to elapse.  `clear_running!` is idempotent.
-        DataVault.clear_running!(vault, key)
+        # Release the lock so the key is immediately retriable by a sibling
+        # without waiting for `stale_after` — BUT NOT if we lost it. When
+        # `lost[]`, the `.running` file is now the RECLAIMING master's, and
+        # `clear_running!` is owner-blind (`isfile && rm`), so clearing it would
+        # delete THEIR lock and re-open double-execution. On `:ok`, `mark_done!`
+        # already removed our `.running`; `clear_running!` is otherwise idempotent.
+        lost[] || DataVault.clear_running!(vault, key)
     end
 
     return (key, outcome)
@@ -408,12 +421,14 @@ function _run_pmap!(
 end
 
 """
-    _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts) -> Symbol
+    _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, lost) -> Symbol
 
 Execute `work_fn(key)` up to `opts.max_attempts` times. Returns:
-  :ok       — payload saved and mark_done! called
-  :gave_up  — all attempts failed, final `:gave_up` event logged
-  :error    — single-attempt config (`max_attempts == 1`) that failed once
+  :ok        — payload saved and mark_done! called
+  :gave_up   — all attempts failed, final `:gave_up` event logged
+  :error     — single-attempt config (`max_attempts == 1`) that failed once
+  :lock_busy — `lost[]` was set (a sibling reclaimed our lock); the result is
+               discarded before `save!` so the reclaiming master's result wins
 """
 function _run_one_with_retry!(
     work_fn,

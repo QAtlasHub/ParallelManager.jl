@@ -52,6 +52,33 @@ end
     end
 end
 
+@testset "lost lock: finally must NOT clear a sibling's reclaimed .running" begin
+    outdir = mktempdir()
+    try
+        v = DataVault.Vault(FIXTURE_CFG; run="phase1", outdir=outdir)
+        key = ParamIO.expand(v.spec)[1]
+        # work_fn simulates a sibling reclaiming our lock mid-work: it removes
+        # our .running (so the heartbeat observes the loss), then re-creates one
+        # owned by "the sibling". `_run_one_with_lock!`'s `finally` must leave
+        # THAT file intact — clearing it would delete the reclaimer's live lock
+        # and re-open double-execution.
+        wf = function (k)
+            DataVault.clear_running!(v, key)        # sibling rm's our lock
+            sleep(0.3)                              # let the heartbeat observe absence
+            DataVault.acquire_running!(v, key)      # sibling acquires its own .running
+            return Dict{String,Any}("x" => 1)
+        end
+        opts = RunOpts(; heartbeat_interval=0.001, stale_after=600.0)
+        log = ParallelManager.EventLog(joinpath(outdir, "ev.jsonl"))
+        (_, outcome) = ParallelManager._run_one_with_lock!(wf, v, key, :phase1, log, opts)
+        @test outcome === :lock_busy            # we detected the loss and bailed
+        @test DataVault.is_running(v, key)      # the sibling's lock SURVIVES (not cleared)
+        @test !DataVault.is_done(v, key)        # and we did not commit
+    finally
+        rm(outdir; recursive=true, force=true)
+    end
+end
+
 @testset "error strings are truncated for the JSONL event log" begin
     s = ParallelManager._short_err(ErrorException("x"^5000))
     @test length(s) <= 2100
