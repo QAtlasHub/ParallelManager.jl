@@ -70,7 +70,7 @@ function init_workers!(;
             # inherit a generous handshake window.  Distributed reads
             # this env var at worker startup only.
             withenv("JULIA_WORKER_TIMEOUT" => string(worker_timeout)) do
-                addprocs(n_workers; exeflags="--project=$project")
+                return addprocs(n_workers; exeflags="--project=$project")
             end
         end
         _apply_blas(master_blas, worker_blas)
@@ -114,7 +114,7 @@ function init_workers!(;
                 mgr = SlurmClusterManager.SlurmManager(;
                     launch_timeout=Float64(launch_timeout)
                 )
-                addprocs(mgr; exeflags="--project=$project")
+                return addprocs(mgr; exeflags="--project=$project")
             end
         end
         _apply_blas(master_blas, worker_blas)

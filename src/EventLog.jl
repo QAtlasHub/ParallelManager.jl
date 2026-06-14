@@ -95,7 +95,7 @@ function log_event(log::EventLog, kind::Symbol; kwargs...)
     lock(log.lock) do
         mkpath(dirname(log.path))
         open(log.path, "a") do io
-            write(io, line)
+            return write(io, line)
         end
     end
     return nothing
@@ -112,7 +112,7 @@ collects and sorts all lines by their `ts` field for post-hoc analysis.
 """
 function merge_event_logs(dir::AbstractString; output::String="events_merged.jsonl")
     logs = filter(readdir(dir)) do f
-        startswith(f, "events_") && endswith(f, ".jsonl") && f != output
+        return startswith(f, "events_") && endswith(f, ".jsonl") && f != output
     end
     all_lines = String[]
     for f in logs
