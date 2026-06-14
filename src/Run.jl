@@ -65,7 +65,9 @@ function RunOpts(;
     stop_flag::Union{String,Nothing}=nothing,
 )
     workers in (:auto, :sequential) || throw(
-        ArgumentError("RunOpts: workers must be :auto or :sequential, got $(repr(workers))"),
+        ArgumentError(
+            "RunOpts: workers must be :auto or :sequential, got $(repr(workers))"
+        ),
     )
     heartbeat_interval < stale_after || throw(
         ArgumentError(
