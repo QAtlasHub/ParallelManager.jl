@@ -133,11 +133,19 @@ derives `(root, stage)` from a `DataVault.Vault`:
 load_manifest(vault::Vault) = load_manifest(manifest_root(vault), Symbol(vault.run))
 
 """
-    run!(work_fn, vault, keys; opts=RunOpts()) -> NamedTuple
+    run!(work_fn, vault, keys; opts=RunOpts(), load=nothing) -> NamedTuple
 
 Run `work_fn(key) -> Dict` for every `key` in `keys`, persisting through
 `vault`. Writes a structured JSONL event log at
 `joinpath(vault.outdir, "events.jsonl")`.
+
+`load` names the module(s) the **worker** processes need beyond the always-loaded seam
+(`ParamIO`/`DataVault`/`ParallelManager`) — typically the package or module that defines `work_fn`
+and the types it touches. Accepts a `Module`, `Symbol`, `String`, or a collection of them (e.g.
+`load=MyModel` or `load=[MyModel, Statistics]`). Under `:distributed`/`:slurm`, `run!` `using`s
+these in `Main` on every worker before fan-out, so a compute script no longer has to hand-roll the
+`for w in workers(); remotecall_fetch(…, :(using …)); end` broadcast. It is a no-op on the master
+(`nprocs() == 1`) and idempotent, so it is safe even when a project still broadcasts by hand.
 
 Early skip (todo 10): on startup a stage-level Manifest is loaded. Keys
 already in the manifest are skipped — when all keys are done, the second
@@ -174,7 +182,11 @@ same vault) continues to work underneath either path because the lock
 layer (DataVault's `.running`) uses POSIX `link()` / atomic `rename` only.
 """
 function run!(
-    work_fn::Function, vault::Vault, keys::AbstractVector{DataKey}; opts::RunOpts=RunOpts()
+    work_fn::Function,
+    vault::Vault,
+    keys::AbstractVector{DataKey};
+    opts::RunOpts=RunOpts(),
+    load=nothing,
 )
     stage = Symbol(vault.run)
     log_name = "events_$(gethostname())_$(getpid()).jsonl"
@@ -194,6 +206,14 @@ function run!(
     # Dispatch strategy: pmap when Distributed workers are present (unless the
     # caller forced `workers=:sequential`), otherwise the sequential loop.
     outcomes = if opts.workers !== :sequential && nprocs() > 1
+        # Ensure the seam packages (+ the user's work module(s) via `load=`) are loaded in `Main`
+        # on every worker before fan-out. `init_workers!` spawns workers with `--project` but loads
+        # no packages, so the first pmap task would otherwise die with a cryptic
+        # `KeyError: <Module> not found` (DataKey deserialization / the save! pipeline / work_fn).
+        # Idempotent, so it composes with a project that still broadcasts modules by hand.
+        _ensure_worker_modules(
+            vcat([:ParamIO, :DataVault, :ParallelManager], _worker_module_names(load))
+        )
         _run_pmap!(work_fn, vault, todo, stage, log, opts)
     else
         _run_sequential!(work_fn, vault, todo, stage, log, opts)
@@ -518,6 +538,9 @@ The loop exits when:
 
 Default parameters (`max_empty_rounds=3`, `idle_sleep=30.0`) are the
 battle-tested values from FiniteTemperature.jl.
+
+`load` is forwarded verbatim to every [`run!`](@ref) call (see its docstring) — name the work
+module(s) the workers need and the loop handles the per-round broadcast.
 """
 function run_loop!(
     work_fn::Function,
@@ -526,13 +549,14 @@ function run_loop!(
     opts::RunOpts=RunOpts(),
     max_empty_rounds::Int=3,
     idle_sleep::Float64=30.0,
+    load=nothing,
 )
     empty_count = 0
     while true
         if _is_stopped(opts)
             break
         end
-        result = run!(work_fn, vault, keys; opts=opts)
+        result = run!(work_fn, vault, keys; opts=opts, load=load)
         if result.done > 0
             empty_count = 0
             continue
