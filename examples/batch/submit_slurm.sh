@@ -21,6 +21,7 @@
 
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # ParallelManager.jl root
+EXAMPLES_ENV="${PROJECT_DIR}/examples"                              # the examples env (its own Project.toml)
 CONFIG="${1:-${PROJECT_DIR}/examples/configs/logistic.toml}"
 COMPUTE="${PROJECT_DIR}/examples/scripts/compute.jl"
 JULIA_BIN="${JULIA_BIN:-julia}"
@@ -45,6 +46,6 @@ trap 'touch "${PM_STOP_FLAG}"' USR1
 
 # Pin the master to core 0 so SlurmClusterManager's internal srun can launch
 # the workers across the allocation without nested-job-step contention.
-taskset -c 0 "${JULIA_BIN}" --project="${PROJECT_DIR}" --threads=1 "${COMPUTE}" "${CONFIG}" &
+taskset -c 0 "${JULIA_BIN}" --project="${EXAMPLES_ENV}" --threads=1 "${COMPUTE}" "${CONFIG}" &
 CHILD_PID=$!
 wait "${CHILD_PID}"

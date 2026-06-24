@@ -1,0 +1,12 @@
+name = "LogisticMap"
+uuid = "cb39c60f-8b6f-4de3-82b1-5433bf964379"
+authors = ["sota shimozono <shimozono-sota631@g.ecc.u-tokyo.ac.jp>"]
+version = "0.1.0"
+
+# Intentionally dependency-free: the example kernel is pure Julia so that the
+# whole sweep runs anywhere `julia` runs. The driver hands it to the workers
+# via `run!(…; load=LogisticMap)` — this package (and anything it `using`s)
+# is what travels.
+
+[compat]
+julia = "1.11"

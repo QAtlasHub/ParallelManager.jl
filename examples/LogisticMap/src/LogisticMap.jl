@@ -14,10 +14,17 @@ We use it because it is:
 It is **independent of the initial condition** `x0` (a property of the
 attractor), which is why different `sample` values agree — a convenient way
 to show reproducibility.
+
+The work is a package function — `work_fn(key)` — precisely so the compute
+driver can hand it to the workers with `run!(…; load=LogisticMap)` instead of
+a hand-rolled `@everywhere include`/`remotecall` broadcast. Everything this
+function reaches (the kernel below, plus its `using`s) travels with the
+package, so there is no per-symbol broadcast to forget (the classic
+`UndefVarError: now not defined` footgun).
 """
 module LogisticMap
 
-export logistic_step, lyapunov, orbit_tail
+export logistic_step, lyapunov, orbit_tail, work_fn
 
 logistic_step(r::Float64, x::Float64) = r * x * (1 - x)
 
@@ -59,6 +66,26 @@ function orbit_tail(
         tail[i] = x
     end
     return tail
+end
+
+"""
+    work_fn(key) -> Dict{String,Any}
+
+The pure `(DataKey) -> Dict` the compute driver fans out. Reads params by the
+DOTTED key (`key.params["system.r"]`), returns the payload — it does NOT
+`save!` (the runtime does). `key` is left untyped so this kernel keeps zero
+dependencies (no `ParamIO` import for the `DataKey` type); it only duck-types
+`key.params` / `key.sample`.
+"""
+function work_fn(key)
+    r = Float64(key.params["system.r"])          # ← dotted key
+    x0 = 0.1 + 0.13 * (key.sample - 1)            # per-sample initial condition
+    return Dict{String,Any}(                       # ← RETURN the payload; do not save! it
+        "r" => r,
+        "x0" => x0,
+        "lyapunov" => lyapunov(r, x0),
+        "tail" => orbit_tail(r, x0),
+    )
 end
 
 end # module LogisticMap

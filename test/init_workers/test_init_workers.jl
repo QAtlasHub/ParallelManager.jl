@@ -60,3 +60,37 @@ end
     end
     init_workers!(mode=:sequential, master_blas=1, verbose=false)  # restore
 end
+
+@testset "detect_mode: JULIA_SLURM_N_WORKERS>0 without SLURM_JOB_ID => :distributed" begin
+    withenv("SLURM_JOB_ID" => nothing, "JULIA_SLURM_N_WORKERS" => "2") do
+        @test detect_mode() == :distributed
+    end
+end
+
+@testset "detect_mode: SLURM_JOB_ID outranks JULIA_SLURM_N_WORKERS" begin
+    withenv("SLURM_JOB_ID" => "99", "JULIA_SLURM_N_WORKERS" => "4") do
+        @test detect_mode() == :slurm
+    end
+end
+
+@testset "detect_mode: malformed JULIA_SLURM_N_WORKERS does not crash" begin
+    # A declared-but-empty / non-integer value must fall through, never throw.
+    withenv("SLURM_JOB_ID" => nothing, "JULIA_SLURM_N_WORKERS" => "") do
+        @test detect_mode() in (:threads, :sequential)
+    end
+    withenv("SLURM_JOB_ID" => nothing, "JULIA_SLURM_N_WORKERS" => "notanint") do
+        @test detect_mode() in (:threads, :sequential)
+    end
+end
+
+@testset "_worker_module_names / _modname normalization" begin
+    wmn = ParallelManager._worker_module_names
+    @test wmn(nothing) == Symbol[]
+    @test wmn(:Statistics) == [:Statistics]
+    @test wmn("Statistics") == [:Statistics]
+    @test wmn(LinearAlgebra) == [:LinearAlgebra]      # Module dispatch
+    @test wmn([:A, :B]) == [:A, :B]
+    @test wmn(("A", :B)) == [:A, :B]                  # Tuple, mixed String/Symbol
+    @test_throws ArgumentError wmn(42)                # clear error, not a deep MethodError
+    @test_throws ArgumentError wmn([1, 2])            # bad collection element
+end

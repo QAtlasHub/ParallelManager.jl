@@ -1,0 +1,18 @@
+# The examples environment — deliberately a SEPARATE env from the package root,
+# because that is how a real project looks: its own Project.toml that pulls the
+# infra stack via [sources], plus its own work package (LogisticMap). Run the
+# scripts with `--project=examples`. ParallelManager resolves from the sibling
+# checkout ("..") so you exercise your working copy.
+[deps]
+DataVault = "23f5f8f6-b4da-40ee-8c72-c53b6c5de94f"
+LogisticMap = "cb39c60f-8b6f-4de3-82b1-5433bf964379"
+ParallelManager = "be946ad2-3cb3-4b6e-8f7e-4a5ecc3c255b"
+ParamIO = "938a3ac2-d340-473c-bcf1-88af577e4ccf"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[sources]
+DataVault = {rev = "main", url = "https://github.com/sotashimozono/DataVault.jl.git"}
+LogisticMap = {path = "LogisticMap"}
+ParallelManager = {path = ".."}
+ParamIO = {rev = "main", url = "https://github.com/sotashimozono/ParamIO.jl.git"}

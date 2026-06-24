@@ -11,8 +11,8 @@
 
  Prerequisite: run compute.jl (phase1) first.
 
-     julia --project=. examples/scripts/compute.jl
-     julia --project=. examples/scripts/refine.jl
+     julia --project=examples examples/scripts/compute.jl
+     julia --project=examples examples/scripts/refine.jl
 ==============================================================================#
 
 using ParamIO, DataVault, ParallelManager

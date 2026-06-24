@@ -135,6 +135,8 @@ end
 Inspect the environment to pick a default [`init_workers!`](@ref) mode:
 
 - `:slurm` if `SLURM_JOB_ID` is present in `ENV`,
+- `:distributed` if `JULIA_SLURM_N_WORKERS > 0` (multi-worker without a Slurm job — e.g. a local
+  `addprocs` smoke test driven by the same env var the batch scripts set),
 - `:threads` if `Threads.nthreads() > 1`,
 - `:sequential` otherwise.
 
@@ -143,6 +145,13 @@ need to invoke `detect_mode` directly; it is public mainly for tests.
 """
 function detect_mode()::Symbol
     haskey(ENV, "SLURM_JOB_ID") && return :slurm
+    # Local multi-worker (Distributed): `JULIA_SLURM_N_WORKERS > 0` without a Slurm job. Recognising
+    # it here lets a compute script just call `init_workers!(mode=:auto)` instead of hand-rolling the
+    # `if SLURM_JOB_ID … elseif JULIA_SLURM_N_WORKERS … else …` dispatch in every project.
+    # `tryparse`, not `parse`: a declared-but-empty / malformed JULIA_SLURM_N_WORKERS (some batch
+    # systems export the var unset) must fall through to threads/sequential, not crash detect_mode.
+    something(tryparse(Int, get(ENV, "JULIA_SLURM_N_WORKERS", "0")), 0) > 0 &&
+        return :distributed
     Threads.nthreads() > 1 && return :threads
     return :sequential
 end
@@ -234,5 +243,57 @@ function verify_workers!()
     flush(stdout)
     return nothing
 end
+
+# Load `modnames` (e.g. [:ParamIO, :DataVault, :ParallelManager, :MyWork]) into `Main` on EVERY
+# worker, so a pmap'd task — `DataKey` deserialization, `run!`'s `acquire_running!`/`save!`/
+# `mark_done!` pipeline, and the user's `work_fn` — can resolve them. `init_workers!` spawns the
+# workers with `--project` but does NOT load the project's packages; without this a real
+# multi-worker run dies with a cryptic `KeyError: <Module> not found` on a worker (only ever seen on
+# real Slurm, never on the master, because the master loaded the packages before `addprocs`).
+#
+# Uses `remotecall(Core.eval, …, quoted-using-expr)` — DATA, not a module-scoped closure — so it
+# works even on a worker that has not yet loaded ParallelManager (the same reason `verify_workers!`
+# evaluates its probe in the worker's `Main`). Idempotent: re-`using` an already-loaded module is a
+# no-op, so this composes with a project that still broadcasts modules by hand.
+function _ensure_worker_modules(modnames)
+    nprocs() > 1 || return nothing
+    names = unique(modnames)                      # `modnames` is already a Vector{Symbol}
+    isempty(names) && return nothing
+    ex = Expr(:block, (Expr(:using, Expr(:., n)) for n in names)...)
+    try
+        @sync for w in workers()
+            @async remotecall_fetch(Core.eval, w, Main, ex)
+        end
+    catch e
+        # Surface a worker-side load failure with context instead of a bare RemoteException:
+        # the usual cause is a worker whose `--project` is missing a package, which is exactly
+        # the failure this function exists to make legible.
+        error(
+            "ParallelManager: failed to load $(names) on a worker — check the worker's " *
+            "--project provides every package named by `run!(…; load=…)` plus the seam " *
+            "packages (ParamIO/DataVault/ParallelManager).\nUnderlying error:\n" *
+            sprint(showerror, e),
+        )
+    end
+    return nothing
+end
+
+# Normalise the user's `load=` argument (a Module, Symbol, String, or a collection of them) to a
+# `Vector{Symbol}` of module names that `_ensure_worker_modules` can `using`.
+_modname(m::Module) = nameof(m)
+_modname(s::Symbol) = s
+_modname(s::AbstractString) = Symbol(s)
+# Clear error for an unsupported `load=` entry (e.g. `load=42` or `load=[1, 2]`) instead of a
+# deep `MethodError: no method matching _modname(::Int64)` with no mention of `load=`.
+function _modname(x)
+    return throw(
+        ArgumentError(
+            "`load=` must name modules (Module/Symbol/String); got a $(typeof(x))"
+        ),
+    )
+end
+_worker_module_names(::Nothing) = Symbol[]
+_worker_module_names(x::Union{AbstractVector,Tuple}) = Symbol[_modname(m) for m in x]
+_worker_module_names(x) = Symbol[_modname(x)]
 
 export init_workers!, detect_mode, verify_workers!

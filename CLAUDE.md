@@ -24,6 +24,14 @@ for how the three layers fit together.
 - Read params by the **DOTTED** key: `key.params["system.N"]`.
 - Depend only on `key` (broadcast shared config with `@everywhere const`),
   or the function breaks under `:distributed`.
+- **Worker module loading is automatic.** `run!` `using`s `ParamIO`/`DataVault`/`ParallelManager`
+  in `Main` on every worker before fan-out, so a sweep no longer dies with a cryptic
+  `KeyError: <Module> not found` on the first pmap task (a failure only ever seen on real Slurm).
+  Name any *additional* installed module your `work_fn` needs — its own package, or a stdlib like
+  `Statistics` — via `run!(…; load=MyModule)` (also accepts `load=[A, B]`, a `Symbol`, or a
+  `String`). This replaces the hand-rolled `for w in workers(); remotecall_fetch(w, …, :(using …));
+  end` broadcast. Caveat: a work *function* defined inline in the script (not in a package) must
+  still be `@everywhere function …`; `load=` resolves installed modules, not `Main` submodules.
 - **No per-item `println`** — structured events go through `EventLog` (JSONL)
   only. This is deliberate (the old loop generated 300 MB of per-item logs).
 
