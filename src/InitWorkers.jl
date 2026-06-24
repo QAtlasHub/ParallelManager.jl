@@ -148,7 +148,10 @@ function detect_mode()::Symbol
     # Local multi-worker (Distributed): `JULIA_SLURM_N_WORKERS > 0` without a Slurm job. Recognising
     # it here lets a compute script just call `init_workers!(mode=:auto)` instead of hand-rolling the
     # `if SLURM_JOB_ID … elseif JULIA_SLURM_N_WORKERS … else …` dispatch in every project.
-    parse(Int, get(ENV, "JULIA_SLURM_N_WORKERS", "0")) > 0 && return :distributed
+    # `tryparse`, not `parse`: a declared-but-empty / malformed JULIA_SLURM_N_WORKERS (some batch
+    # systems export the var unset) must fall through to threads/sequential, not crash detect_mode.
+    something(tryparse(Int, get(ENV, "JULIA_SLURM_N_WORKERS", "0")), 0) > 0 &&
+        return :distributed
     Threads.nthreads() > 1 && return :threads
     return :sequential
 end
@@ -254,11 +257,23 @@ end
 # no-op, so this composes with a project that still broadcasts modules by hand.
 function _ensure_worker_modules(modnames)
     nprocs() > 1 || return nothing
-    names = unique(Symbol[m for m in modnames])
+    names = unique(modnames)                      # `modnames` is already a Vector{Symbol}
     isempty(names) && return nothing
     ex = Expr(:block, (Expr(:using, Expr(:., n)) for n in names)...)
-    @sync for w in workers()
-        @async remotecall_fetch(Core.eval, w, Main, ex)
+    try
+        @sync for w in workers()
+            @async remotecall_fetch(Core.eval, w, Main, ex)
+        end
+    catch e
+        # Surface a worker-side load failure with context instead of a bare RemoteException:
+        # the usual cause is a worker whose `--project` is missing a package, which is exactly
+        # the failure this function exists to make legible.
+        error(
+            "ParallelManager: failed to load $(names) on a worker — check the worker's " *
+            "--project provides every package named by `run!(…; load=…)` plus the seam " *
+            "packages (ParamIO/DataVault/ParallelManager).\nUnderlying error:\n" *
+            sprint(showerror, e),
+        )
     end
     return nothing
 end
@@ -268,6 +283,15 @@ end
 _modname(m::Module) = nameof(m)
 _modname(s::Symbol) = s
 _modname(s::AbstractString) = Symbol(s)
+# Clear error for an unsupported `load=` entry (e.g. `load=42` or `load=[1, 2]`) instead of a
+# deep `MethodError: no method matching _modname(::Int64)` with no mention of `load=`.
+function _modname(x)
+    throw(
+        ArgumentError(
+            "`load=` must name modules (Module/Symbol/String); got a $(typeof(x))"
+        ),
+    )
+end
 _worker_module_names(::Nothing) = Symbol[]
 _worker_module_names(x::Union{AbstractVector,Tuple}) = Symbol[_modname(m) for m in x]
 _worker_module_names(x) = Symbol[_modname(x)]

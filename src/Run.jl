@@ -137,7 +137,8 @@ load_manifest(vault::Vault) = load_manifest(manifest_root(vault), Symbol(vault.r
 
 Run `work_fn(key) -> Dict` for every `key` in `keys`, persisting through
 `vault`. Writes a structured JSONL event log at
-`joinpath(vault.outdir, "events.jsonl")`.
+`joinpath(vault.outdir, "events_<hostname>_<pid>.jsonl")` — one file per master,
+so concurrent masters never contend on a single log.
 
 `load` names the module(s) the **worker** processes need beyond the always-loaded seam
 (`ParamIO`/`DataVault`/`ParallelManager`) — typically the package or module that defines `work_fn`
@@ -526,7 +527,7 @@ end
 
 """
     run_loop!(work_fn, vault, keys; opts=RunOpts(),
-              max_empty_rounds=3, idle_sleep=30.0)
+              max_empty_rounds=3, idle_sleep=30.0, load=nothing)
 
 Work-stealing loop that repeatedly calls [`run!`](@ref) until there is no
 more work to do. This is the infra equivalent of FiniteTemperature.jl's

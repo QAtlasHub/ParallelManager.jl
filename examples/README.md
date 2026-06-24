@@ -122,7 +122,7 @@ out/
    the runtime `using`s it — plus `ParamIO`/`DataVault`/`ParallelManager` — in
    `Main` on every worker before fan-out. No `@everywhere`, no hand-rolled
    `remotecall` broadcast, nothing to forget. The failure that used to read
-   `UndefVarError: <X> not defined on a worker` (only ever on a real cluster) is
+   `KeyError: <Module> not found` on a worker (only ever on a real cluster) is
    gone by construction.
 
 ## Going to a cluster

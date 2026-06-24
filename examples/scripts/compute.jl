@@ -14,7 +14,7 @@
  packages) on every worker for you. No `@everywhere`, no hand-rolled
  `for w in workers(); remotecall_fetch(…, :(using …)); end` broadcast — and
  nothing to forget (the broadcast is where the classic
- `UndefVarError: <X> not defined on a worker` footgun lives).
+ `KeyError: <Module> not found` on a worker footgun lives).
 
  Run it (from the ParallelManager.jl package root, with the EXAMPLES env):
 
