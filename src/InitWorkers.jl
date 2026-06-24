@@ -286,7 +286,7 @@ _modname(s::AbstractString) = Symbol(s)
 # Clear error for an unsupported `load=` entry (e.g. `load=42` or `load=[1, 2]`) instead of a
 # deep `MethodError: no method matching _modname(::Int64)` with no mention of `load=`.
 function _modname(x)
-    throw(
+    return throw(
         ArgumentError(
             "`load=` must name modules (Module/Symbol/String); got a $(typeof(x))"
         ),
