@@ -2,9 +2,10 @@
 
 A complete, **runnable, dependency-free** parameter sweep that uses all three
 infra packages the way a real HPC job does. The "physics" is the logistic map
-(`src/LogisticMap.jl`, pure Julia, no deps) so the whole thing runs in seconds
-on any machine — but the *structure* is identical to a DMRG / Monte-Carlo
-sweep on a cluster.
+(`LogisticMap/`, a tiny pure-Julia package, no deps) so the whole thing runs in
+seconds on any machine — but the *structure* is identical to a DMRG / Monte-Carlo
+sweep on a cluster: a separate env that pulls the infra stack, and the work in
+its own package handed to the workers with `run!(…; load=LogisticMap)`.
 
 If you only read one thing in `infra/` to learn how to submit a computation,
 read this directory.
@@ -21,10 +22,13 @@ read this directory.
 
 ```
 examples/
+├── Project.toml              # the examples ENV — pulls the infra stack via [sources] + LogisticMap
 ├── configs/logistic.toml     # the sweep: r = [2.8 … 4.0], 3 samples ⇒ 18 DataKeys
-├── src/LogisticMap.jl        # pure-Julia kernel: lyapunov(r, x0), no dependencies
+├── LogisticMap/              # the work PACKAGE: pure-Julia kernel + work_fn(key), no deps
+│   ├── Project.toml
+│   └── src/LogisticMap.jl    #   lyapunov(r, x0), orbit_tail, and the pure work_fn
 ├── scripts/
-│   ├── compute.jl            # PHASE 1 — the canonical driver (COPY THIS)
+│   ├── compute.jl            # PHASE 1 — the canonical driver (COPY THIS): run!(…; load=LogisticMap)
 │   ├── refine.jl             # PHASE 2 — phase chaining via one DataVault.load line
 │   └── summarize.jl          # the READER side — load data back, aggregate λ(r)
 └── batch/submit_slurm.sh     # the HPC submission template (env vars + graceful stop)
@@ -32,13 +36,15 @@ examples/
 
 ## Run it
 
-From the **ParallelManager.jl package root** (so `--project=.` resolves all three packages):
+From the **ParallelManager.jl package root**, using the **examples env**
+(`examples/Project.toml`, which pulls the three infra packages + the `LogisticMap`
+work package — `--project=examples`):
 
 ```bash
-julia --project=. examples/scripts/compute.jl     # phase 1: computes 18 keys
-julia --project=. examples/scripts/compute.jl     # run AGAIN → instant :skip_complete
-julia --project=. examples/scripts/refine.jl      # phase 2: reads phase1, classifies regime
-julia --project=. examples/scripts/summarize.jl   # reader: λ(r) table
+julia --project=examples examples/scripts/compute.jl     # phase 1: computes 18 keys
+julia --project=examples examples/scripts/compute.jl     # run AGAIN → instant :skip_complete
+julia --project=examples examples/scripts/refine.jl      # phase 2: reads phase1, classifies regime
+julia --project=examples examples/scripts/summarize.jl   # reader: λ(r) table
 ```
 
 (Output goes to `examples/out/`, which is gitignored — delete it to start fresh.)
@@ -85,7 +91,7 @@ out/
     └── sysr2.80/data_sample001.jld2   # "sysr2.80" = path_keys ["system.r"], r = 2.80
 ```
 
-## The five things that confuse people (and LLMs) — answered here
+## The six things that confuse people (and LLMs) — answered here
 
 1. **`work_fn` RETURNS a `Dict`; it does not `save!`.** Grep `compute.jl` for
    `save!` — it's not there. `run!` calls `DataVault.save!(vault, key, returned_dict)`
@@ -109,6 +115,15 @@ out/
    returns `:sequential` / `:threads` / `:slurm` from the environment; `run!`
    fans out over `Distributed` workers when they exist and runs sequentially
    otherwise. To go to a cluster you change the *batch script*, not the Julia.
+
+6. **Your work reaches the workers because it's a package + `load=`.**
+   `init_workers!` spawns workers with `--project` but loads no packages. Put the
+   work in a package (here `LogisticMap`) and pass `run!(…; load=LogisticMap)`:
+   the runtime `using`s it — plus `ParamIO`/`DataVault`/`ParallelManager` — in
+   `Main` on every worker before fan-out. No `@everywhere`, no hand-rolled
+   `remotecall` broadcast, nothing to forget. The failure that used to read
+   `UndefVarError: <X> not defined on a worker` (only ever on a real cluster) is
+   gone by construction.
 
 ## Going to a cluster
 

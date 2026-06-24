@@ -5,7 +5,7 @@
  notice: compute.jl never called save! — yet the data is here. The runtime
  persisted every work_fn return value for us.
 
-     julia --project=. examples/scripts/summarize.jl
+     julia --project=examples examples/scripts/summarize.jl
 ==============================================================================#
 
 using ParamIO, DataVault, Printf, Statistics

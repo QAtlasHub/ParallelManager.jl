@@ -8,10 +8,18 @@
    DataVault  : (study, run)       → file storage      (where it goes)
    ParallelM. : run!(work_fn, …)   → parallel runtime  (do it, lock-safe, resumable)
 
- Run it (from the ParallelManager.jl package root):
+ The work itself (LogisticMap.work_fn) lives in a PACKAGE, not in this script.
+ That is the whole point: you hand the work module to the workers with
+ `run!(…; load=LogisticMap)` and the runtime `using`s it (plus the seam
+ packages) on every worker for you. No `@everywhere`, no hand-rolled
+ `for w in workers(); remotecall_fetch(…, :(using …)); end` broadcast — and
+ nothing to forget (the broadcast is where the classic
+ `UndefVarError: <X> not defined on a worker` footgun lives).
 
-     julia --project=. examples/scripts/compute.jl
-     julia --project=. examples/scripts/compute.jl examples/configs/logistic.toml
+ Run it (from the ParallelManager.jl package root, with the EXAMPLES env):
+
+     julia --project=examples examples/scripts/compute.jl
+     julia --project=examples examples/scripts/compute.jl examples/configs/logistic.toml
 
  Run it AGAIN: the second run prints `:skip_complete` and exits in
  milliseconds — the manifest records what is already done, so a finished
@@ -19,8 +27,7 @@
 ==============================================================================#
 
 using ParamIO, DataVault, ParallelManager
-include(joinpath(@__DIR__, "..", "src", "LogisticMap.jl"))
-using .LogisticMap
+using LogisticMap   # the work PACKAGE (defines the pure work_fn); shipped to workers via load=
 
 const EXAMPLES = abspath(joinpath(@__DIR__, ".."))
 const CONFIG = get(ARGS, 1, joinpath(EXAMPLES, "configs", "logistic.toml"))
@@ -39,30 +46,18 @@ vault = DataVault.Vault(CONFIG; run="phase1", outdir=OUTDIR)
 #    :sequential locally, :threads if -t>1, :slurm inside a SLURM job. ──
 ParallelManager.init_workers!(; mode=:auto)
 
-#=  work_fn is a PURE function  (DataKey) -> Dict{String,Any}.
-    Two things trip people (and LLMs) up here, so read carefully:
+#=  The work is LogisticMap.work_fn — a PURE (DataKey) -> Dict{String,Any}.
+    Two things trip people (and LLMs) up, both handled by structure here:
 
-    1. work_fn does NOT call save!/mark_done!. It just RETURNS a Dict.
-       The runtime calls DataVault.save!(vault, key, returned_dict) and writes
-       the .done marker for you. If you grep compute.jl for `save!`, you won't
-       find it — that is by design. (Returning a non-Dict is a runtime error.)
+    1. work_fn does NOT call save!/mark_done!. It just RETURNS a Dict; the
+       runtime calls DataVault.save!(vault, key, returned_dict) and writes the
+       .done marker. (Returning a non-Dict is a runtime error.)
 
-    2. Params are keyed by the DOTTED path  key.params["system.r"]  — NOT
-       key.params["r"]. The leaf name alone raises KeyError. The dotted key
-       matches the [paramsets.system] r=… block and the [datavault] path_keys.
-
-    work_fn depends ONLY on `key` (no closure over master-side globals), so the
-    exact same function is correct under :sequential, :threads and :slurm. =#
-function work_fn(key::DataKey)
-    r = Float64(key.params["system.r"])          # ← dotted key
-    x0 = 0.1 + 0.13 * (key.sample - 1)            # per-sample initial condition
-    return Dict{String,Any}(                       # ← RETURN the payload; do not save! it
-        "r" => r,
-        "x0" => x0,
-        "lyapunov" => LogisticMap.lyapunov(r, x0),
-        "tail" => LogisticMap.orbit_tail(r, x0),
-    )
-end
+    2. It must run on the WORKERS. Because the work lives in a package, we pass
+       `load=LogisticMap` below and run! loads it (and ParamIO/DataVault/
+       ParallelManager) in Main on every worker before fan-out. Put your work in
+       a package and this whole class of "module not defined on a worker" bugs
+       disappears. =#
 
 # Optional graceful-stop sentinel: the SLURM template (batch/submit_slurm.sh)
 # traps SIGUSR1 ~60 s before the wall-clock kill and `touch`es this file; run!
@@ -70,9 +65,10 @@ end
 const STOP_FLAG = get(ENV, "PM_STOP_FLAG", nothing)
 opts = ParallelManager.RunOpts(; stop_flag=STOP_FLAG)
 
-# ── Run — manifest-aware early-skip, multi-master lock safety (DataVault .running), retry. ──
-# Returns a NamedTuple of counters: (stage, done, err, skipped, total, …).
-result = ParallelManager.run!(work_fn, vault, keys; opts=opts)
+# ── Run — manifest-aware early-skip, multi-master lock safety (DataVault .running), retry.
+#    `load=LogisticMap` ships the work module to the workers. Returns a NamedTuple
+#    of counters: (stage, done, err, skipped, total, …). ──
+result = ParallelManager.run!(LogisticMap.work_fn, vault, keys; opts=opts, load=LogisticMap)
 @info "phase1 complete" result
 
 # Reader-side convenience: ledger.csv, one row per completed key.
