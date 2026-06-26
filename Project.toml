@@ -1,6 +1,6 @@
 name = "ParallelManager"
 uuid = "be946ad2-3cb3-4b6e-8f7e-4a5ecc3c255b"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["sota shimozono <shimozono-sota631@g.ecc.u-tokyo.ac.jp>"]
 
 [deps]
@@ -16,14 +16,6 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SlurmClusterManager = "c82cd089-7bf7-41d7-976b-6b5d413cbe0a"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
-
-[sources.DataVault]
-rev = "main"
-url = "https://github.com/sotashimozono/DataVault.jl.git"
-
-[sources.ParamIO]
-rev = "main"
-url = "https://github.com/sotashimozono/ParamIO.jl.git"
 
 [compat]
 DataVault = "0.7"

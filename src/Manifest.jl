@@ -13,7 +13,7 @@ using ParamIO: DataKey, canonical
     Manifest(stage, root)
 
 Rollup index for a single stage under a vault root. `complete` holds
-[`ParamIO.canonical`](@extref) strings of every key known to be finished.
+`ParamIO.canonical` strings of every key known to be finished.
 
 # Fields
 
