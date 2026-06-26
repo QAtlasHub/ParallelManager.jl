@@ -27,6 +27,7 @@ makedocs(;
         assets=["assets/favicon.ico", "assets/custom.css"],
     ),
     modules=[ParallelManager],
+    checkdocs=:exports,
     pages=[
         "Home" => "index.md",
         "Quick start" => "quickstart.md",
@@ -36,4 +37,8 @@ makedocs(;
     ],
 )
 
-deploydocs(; repo="github.com/sotashimozono/ParallelManager.jl.git", devbranch="main")
+deploydocs(;
+    repo="github.com/sotashimozono/ParallelManager.jl.git",
+    devbranch="main",
+    push_preview=true,
+)

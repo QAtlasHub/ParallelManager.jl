@@ -1,5 +1,9 @@
 # API reference
 
+```@docs
+ParallelManager
+```
+
 ## AtomicIO
 
 ```@docs
@@ -12,6 +16,7 @@ ParallelManager.atomic_touch
 ```@docs
 ParallelManager.EventLog
 ParallelManager.log_event
+ParallelManager.merge_event_logs
 ```
 
 ## Manifest
@@ -25,6 +30,7 @@ ParallelManager.add_complete!
 ParallelManager.is_complete
 ParallelManager.todo_keys
 ParallelManager.manifest_root
+ParallelManager.merge_and_save_manifest!
 ```
 
 ## InitWorkers
@@ -32,6 +38,7 @@ ParallelManager.manifest_root
 ```@docs
 ParallelManager.init_workers!
 ParallelManager.detect_mode
+ParallelManager.verify_workers!
 ```
 
 ## Run
@@ -39,4 +46,5 @@ ParallelManager.detect_mode
 ```@docs
 ParallelManager.RunOpts
 ParallelManager.run!
+ParallelManager.run_loop!
 ```
