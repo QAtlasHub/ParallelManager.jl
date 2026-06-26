@@ -17,9 +17,13 @@ SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SlurmClusterManager = "c82cd089-7bf7-41d7-976b-6b5d413cbe0a"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
-[sources]
-DataVault = {rev = "main", url = "https://github.com/sotashimozono/DataVault.jl.git"}
-ParamIO = {rev = "main", url = "https://github.com/sotashimozono/ParamIO.jl.git"}
+[sources.DataVault]
+rev = "main"
+url = "https://github.com/sotashimozono/DataVault.jl.git"
+
+[sources.ParamIO]
+rev = "main"
+url = "https://github.com/sotashimozono/ParamIO.jl.git"
 
 [compat]
 DataVault = "0.7"
