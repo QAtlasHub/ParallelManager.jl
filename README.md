@@ -5,13 +5,13 @@
 [![Julia](https://img.shields.io/badge/julia-v1.11+-9558b2.svg)](https://julialang.org)
 [![Code Style: Blue](https://img.shields.io/badge/Code%20Style-Blue-4495d1.svg)](https://github.com/invenia/BlueStyle)
 
-[![codecov](https://codecov.io/gh/sotashimozono/ParallelManager.jl/graph/badge.svg?token=0kGBejbpL8)](https://codecov.io/gh/sotashimozono/ParallelManager.jl)
-[![Build Status](https://github.com/sotashimozono/ParallelManager.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/sotashimozono/ParallelManager.jl/actions/workflows/CI.yml?query=branch%3Amain)
+[![codecov](https://codecov.io/gh/QAtlasHub/ParallelManager.jl/graph/badge.svg?token=0kGBejbpL8)](https://codecov.io/gh/QAtlasHub/ParallelManager.jl)
+[![Build Status](https://github.com/QAtlasHub/ParallelManager.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/QAtlasHub/ParallelManager.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **HPC experiment runtime for Julia** — multi-master safe, crash-recoverable,
-`Pkg.test()`-fast. Wraps [ParamIO.jl](https://github.com/sotashimozono/ParamIO.jl)
-and [DataVault.jl](https://github.com/sotashimozono/DataVault.jl) with a
+`Pkg.test()`-fast. Wraps [ParamIO.jl](https://github.com/QAtlasHub/ParamIO.jl)
+and [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl) with a
 unified `run!` that handles parallel dispatch, advisory locking, `.done`
 rollups, structured event logging, and retry.
 
@@ -121,9 +121,9 @@ ParallelManager = "be946ad2-3cb3-4b6e-8f7e-4a5ecc3c255b"
 ParamIO         = "938a3ac2-d340-473c-bcf1-88af577e4ccf"
 
 [sources]
-ParamIO         = {url = "https://github.com/sotashimozono/ParamIO.jl.git"}
-DataVault       = {url = "https://github.com/sotashimozono/DataVault.jl.git"}
-ParallelManager = {url = "https://github.com/sotashimozono/ParallelManager.jl.git"}
+ParamIO         = {url = "https://github.com/QAtlasHub/ParamIO.jl.git"}
+DataVault       = {url = "https://github.com/QAtlasHub/DataVault.jl.git"}
+ParallelManager = {url = "https://github.com/QAtlasHub/ParallelManager.jl.git"}
 ```
 
 Then `julia --project -e 'using Pkg; Pkg.instantiate()'`.
@@ -141,8 +141,8 @@ Then `julia --project -e 'using Pkg; Pkg.instantiate()'`.
 
 ## See also
 
-- [ParamIO.jl](https://github.com/sotashimozono/ParamIO.jl) — config TOML parsing and `DataKey` enumeration
-- [DataVault.jl](https://github.com/sotashimozono/DataVault.jl) — `Vault` struct, atomic JLD2 save, `.done` markers
+- [ParamIO.jl](https://github.com/QAtlasHub/ParamIO.jl) — config TOML parsing and `DataKey` enumeration
+- [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl) — `Vault` struct, atomic JLD2 save, `.done` markers
 - [templateHPC.jl](https://github.com/sotashimozono/templateHPC.jl) — clone-to-start scaffold that wires all three together
 
 ## License

@@ -3,8 +3,8 @@
 **HPC experiment runtime for Julia** — multi-master safe, crash-recoverable,
 `Pkg.test()`-fast.
 
-Wraps [ParamIO.jl](https://github.com/sotashimozono/ParamIO.jl) and
-[DataVault.jl](https://github.com/sotashimozono/DataVault.jl) with a unified
+Wraps [ParamIO.jl](https://github.com/QAtlasHub/ParamIO.jl) and
+[DataVault.jl](https://github.com/QAtlasHub/DataVault.jl) with a unified
 [`run!`](@ref ParallelManager.run!) that handles parallel dispatch,
 advisory locking, `.done` rollups, structured event logging, and retry.
 
@@ -63,6 +63,6 @@ exits in milliseconds regardless of `length(keys)`.
 
 ## See also
 
-- [ParamIO.jl](https://github.com/sotashimozono/ParamIO.jl) — config TOML parsing and `DataKey` enumeration
-- [DataVault.jl](https://github.com/sotashimozono/DataVault.jl) — `Vault` struct, atomic JLD2 save, `.done` markers
+- [ParamIO.jl](https://github.com/QAtlasHub/ParamIO.jl) — config TOML parsing and `DataKey` enumeration
+- [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl) — `Vault` struct, atomic JLD2 save, `.done` markers
 - [templateHPC.jl](https://github.com/sotashimozono/templateHPC.jl) — clone-to-start scaffold that wires all three together

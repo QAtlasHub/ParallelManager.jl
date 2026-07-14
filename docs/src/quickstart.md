@@ -13,9 +13,9 @@ ParallelManager = "be946ad2-3cb3-4b6e-8f7e-4a5ecc3c255b"
 ParamIO         = "938a3ac2-d340-473c-bcf1-88af577e4ccf"
 
 [sources]
-ParamIO         = {url = "https://github.com/sotashimozono/ParamIO.jl.git"}
-DataVault       = {url = "https://github.com/sotashimozono/DataVault.jl.git"}
-ParallelManager = {url = "https://github.com/sotashimozono/ParallelManager.jl.git"}
+ParamIO         = {url = "https://github.com/QAtlasHub/ParamIO.jl.git"}
+DataVault       = {url = "https://github.com/QAtlasHub/DataVault.jl.git"}
+ParallelManager = {url = "https://github.com/QAtlasHub/ParallelManager.jl.git"}
 ```
 
 Then:
