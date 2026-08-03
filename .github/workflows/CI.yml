@@ -1,57 +1,36 @@
 name: CI
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     tags: '*'
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# This suite was not split before. The whole sharded-test vertical is QAtlasHub/TestShards.jl:
+# nothing is planned up front — each shard decides what it owns from the same timing history —
+# and the reusable merges the shards' coverage into one Codecov upload, merges their records into
+# one ordered document, checks that every unit ran exactly once, and refreshes `ci-timings` on
+# pushes to main.
+#
+# The split is not the only thing gained. The exactly-once check and the merged record hold for a
+# small suite too, and with no history the first run is round-robin and balances itself from the
+# second push onward.
 jobs:
   test:
-    name: ${{ matrix.env_name }} - Julia ${{ matrix.version }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        version:
-          - '1'
-        include:
-          - env_name: sequential
-            env_file: .github/ci/env_sequential.toml
-            julia_threads: 1
-            version: '1'
-          - env_name: threaded
-            env_file: .github/ci/env_threaded.toml
-            julia_threads: 4
-            version: '1'
-          - env_name: distributed-2
-            env_file: .github/ci/env_distributed_2.toml
-            julia_threads: 1
-            version: '1'
-          - env_name: distributed-4
-            env_file: .github/ci/env_distributed_4.toml
-            julia_threads: 1
-            version: '1'
-          - env_name: distributed-master-only
-            env_file: .github/ci/env_distributed_master_only.toml
-            julia_threads: 1
-            version: '1'
-          - env_name: stress
-            env_file: .github/ci/env_stress.toml
-            julia_threads: 8
-            version: '1'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: julia-actions/setup-julia@v3
-        with:
-          version: ${{ matrix.version }}
-      - uses: julia-actions/cache@v3
-      - uses: julia-actions/julia-buildpkg@v1
-      - name: Run tests (${{ matrix.env_name }})
-        run: |
-          julia --project=. --threads=${{ matrix.julia_threads }} \
-            .github/ci/runner.jl ${{ matrix.env_file }}
-      - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v7
-        with:
-          file: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: write   # the timing history is pushed to the `ci-timings` orphan branch
+    uses: QAtlasHub/TestShards.jl/.github/workflows/sharded-tests.yml@main
+    with:
+      # A starting point. The diagnosis printed on every run names the knee for THIS suite —
+      # read it and set what it says rather than keeping this number out of inertia.
+      shards: 4
+      # Also refreshes: a registry present but stale resolves fine while failing to see anything
+      # published since it was last pulled.
+      registries: |
+        General
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
