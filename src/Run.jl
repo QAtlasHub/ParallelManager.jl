@@ -596,9 +596,10 @@ function _run_affinity!(
         end
     end
 
-    _give_back!(i::Int) = lock(q) do
-        return push!(get!(Vector{Int}, by_group, groups[i]), i)
-    end
+    _give_back!(i::Int) =
+        lock(q) do
+            return push!(get!(Vector{Int}, by_group, groups[i]), i)
+        end
 
     @sync for pid in workers()
         @async while true
@@ -675,8 +676,16 @@ function _run_one_with_retry!(
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
                 return :lock_busy
             end
-            DataVault.save!(vault, key, payload)
-            DataVault.mark_done!(vault, key)
+            # `save!` returns `(; file, sha256)` — the bytes it just wrote, named. Handing that
+            # to `mark_done!` is what puts `result_sha256` in the `.done`, and without it every
+            # marker this runner writes says `unknown`: a later reader can hash what it loads
+            # and has nothing to compare it against. Archeion's per-point provenance reads the
+            # two and reports `read_matches_result`; with the digest missing it can only report
+            # `result_unknown`, and `capability.verified` with criterion `result-file-sha256`
+            # (SPEC §6) cannot be earned at all. The value is already in hand here; not passing
+            # it was the whole of the gap.
+            saved = DataVault.save!(vault, key, payload)
+            DataVault.mark_done!(vault, key; result=saved)
             log_event(
                 log, :key_done; stage=stage, key=kstr, secs=time() - t0, attempt=attempt
             )

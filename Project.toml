@@ -1,6 +1,6 @@
 name = "SweepRunner"
 uuid = "be946ad2-3cb3-4b6e-8f7e-4a5ecc3c255b"
-version = "0.6.2"
+version = "0.7.0"
 authors = ["sota shimozono <shimozono-sota631@g.ecc.u-tokyo.ac.jp>"]
 
 [deps]
@@ -19,7 +19,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [compat]
 Aqua = "0.8"
-DataVault = "0.7, 0.8"
+DataVault = "0.8.5"          # mark_done!(; result), which writes result_sha256 (done_version=2)
 Dates = "1.11"
 Distributed = "1.11"
 JLD2 = "0.6"
