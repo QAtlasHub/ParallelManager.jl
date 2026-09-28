@@ -54,12 +54,14 @@ end
     try
         v = DataVault.Vault(FIXTURE_CFG; run="phase1", outdir=outdir)
         key = ParamIO.expand(v.spec)[1]
-        lost = Threads.Atomic{Bool}(true)        # simulate: heartbeat saw a reclaim
+        # Simulate a reclaim: the lock on disk belongs to a sibling, not to `tok`.
+        tok = DataVault.new_owner_token()
+        @test DataVault.acquire_running!(v, key, DataVault.new_owner_token()) === :ok
         log = SweepRunner.EventLog(joinpath(outdir, "ev.jsonl"))
         ran = Ref(false)
         wf = k -> (ran[]=true; Dict{String,Any}("x" => 1))
         outcome = SweepRunner._run_one_with_retry!(
-            wf, v, key, ParamIO.canonical(key), :phase1, log, RunOpts(), lost
+            wf, v, key, ParamIO.canonical(key), :phase1, log, RunOpts(), tok
         )
         @test ran[]                              # work_fn ran...
         @test outcome === :lock_busy             # ...but its result was discarded

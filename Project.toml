@@ -23,8 +23,9 @@ Aqua = "0.8"
 # there, and `save!` returning the digest it wrote (with `mark_done!(…; result)`) in 0.8.3. `artifact!` / `ArtifactBusy`
 # (what the deferral and `artifact_affinity` are built for) came in 0.8.2. The owner-stamped
 # `.running` API (`new_owner_token`, `running_owner`, and the three-argument `refresh_running!` /
-# `clear_running!`) that the liveness reaper is built on arrived in 0.8.1.
-DataVault = "0.8.4"
+# `clear_running!`) that the liveness reaper is built on arrived in 0.8.1. 0.8.9 is the floor now:
+# the key heartbeat is `start_heartbeat`'s child process, and a commit is `mark_done!(…, owner)`.
+DataVault = "0.8.9"
 Dates = "1.11"
 Distributed = "1.11"
 JLD2 = "0.6"

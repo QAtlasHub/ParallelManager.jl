@@ -79,8 +79,10 @@ When you call `run!(work_fn, vault, keys)`, it does:
      — another master may have finished this key between our manifest
      read and lock acquisition.
    - Call `work_fn(key)` up to `opts.max_attempts` times, with a heartbeat
-     task refreshing `.running`. On success, `DataVault.save!` +
-     `DataVault.mark_done!` + `Manifest.add_complete!`.
+     child process (`DataVault.start_heartbeat`) refreshing `.running`. On
+     success, `DataVault.save!` + `DataVault.mark_done!(vault, key, owner)` +
+     `Manifest.add_complete!`; the owner form commits nothing if a sibling
+     reclaimed the key meanwhile.
 5. `save_manifest(manifest)`.
 6. Emit `:stage_done` and return the aggregate counts.
 
@@ -100,11 +102,12 @@ moves on — no blocking, no waiting, no central queue.
 
 Two things keep this robust against crashes:
 
-1. **Heartbeat + stale reclaim.** The live holder touches `heartbeat` on
-   a timer. If a holder dies, its `heartbeat` mtime stops advancing; the
-   next contender sees the lock as stale (by either heartbeat age or lock-dir
-   age, depending on whether the holder made it past initial write), and
-   reclaims via `mv lock lock.dead.X` + `rm -rf lock.dead.X`.
+1. **Heartbeat + stale reclaim.** A child process of the live holder
+   rewrites the lock's `heartbeat_unix=` every `heartbeat_interval`, for as
+   long as the holder's pid lives — also while `work_fn` never yields, which
+   an in-process task did not survive. If the holder dies, the heartbeat
+   stops; after `stale_after` the next contender reclaims the lock under
+   DataVault's reclaim mutex (see DataVault's README, "ロックの規約").
 2. **Post-lock `is_done` re-check.** Even on the happy path, two masters
    can start the loop with overlapping `todo`. The re-check inside the
    locked critical section ensures the second master notices the work
