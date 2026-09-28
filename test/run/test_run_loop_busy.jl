@@ -48,7 +48,11 @@ end
         @test n[] == 1                          # it ran the key
         @test DataVault.is_done(v, ks[1])       # and the campaign is complete
         @test r.done == 1
-        @test elapsed >= 3.0                    # it waited stale_after out rather than giving up
+        # It waited stale_after out rather than giving up (the bug gave up after two empty rounds,
+        # ~1 s). Less one second: DataVault writes `heartbeat=` truncated to the second, so the lock
+        # reads up to 1 s older than it is and is reclaimed up to 1 s before stale_after. Asserting
+        # the full 3.0 failed on hosted runners at 2.85 s and 2.90 s.
+        @test elapsed >= 3.0 - 1.0
     end
 end
 
