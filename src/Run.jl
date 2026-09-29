@@ -31,9 +31,11 @@ Execution options for [`run!`](@ref).
   retry (a failed `work_fn` is logged as `:error` instead of `:gave_up`).
 - `stale_after::Float64 = 600.0` — seconds before another master can reclaim a
   held lock as stale. Passed through to `DataVault.acquire_running!`.
-- `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat task
-  refreshes DataVault's `.running` file. Enforced to be `<` `stale_after`
-  (otherwise a live holder's lock could be reclaimed mid-work).
+- `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat
+  (a child process, `DataVault.start_heartbeat`) refreshes DataVault's
+  `.running` file. It keeps beating while `work_fn` computes without yielding.
+  Enforced to be `<` `stale_after` (otherwise a live holder's lock could be
+  reclaimed mid-work).
 - `log_level::Symbol = :info` — event-log verbosity. At `:info` (default) the
   high-churn per-key `:lock_busy` and `:key_start` events are suppressed (their
   totals still ride in the `:stage_done` summary), keeping the JSONL log
@@ -415,7 +417,7 @@ end
 
 Execute the per-key pipeline: atomic-acquire via
 `DataVault.acquire_running!`, re-check completion, run work_fn with a
-background heartbeat task, and release on exit.  Returns a
+heartbeat child process, commit owner-checked, and release on exit.  Returns a
 `(key, outcome)` pair suitable for aggregation by the caller.
 
 Outcome symbols:
@@ -472,60 +474,25 @@ function _run_one_with_lock!(
         return (key, :already_done)
     end
 
-    # Background heartbeat task: periodically refresh `.running` so
-    # `DataVault.cleanup_stale` / sibling `acquire_running!` callers
-    # recognise us as alive.  The `Threads.Atomic{Bool}` flag makes
-    # the stop signal thread-safe; a short sleep tick keeps finally
-    # cleanup responsive (the earlier fixed 60-s sleep would block the
-    # whole shutdown until the next heartbeat tick).
-    # `lost[]` is raised by the heartbeat task if it observes that a sibling reclaimed our lock (we
-    # stalled past `stale_after`). `_run_one_with_retry!` checks it before `save!`, and the
-    # `finally` below skips `clear_running!` when lost, so we neither commit on top of nor delete
-    # the lock now owned by the reclaiming master. The refresh is OWNER-CHECKED (DataVault 0.8.1),
-    # so a reclaim that has already happened is seen on the next beat; the previous
-    # existence-based form returned `true` against the reclaimer's own file.
-    hb_stop = Threads.Atomic{Bool}(false)
-    lost = Threads.Atomic{Bool}(false)
-    hb_task = Threads.@spawn begin
-        tick = 0.1
-        elapsed = 0.0
-        while !hb_stop[]
-            sleep(tick)
-            hb_stop[] && break
-            elapsed += tick
-            if elapsed >= opts.heartbeat_interval
-                # A `false` return (sibling reclaimed) OR a throw (un-refreshable
-                # lock, e.g. NFS hiccup) both mean "treat as lost": stop
-                # heartbeating and signal it, rather than silently dying.
-                alive = try
-                    DataVault.refresh_running!(vault, key, tok)
-                catch
-                    false
-                end
-                if !alive
-                    lost[] = true
-                    break
-                end
-                elapsed = 0.0
-            end
-        end
-    end
+    # The heartbeat runs in a CHILD process (DataVault 0.8.9). A task here was starved by work that
+    # does not yield — a long BLAS call, a tight loop — under -t 1, -t 2 and -t 2,1 alike: it never
+    # beat, a sibling reclaimed the live key after `stale_after`, and this master committed it too.
+    # The child stops when this process dies or when the lock leaves our hands.
+    #
+    # Whether we still hold the key is asked where it matters, at commit: `_run_one_with_retry!`
+    # checks the owner before `save!`, and commits with the owner form of `mark_done!`, which
+    # refuses if a sibling reclaimed in between. The release below is owner-checked as well, so it
+    # can run unconditionally: it never deletes a reclaimer's lock.
+    hb = DataVault.start_heartbeat(vault, key, tok; interval=opts.heartbeat_interval)
 
     outcome = try
-        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, lost)
+        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, tok)
     finally
-        hb_stop[] = true
-        try
-            wait(hb_task)
-        catch
-        end
-        # Release the lock so the key is immediately retriable by a sibling
-        # without waiting for `stale_after` — BUT NOT if we lost it. When
-        # `lost[]`, the `.running` file is now the RECLAIMING master's, and
-        # `clear_running!` is owner-blind (`isfile && rm`), so clearing it would
-        # delete THEIR lock and re-open double-execution. On `:ok`, `mark_done!`
-        # already removed our `.running`; `clear_running!` is otherwise idempotent.
-        lost[] || DataVault.clear_running!(vault, key, tok)
+        DataVault.stop_heartbeat(hb)
+        # Release so a sibling can retry the key at once instead of after `stale_after`. On `:ok`
+        # the commit already released it; on a lost key the lock is the reclaimer's, and this is
+        # a no-op.
+        DataVault.clear_running!(vault, key, tok)
     end
 
     return (key, outcome)
@@ -773,14 +740,15 @@ function _redispatch_deferred(
 end
 
 """
-    _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, lost) -> Symbol
+    _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, tok) -> Symbol
 
 Execute `work_fn(key)` up to `opts.max_attempts` times. Returns:
   :ok        — payload saved and mark_done! called
   :gave_up   — all attempts failed, final `:gave_up` event logged
   :error     — single-attempt config (`max_attempts == 1`) that failed once
-  :lock_busy — `lost[]` was set (a sibling reclaimed our lock); the result is
-               discarded before `save!` so the reclaiming master's result wins
+  :lock_busy — the lock is no longer `tok`'s (a sibling reclaimed it): the result is
+               discarded, before `save!` if the loss is already visible, else at the
+               owner-checked commit, so the reclaiming master's result wins
 """
 function _run_one_with_retry!(
     work_fn,
@@ -790,7 +758,7 @@ function _run_one_with_retry!(
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
-    lost::Threads.Atomic{Bool},
+    tok::AbstractString,
 )
     last_err = nothing
     for attempt in 1:opts.max_attempts
@@ -802,7 +770,7 @@ function _run_one_with_retry!(
                 "work_fn must return a Dict (got $(typeof(payload))). " *
                 "Wrap scalars as e.g. Dict(\"value\" => x).",
             )
-            if lost[]
+            if DataVault.running_owner(vault, key) != tok
                 # A sibling master reclaimed our lock while work_fn ran; it now
                 # owns this key. Discard our result rather than double-committing.
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
@@ -811,9 +779,15 @@ function _run_one_with_retry!(
             # The digest save! took before its rename goes into the marker, so `.done` names the
             # bytes this attempt wrote rather than whatever the file holds when someone looks.
             saved = DataVault.save!(vault, key, payload)
-            DataVault.mark_done!(
-                vault, key; result=saved, observation=_observation_token(vault)
+            # Owner-checked: a reclaim between the check above and here is refused, and nothing is
+            # committed. The file save! wrote is then the reclaimer's to overwrite.
+            committed = DataVault.mark_done!(
+                vault, key, tok; result=saved, observation=_observation_token(vault)
             )
+            if !committed
+                log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                return :lock_busy
+            end
             log_event(
                 log,
                 :key_done;

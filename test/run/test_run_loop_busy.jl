@@ -32,9 +32,12 @@ end
 
 @testset "run_loop!: a dead holder's key is waited out and completed" begin
     with_tail() do v, ks
+        # t0 BEFORE the marker, so `elapsed` bounds the marker's own age from above: the key must not
+        # be reclaimed before `stale_after` of it, and the heartbeat is exact (DataVault 0.8.9's
+        # `heartbeat_unix=`), so no allowance is due.
+        t0 = time()
         DataVault.mark_running!(v, ks[1])       # killed mid-key: the marker outlived the process
         n = Ref(0)
-        t0 = time()
         r = run_loop!(
             k -> (n[] += 1; Dict{String,Any}("x" => 1)),
             v,
@@ -48,7 +51,10 @@ end
         @test n[] == 1                          # it ran the key
         @test DataVault.is_done(v, ks[1])       # and the campaign is complete
         @test r.done == 1
-        @test elapsed >= 3.0                    # it waited stale_after out rather than giving up
+        # It waited stale_after out rather than giving up (the bug gave up after two empty rounds,
+        # ~1 s). Before DataVault 0.8.9 the heartbeat had whole seconds, the lock read up to 1 s
+        # older than it was, and this failed at 2.85 s and 2.90 s on hosted runners.
+        @test elapsed >= 3.0
     end
 end
 

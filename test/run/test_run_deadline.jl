@@ -52,8 +52,16 @@ end
         keys = ParamIO.expand(v.spec)
         @test length(keys) > 1
         started = Ref(0)
-        deadline = time() + 0.3
-        work = k -> (started[] += 1; sleep(0.6); Dict{String,Any}("x" => 1))
+        # The first key runs until the deadline has passed, so the test does not depend on how long
+        # `run!` takes to hand it out — only that it is under the margin. A 0.3 s margin was not:
+        # a run-start observation takes most of a second, and on a hosted runner no key was handed
+        # out at all (started == 0).
+        deadline = time() + 5.0
+        work = k -> begin
+            started[] += 1
+            sleep(max(0.0, deadline - time()) + 0.1)
+            Dict{String,Any}("x" => 1)
+        end
         r = run!(work, v, keys; opts=RunOpts(workers=:sequential, deadline=deadline))
         @test started[] >= 1                 # the first key ran
         @test started[] < length(keys)       # later keys were not handed out

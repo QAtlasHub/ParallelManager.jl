@@ -10,6 +10,7 @@
 #    (exactly the situation the try-finally fix in #8 created a regression for)
 # ─────────────────────────────────────────────────────────────────────────────
 
+using Printf: @sprintf
 using SweepRunner, Test, DataVault, ParamIO, JSON3, JLD2
 using Distributed
 using Dates
@@ -90,11 +91,20 @@ end
         # exactly the crashed-run recovery path.
         DataVault.mark_running!(v, target)
         running_path = DataVault._running_file(v, target)
+        # Both heartbeat lines, as a holder that stopped beating leaves them: age is read from
+        # `heartbeat_unix=` (DataVault 0.8.9), `heartbeat=` by older readers.
         old_str = Dates.format(Dates.now() - Dates.Second(7200), "yyyy-mm-ddTHH:MM:SS")
+        old_unix = @sprintf("%017.6f", time() - 7200)
         lines = readlines(running_path)
         open(running_path, "w") do io
             for line in lines
-                println(io, startswith(line, "heartbeat=") ? "heartbeat=$old_str" : line)
+                if startswith(line, "heartbeat_unix=")
+                    println(io, "heartbeat_unix=", old_unix)
+                elseif startswith(line, "heartbeat=")
+                    println(io, "heartbeat=", old_str)
+                else
+                    println(io, line)
+                end
             end
         end
         @test DataVault.is_running(v, target)
