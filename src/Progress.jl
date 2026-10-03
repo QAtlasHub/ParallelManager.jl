@@ -159,4 +159,4 @@ function read_progress(vault::Vault)
     return out
 end
 
-export report_progress, resume_point, read_progress, progress_dir
+export report_progress, resume_point, read_progress

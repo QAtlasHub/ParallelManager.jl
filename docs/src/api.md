@@ -149,7 +149,7 @@ SweepRunner.run_prerequisite!
 ```@docs
 SweepRunner.Campaign
 SweepRunner.StageSpec
-SweepRunner.Profile
+SweepRunner.CampaignProfile
 SweepRunner.stage_id
 SweepRunner.load_campaign
 SweepRunner.validate_campaign

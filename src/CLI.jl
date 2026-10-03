@@ -266,5 +266,3 @@ function _cli_usage(io::IO, msg::AbstractString)
     print(io, _CLI_USAGE)
     return 2
 end
-
-export cli

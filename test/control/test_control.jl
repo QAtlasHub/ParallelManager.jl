@@ -1,6 +1,7 @@
 # Control (#65): a running sweep takes requests — add work, cancel, stop, reorder, resize, pause.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed
+using SweepRunner: matches, control_dir
 
 const _CT_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")
 const _CT_BIG = joinpath(@__DIR__, "..", "run", "fixtures", "affinity.toml")
