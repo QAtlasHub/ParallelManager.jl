@@ -156,7 +156,8 @@ end
 What [`write_status`](@ref) writes: the task counts, the worker pool (planned / launched / joined
 / busy / idle, cores busy against cores allocated), one line per node, one row per worker (the key
 it is on, since when, the lock it holds, the progress last reported for that key, CPU utilisation
-and RSS), and the warnings in force.
+and RSS), the lock tokens this process has out (`held`), what the last scan found among the locks
+(`locks`), and the warnings in force.
 """
 function status_snapshot(m::Master)
     now = time()
@@ -260,6 +261,10 @@ function status_snapshot(m::Master)
         "nodes" => nodelist,
         "nodes_without_workers" => empty_nodes,
         "worker_table" => rows,
+        # Every lock a master in this process has named and not settled. This is what a sibling
+        # asks when it finds a `.running`: see `judge_lock`.
+        "held" => _out_tokens(),
+        "locks" => copy(m.locks),
         "warnings" => copy(m.warnings),
     )
 end
@@ -514,6 +519,13 @@ function print_status(io::IO, x; workers::Bool=false)
             io,
             "  cores    busy $(w["cores_busy"]) of $(w["cores_allocated"]) allocated ",
             "($(_pct(w["cores_busy"], w["cores_allocated"])))",
+        )
+        lk = get(d, "locks", Dict{String,Any}())
+        get(lk, "locks", 0) > 0 && println(
+            io,
+            "  locks    $(lk["held"]) held by $(lk["held_jobs"]) job(s), ",
+            "$(lk["reaped"]) reaped ($(lk["dead_jobs"]) dead job(s)), ",
+            "$(lk["stale"]) stale, $(lk["unknown"]) unknown",
         )
         none = d["nodes_without_workers"]
         isempty(none) || println(

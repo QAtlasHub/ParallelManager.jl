@@ -23,6 +23,7 @@ independently.
 | `TaskTable.jl`  | [`TaskTable`](@ref), [`next_task!`](@ref), [`settle!`](@ref), [`task_counts`](@ref) |
 | `Progress.jl`   | [`report_progress`](@ref), [`resume_point`](@ref)       |
 | `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
+| `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
 
 # Quick start
 
@@ -74,6 +75,7 @@ include("InitWorkers.jl")
 include("Liveness.jl")
 include("TaskTable.jl")       # the master's table of a round's units, and its queue
 include("Master.jl")          # a master's identity; state_root
+include("Locks.jl")           # judge_lock: ask the holder's master; locks(), reap_dead_locks!
 include("Run.jl")
 include("Progress.jl")        # report_progress / resume_point, the context work_fn runs in
 include("Status.jl")          # the status file a master rewrites, and reading it from outside

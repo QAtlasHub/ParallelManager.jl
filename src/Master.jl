@@ -69,6 +69,8 @@ mutable struct Master
     const progress::Dict{String,Progress}
     const warnings::Vector{String}
     const lock::ReentrantLock
+    # What the last scan found among the locks (`_scan!`'s return), for the status.
+    locks::Dict{String,Any}
     table::Union{TaskTable,Nothing}
     vault::Union{Vault,Nothing}
     stage::String
@@ -93,6 +95,7 @@ function Master()
         Dict{String,Progress}(),
         String[],
         ReentrantLock(),
+        Dict{String,Any}(),
         nothing,
         nothing,
         "",

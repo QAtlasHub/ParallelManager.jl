@@ -96,6 +96,17 @@ SweepRunner.expand_nodelist
 SweepRunner.cli
 ```
 
+## Locks
+
+```@docs
+SweepRunner.locks
+SweepRunner.LockInfo
+SweepRunner.judge_lock
+SweepRunner.lock_summary
+SweepRunner.print_locks
+SweepRunner.reap_dead_locks!
+```
+
 ## Artifacts
 
 ```@docs
