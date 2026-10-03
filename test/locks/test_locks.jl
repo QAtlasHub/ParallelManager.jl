@@ -2,6 +2,7 @@
 # reconciles the locks it finds.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3
+using SweepRunner: locks, lock_summary, next_task!, start_task!
 
 const _LK_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")
 

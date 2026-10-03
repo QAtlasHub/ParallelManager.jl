@@ -206,4 +206,4 @@ function _identify_workers!(m::Master, pids)
     return nothing
 end
 
-export state_root, Master
+export state_root

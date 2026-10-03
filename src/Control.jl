@@ -737,5 +737,8 @@ function stop_point(; poll::Real=10.0)
     return nothing
 end
 
-export control!, control_dir, read_requests, read_acks, poll_control!
-export KeyFilter, matches, should_stop, stop_point, StopRequested
+# Exported: the names that say what they are. The rest of this file's API is documented and used
+# qualified (`SweepRunner.matches`): a name that short or that common is not this package's to put in
+# a caller's namespace.
+export control!, read_requests, read_acks
+export KeyFilter, should_stop, stop_point, StopRequested

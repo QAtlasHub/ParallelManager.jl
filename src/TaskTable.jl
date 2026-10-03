@@ -316,6 +316,7 @@ function task_counts(t::TaskTable)
     end
 end
 
-export Progress, TaskRow, TaskTable
-export add_tasks!, next_task!, start_task!, settle!, hold!, requeue!, settle_queued!
-export task_counts
+# Exported: the names that say what they are. The rest of this file's API is documented and used
+# qualified (`SweepRunner.next_task!`): a name that short or that common is not this package's to put in
+# a caller's namespace.
+export TaskTable

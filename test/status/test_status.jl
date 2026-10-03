@@ -1,6 +1,7 @@
 # Status (#63): what a running sweep is doing, written where it can be asked from outside.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed
+using SweepRunner: Master, expand_nodelist
 
 const _ST_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")
 
