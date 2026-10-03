@@ -334,3 +334,91 @@ not from the next round.
 - Enqueued keys run under the stage's `work_fn`; a prerequisite stage is not
   re-run for them.
 - Growing the pool needs a `spawn` hook: `run!(…; spawn = n -> addprocs(…))`.
+
+## 12. One file for a campaign
+
+A campaign is many stages of many studies. Which run, in what order and under
+which filters is one file:
+
+```toml
+[campaign]
+name   = "2026-09"
+outdir = "out/campaign"
+
+[[study]]
+name   = "conv"
+stages = { phase1 = "conv_phase1.toml", phase2 = "conv_phase2.toml" }
+
+[[study]]
+name     = "fdtx"
+stages   = { phase1 = "fdtx_phase1.toml", phase2 = "fdtx_phase2.toml", phase3 = "fdtx_phase3.toml" }
+priority = 10                       # ahead of the others, with what it needs
+
+[[study]]
+name    = "typx"
+stages  = { phase2 = "typx_phase2.toml" }
+needs   = ["conv.phase1", "typ.phase1"]
+enabled = true
+
+[profile.short]                     # what a 30-minute job may take
+max_key_time = "20min"
+skip_stages  = ["phase1"]
+
+[profile.large]
+min_nodes = 16
+```
+
+- Config paths are relative to the meta file (or `[campaign] config_dir`).
+- A stage needs the stage before it in its study (`chain = false` turns that
+  off). `needs` on a study is what its first stage needs from other studies:
+  `"study.stage"`, or `"study"` for all of that study's stages. Stages written
+  as an array of tables (`[{name=…, config=…, needs=[…]}]`) run as written and
+  can carry their own `needs`.
+- Anything else in a study's or a profile's table is kept in `extra` and
+  handed to the application.
+
+The application's half is one function: how to open a stage.
+
+```julia
+campaign = SweepRunner.load_campaign("configs/campaign.toml")
+
+open_stage(stage) = (;
+    work_fn = WORK[stage.name],                 # required
+    # vault = DataVault.Vault(stage.config; run=stage.name, outdir=campaign.outdir),  (default)
+    # keys  = ParamIO.expand(vault.spec),                                             (default)
+    # load = MyModel, affinity = …, prerequisite = …                                  (optional)
+)
+
+SweepRunner.run_campaign!(
+    open_stage, campaign;
+    profile = get(ENV, "SWEEP_PROFILE", nothing),
+    cost    = (stage, key) -> estimated_seconds(stage, key),   # needed by max_key_time
+)
+```
+
+What a job ran is on record: `events_campaign_<host>_<pid>.jsonl` under the
+outdir has the meta file, its sha256, the profile and the stages in order,
+then one line per stage.
+
+**Check before submitting.** `bin/sweeprunner campaign configs/campaign.toml
+--profile short` prints the studies, the validation report and the plan, and
+exits non-zero when the file is not launchable: a config that is missing or
+does not load, a `needs` that names nothing, a cycle, or two stages with
+different configs that write the same project and run.
+
+**Order.** Every stage comes after the stages it needs; among the ready ones
+the highest `priority` goes first, and a stage inherits the priority of what
+needs it. A stage whose needs are not complete is not started (the result says
+which need), so a profile that skips `phase1` simply does not run the `phase2`
+whose `phase1` is not there yet.
+
+**Changing a running campaign.** The meta file is re-read between stages. Set
+`enabled = false` or raise a `priority`, and the stages not yet started are
+re-planned (`campaign_reloaded`); an edit that breaks the file is ignored and
+said so once (`campaign_reload_refused`). Within a stage, the control channel
+(guide 11) does the same job per key.
+
+**What is left.** `SweepRunner.remaining_work(open_stage, campaign; profile,
+cost)` returns, per stage, how many keys are undone, how many of them the
+profile lets a job take, their estimated cost and the longest one, and which
+needs block the stage.

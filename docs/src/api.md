@@ -144,6 +144,21 @@ SweepRunner.Prerequisite
 SweepRunner.run_prerequisite!
 ```
 
+## Campaign
+
+```@docs
+SweepRunner.Campaign
+SweepRunner.StageSpec
+SweepRunner.Profile
+SweepRunner.stage_id
+SweepRunner.load_campaign
+SweepRunner.validate_campaign
+SweepRunner.plan_campaign
+SweepRunner.run_campaign!
+SweepRunner.remaining_work
+SweepRunner.parse_duration
+```
+
 ## Preflight
 
 ```@docs
