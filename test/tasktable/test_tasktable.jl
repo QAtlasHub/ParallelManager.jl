@@ -111,3 +111,21 @@ end
     @test t.rows[2].progress.step == 3
     @test task_counts(t).failed == 1
 end
+
+@testset "TaskTable: an outcome is one of a closed set (#110)" begin
+    t = TaskTable(_tt_keys(3))
+    @test_throws ArgumentError settle!(t, 1, :typo)
+    @test_throws ArgumentError settle_queued!(t, :typo)
+    @test t.rows[1].state === :todo                             # nothing was changed
+    @test task_counts(t).todo == 3
+    for o in SweepRunner.OUTCOMES
+        settle!(t, 1, o)
+        @test t.rows[1].outcome === o
+    end
+    # Held by a sibling is counted as held, whether the scan saw it or a worker ran into it.
+    hold!(t, 2, "other:1:abcd")
+    settle!(t, 3, :lock_busy)
+    settle!(t, 1, :ok)
+    c = task_counts(t)
+    @test (c.done, c.held, c.other) == (1, 2, 0)
+end

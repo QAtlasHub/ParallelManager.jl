@@ -77,7 +77,15 @@ Execution options for [`run!`](@ref).
 
   ```julia
   RunOpts(deadline = time() + 25 * 60)   # stop dispatching 5 min before a 30 min job ends
+  RunOpts(deadline_in = 25 * 60)         # the same, said as seconds from now
   ```
+
+  `deadline_in` is the relative form (seconds from when the options are built); give one or the
+  other. A `deadline` too small to be a `time()` is warned about: it is already past.
+
+The numbers are checked when the options are built: `max_attempts >= 1`; `stale_after`,
+`heartbeat_interval` and `defer_poll` positive; the intervals and graces non-negative (`0` is
+"off" where the field says so); `min_busy_fraction` in `[0, 1]`.
 
 - `defer_poll::Float64 = 30.0` — seconds [`run!`](@ref) waits before re-dispatching keys whose
   `work_fn` threw `DataVault.ArtifactBusy` (an artifact being built by another worker or job),
@@ -144,6 +152,9 @@ struct RunOpts
     manifest_interval::Float64
 end
 
+# `time()` was past this in 2001: an absolute deadline below it was meant as a duration.
+const _DEADLINE_LOOKS_RELATIVE = 1.0e9
+
 function RunOpts(;
     workers::Symbol=:auto,
     max_attempts::Int=3,
@@ -152,6 +163,7 @@ function RunOpts(;
     stop_flag::Union{String,Nothing}=get(ENV, "SWEEPRUNNER_STOP_FLAG", nothing),
     log_level::Symbol=:info,
     deadline::Union{Real,Nothing}=nothing,
+    deadline_in::Union{Real,Nothing}=nothing,
     defer_poll::Real=30.0,
     status_interval::Real=60.0,
     control_interval::Real=10.0,
@@ -181,6 +193,57 @@ function RunOpts(;
     (shard === nothing || (shard[2] >= 1 && 0 <= shard[1] < shard[2])) || throw(
         ArgumentError("RunOpts: shard must be (i, m) with 0 <= i < m, got $(repr(shard))"),
     )
+    max_attempts >= 1 || throw(
+        ArgumentError(
+            "RunOpts: max_attempts must be >= 1, got $max_attempts (with 0 a key is given " *
+            "up on without one attempt)",
+        ),
+    )
+    # `x > 0` and `x >= 0` are false for NaN too, so a NaN is refused with the rest.
+    for (name, x) in (
+        ("stale_after", stale_after),
+        ("heartbeat_interval", heartbeat_interval),
+        ("defer_poll", defer_poll),
+    )
+        x > 0 || throw(ArgumentError("RunOpts: $name must be > 0 seconds, got $x"))
+    end
+    for (name, x) in (
+        ("status_interval", status_interval),
+        ("control_interval", control_interval),
+        ("manifest_interval", manifest_interval),
+        ("checkpoint_every", checkpoint_every),
+        ("idle_grace", idle_grace),
+        ("stop_grace", stop_grace),
+    )
+        x >= 0 ||
+            throw(ArgumentError("RunOpts: $name must be >= 0 seconds (0: off), got $x"))
+    end
+    0 <= min_busy_fraction <= 1 || throw(
+        ArgumentError(
+            "RunOpts: min_busy_fraction is a fraction of the workers, in [0, 1]; got " *
+            "$min_busy_fraction",
+        ),
+    )
+    if deadline_in !== nothing
+        deadline === nothing || throw(
+            ArgumentError(
+                "RunOpts: give `deadline` (an absolute time()) or `deadline_in` (seconds " *
+                "from now), not both",
+            ),
+        )
+        deadline_in >= 0 ||
+            throw(ArgumentError("RunOpts: deadline_in must be >= 0, got $deadline_in"))
+        deadline = time() + deadline_in
+    elseif deadline !== nothing
+        isnan(deadline) && throw(ArgumentError("RunOpts: deadline is NaN"))
+        # Every other option is seconds FROM NOW; this one is a point in time. A value that
+        # small is a duration written in its place, and the run it gives stops at once.
+        deadline < _DEADLINE_LOOKS_RELATIVE && @warn(
+            "RunOpts: deadline = $deadline is an absolute time() and is long past, so the " *
+                "run stops at once. For \"$deadline seconds from now\" write " *
+                "`deadline_in = $deadline`.",
+        )
+    end
     heartbeat_interval < stale_after || throw(
         ArgumentError(
             "RunOpts: heartbeat_interval ($heartbeat_interval) must be < " *
