@@ -103,7 +103,7 @@ julia --project --threads=8 run.jl
 
 `init_workers!(mode=:auto)` detects `Threads.nthreads() > 1` and returns
 `:threads`. For process-level parallelism, `run!` automatically fans out over
-Distributed workers via `pmap` when `nprocs() > 1` (use
+Distributed workers when `nprocs() > 1` (use
 `init_workers!(mode=:distributed|:slurm)`); with only the master it runs
 sequentially. Several independent masters can also share one vault:
 

@@ -28,6 +28,20 @@ function owner_token()::String
     return isempty(job) ? base : string(base, ":slurm", job)
 end
 
+"""
+    owner_token(host, pid) -> String
+
+A token for an acquisition that the process `pid` on `host` is about to make, written by someone
+else: the master, naming the lock its worker will take, so that it knows the name without asking.
+Same shape as `owner_token()`, and the Slurm field is this process's — a master and its workers
+share a job.
+"""
+function owner_token(host::AbstractString, pid::Integer)::String
+    base = string(host, ':', pid, ':', string(rand(UInt32); base=16, pad=8))
+    job = _slurm_queue_id()
+    return isempty(job) ? base : string(base, ":slurm", job)
+end
+
 # The id as `squeue` PRINTS it, which is not always `SLURM_JOB_ID`. In an array task that variable
 # holds a distinct raw id per task while the queue lists `<array id>_<task index>`, so stamping it
 # makes every task but the first unfindable, and unfindable reads as `:dead`.

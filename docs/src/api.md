@@ -49,6 +49,38 @@ SweepRunner.run!
 SweepRunner.run_loop!
 ```
 
+## Task table
+
+```@docs
+SweepRunner.TaskTable
+SweepRunner.TaskRow
+SweepRunner.Progress
+SweepRunner.next_task!
+SweepRunner.start_task!
+SweepRunner.settle!
+SweepRunner.hold!
+SweepRunner.requeue!
+SweepRunner.add_tasks!
+SweepRunner.settle_queued!
+SweepRunner.task_counts
+```
+
+## Progress
+
+```@docs
+SweepRunner.report_progress
+SweepRunner.resume_point
+SweepRunner.read_progress
+SweepRunner.progress_dir
+```
+
+## Master
+
+```@docs
+SweepRunner.Master
+SweepRunner.state_root
+```
+
 ## Artifacts
 
 ```@docs
@@ -58,7 +90,8 @@ SweepRunner.artifact_affinity
 ## Liveness
 
 ```@docs
-SweepRunner.owner_token
+SweepRunner.owner_token()
+SweepRunner.owner_token(::AbstractString, ::Integer)
 SweepRunner.holder_liveness
 ```
 

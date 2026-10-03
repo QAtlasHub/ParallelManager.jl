@@ -20,6 +20,8 @@ independently.
 | `Manifest.jl`   | [`Manifest`](@ref), [`load_manifest`](@ref), [`save_manifest`](@ref), [`add_complete!`](@ref), [`is_complete`](@ref), [`todo_keys`](@ref), [`manifest_path`](@ref) |
 | `InitWorkers.jl`| [`init_workers!`](@ref), [`detect_mode`](@ref)          |
 | `Run.jl`        | [`run!`](@ref), [`RunOpts`](@ref), [`manifest_root`](@ref) |
+| `TaskTable.jl`  | [`TaskTable`](@ref), [`next_task!`](@ref), [`settle!`](@ref), [`task_counts`](@ref) |
+| `Progress.jl`   | [`report_progress`](@ref), [`resume_point`](@ref)       |
 
 # Quick start
 
@@ -69,7 +71,10 @@ include("EventLog.jl")
 include("Manifest.jl")
 include("InitWorkers.jl")
 include("Liveness.jl")
+include("TaskTable.jl")       # the master's table of a round's units, and its queue
+include("Master.jl")          # a master's identity; state_root
 include("Run.jl")
+include("Progress.jl")        # report_progress / resume_point, the context work_fn runs in
 include("Observe.jl")         # one source observation per process per run!, for each .done
 include("Artifacts.jl")        # artifact_affinity; ArtifactBusy deferral lives in Run.jl
 include("Prerequisite.jl")
