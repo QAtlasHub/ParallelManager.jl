@@ -65,6 +65,8 @@ function init_workers!(;
             Int, get(ENV, "JULIA_WORKER_CPUS", get(ENV, "SLURM_CPUS_PER_TASK", "1"))
         )
         if n_workers > 0 && nprocs() == 1
+            # What the status compares the workers that actually join against.
+            note_workers!(; planned=n_workers, launched=n_workers)
             project = dirname(Base.active_project())
             # Export JULIA_WORKER_TIMEOUT so the freshly spawned workers
             # inherit a generous handshake window.  Distributed reads
@@ -88,6 +90,8 @@ function init_workers!(;
             Int, get(ENV, "JULIA_WORKER_CPUS", get(ENV, "SLURM_CPUS_PER_TASK", "1"))
         )
         if n_workers > 0 && nprocs() == 1
+            # What the status compares the workers that actually join against.
+            note_workers!(; planned=n_workers, launched=n_workers)
             project = dirname(Base.active_project())
             # BOTH the `SlurmManager()` construction AND the
             # `addprocs(mgr)` call must live inside the SAME

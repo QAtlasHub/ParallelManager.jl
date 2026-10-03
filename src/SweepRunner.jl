@@ -22,6 +22,7 @@ independently.
 | `Run.jl`        | [`run!`](@ref), [`RunOpts`](@ref), [`manifest_root`](@ref) |
 | `TaskTable.jl`  | [`TaskTable`](@ref), [`next_task!`](@ref), [`settle!`](@ref), [`task_counts`](@ref) |
 | `Progress.jl`   | [`report_progress`](@ref), [`resume_point`](@ref)       |
+| `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
 
 # Quick start
 
@@ -75,9 +76,11 @@ include("TaskTable.jl")       # the master's table of a round's units, and its q
 include("Master.jl")          # a master's identity; state_root
 include("Run.jl")
 include("Progress.jl")        # report_progress / resume_point, the context work_fn runs in
+include("Status.jl")          # the status file a master rewrites, and reading it from outside
 include("Observe.jl")         # one source observation per process per run!, for each .done
 include("Artifacts.jl")        # artifact_affinity; ArtifactBusy deferral lives in Run.jl
 include("Prerequisite.jl")
 include("Preflight.jl")
+include("CLI.jl")             # `sweeprunner status …`
 
 end # module SweepRunner

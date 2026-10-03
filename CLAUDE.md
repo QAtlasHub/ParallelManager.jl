@@ -14,7 +14,10 @@ for how the three layers fit together.
   NamedTuple `(stage, done, err, skipped, total, …)`.
 - `run_loop!(...)` — re-scan until the sweep is fully done; the production driver
   (picks up keys freed by crashed sibling masters).
-- `RunOpts(; max_attempts, stale_after, heartbeat_interval, stop_flag)`.
+- `RunOpts(; max_attempts, stale_after, heartbeat_interval, stop_flag, status_interval)`.
+- `read_status(vault | outdir)` / `print_status` / `bin/sweeprunner status <outdir>` — what every
+  master is doing (tasks, workers planned/launched/joined/busy, per-worker key, CPU, RSS), read
+  from the status file each master rewrites. A spawner reports `note_workers!(planned=, launched=)`.
 
 ## The `work_fn` contract — read this
 
@@ -51,8 +54,8 @@ for how the three layers fit together.
 
 `AtomicIO` (atomic write) · `EventLog` (JSONL) · `Manifest` (O(1) early-skip) ·
 `InitWorkers` (backend bootstrap) · `Run` (the `run!` facade) · `TaskTable` (the master's table
-of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`). Each is usable
-independently. As of v0.3 the per-key advisory lock lives entirely in
+of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`) · `Status`
+(the status file and its readers) · `CLI`. Each is usable independently. As of v0.3 the per-key advisory lock lives entirely in
 **DataVault's `.running` markers** (`acquire_running!`); `run!` calls into it
 rather than maintaining its own `locks/` tree.
 

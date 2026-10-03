@@ -81,6 +81,21 @@ SweepRunner.Master
 SweepRunner.state_root
 ```
 
+## Status
+
+```@docs
+SweepRunner.read_status
+SweepRunner.print_status
+SweepRunner.note_workers!
+SweepRunner.status_snapshot
+SweepRunner.write_status
+SweepRunner.status_path
+SweepRunner.status_tick!
+SweepRunner.WorkerSample
+SweepRunner.expand_nodelist
+SweepRunner.cli
+```
+
 ## Artifacts
 
 ```@docs

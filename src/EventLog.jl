@@ -58,6 +58,9 @@ stay within that guarantee.
 |                 | the re-dispatch bound (includes `deaths`)                          |
 | `worker_lost`   | every worker died with keys still queued; this key was left for a  |
 |                 | later run rather than completed or failed                          |
+| `workers_short` | fewer workers joined than `note_workers!` said were planned, for   |
+|                 | longer than the worker timeout (includes `planned`, `launched`,    |
+|                 | `joined`); logged once per distinct shortfall, at `:warn`          |
 | `artifact_busy` | `work_fn` threw `DataVault.ArtifactBusy`; the key is deferred, no  |
 |                 | attempt spent (includes `artifact`)                                |
 | `deferred_round`| `run!` re-dispatches its deferred keys (includes `round`, `keys`) |

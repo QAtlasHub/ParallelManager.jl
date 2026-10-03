@@ -55,6 +55,8 @@ and owns the coordination story separately.
 | [`src/TaskTable.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/TaskTable.jl) | The master's table of a round's units (state, owner, progress) and the queue the dispatcher draws from |
 | [`src/Progress.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Progress.jl)   | `report_progress` / `resume_point`: how far a unit got, handed to the next attempt                  |
 | [`src/Master.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Master.jl)       | A master's identity and its workers'; `state_root(vault)`                                          |
+| [`src/Status.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Status.jl)       | The status file each master rewrites, and `read_status` / `print_status` to ask it from outside    |
+| [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status <outdir>` (`bin/sweeprunner`)                                                  |
 
 ## Key identity: `canonical(::DataKey)`
 
