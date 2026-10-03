@@ -530,3 +530,52 @@ nothing is dispatched to them.
 [`Scheduler`](@ref SweepRunner.Scheduler). `SlurmScheduler` is the first
 backend; `MockScheduler` is what the policy's tests run against, and what you
 can try a policy on before it touches a queue.
+
+## 14. What a key cost
+
+Every finished key leaves a `key_done` record with its wall time, CPU time
+(all threads), the cores its worker had, its peak resident memory, the node it
+ran on and its class:
+
+```julia
+run_loop!(work_fn, vault, keys; key_class = k -> "N=$(k.params["system.N"])")
+```
+
+Inside `work_fn`, `SweepRunner.note_key!(segments = nseg, chi = chi)` adds
+fields to the record.
+
+```sh
+bin/sweeprunner costs out/campaign
+```
+
+```
+class                           keys  median s     p90 s  cores  used  peak GB
+N=16                            4120     212.4     388.0      1   97%     1.84
+N=32                            1890    3310.9    5120.2      4   39%     6.10
+N=64                             212   61804.0   94310.5      7   55%    11.72
+```
+
+`used` is CPU time over wall time over cores: 39% at 4 cores is the number
+that says a key class would run more work per node-hour on fewer threads.
+
+`run_loop!` writes the same table to `<state_root>/costs.json` when it ends,
+so the next job reads measurements instead of a hand-fitted formula:
+
+```julia
+table = SweepRunner.load_cost_table(vault)
+class = k -> "N=$(k.params["system.N"])"
+secs  = SweepRunner.measured_cost(table, class; fallback = k -> formula(k))   # key -> seconds
+bytes = SweepRunner.measured_mem(table, class; margin = 1.2, fallback = k -> declared(k))
+
+SweepRunner.run_campaign!(open_stage, campaign; profile = "short",
+                          cost = (stage, key) -> secs(key))
+```
+
+A class the table has not seen falls back to the application's estimate, so
+the first job of a new study still has one. `key_costs(vault)` returns the raw
+records (`KeyCost`) and `cost_summary(costs; by = c -> c.host)` groups them
+any way you like — per node, per thread count.
+
+The peak is counted from the start of the key on Linux (the kernel's
+high-water mark is reset), so it is the key's and not the largest key that
+worker ever ran.

@@ -277,6 +277,12 @@ Each key goes to a worker together with its lock token and the last progress rec
 When the queue drains, the keys that came back busy are asked about once more, since their holder
 may have finished or died while the pass ran.
 
+`key_class` is `key -> label`: the class a key's cost is recorded under (a size, a model). Every
+finished key leaves a `key_done` record with its wall time, CPU time, cores, peak memory and node;
+[`key_costs`](@ref) reads them back and [`cost_summary`](@ref) groups them by this label, so the
+next job can be sized from what keys of each class actually took. Inside `work_fn`,
+[`note_key!`](@ref) adds fields to the record.
+
 `spawn` is `n -> start n more workers`: what a `:resize` request calls to grow the pool. Without
 it the pool can only shrink.
 
@@ -345,6 +351,7 @@ function run!(
     observe::Bool=true,
     master::Union{Master,Nothing}=nothing,
     spawn=nothing,
+    key_class=nothing,
 )
     stage = Symbol(vault.run)
     # A master handed in outlives this call (`run_loop!` between rounds); one made here does not.
@@ -443,9 +450,12 @@ function run!(
             master;
             affinity=affinity,
             prepare=prepare,
+            key_class=key_class,
         )
     else
-        () -> _drive_sequential!(work_fn, vault, table, stage, log, opts, master)
+        () -> _drive_sequential!(
+            work_fn, vault, table, stage, log, opts, master; key_class=key_class
+        )
     end
     try
         _with_status(master, log) do
@@ -601,6 +611,7 @@ function _run_one_with_lock!(
     resume::Union{Progress,Nothing}=nothing,
     reap::Bool=true,
     watch::StopWatch=StopWatch(time(), "", ""),
+    class::AbstractString="",
 )
     kstr = canonical(key)
 
@@ -653,7 +664,17 @@ function _run_one_with_lock!(
 
     outcome = try
         _run_one_with_retry!(
-            work_fn, vault, key, kstr, stage, log, opts, tok; resume=resume, watch=watch
+            work_fn,
+            vault,
+            key,
+            kstr,
+            stage,
+            log,
+            opts,
+            tok;
+            resume=resume,
+            watch=watch,
+            class=class,
         )
     finally
         DataVault.stop_heartbeat(hb)
@@ -836,7 +857,8 @@ function _drive_sequential!(
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
-    master::Master,
+    master::Master;
+    key_class=nothing,
 )
     c = master.ctl
     while true
@@ -874,6 +896,7 @@ function _drive_sequential!(
                     resume=row.progress,
                     reap=false,
                     watch=StopWatch(master.started, master.id, master.job),
+                    class=_class_of(key_class, row.key),
                 ),
             )
         finally
@@ -961,6 +984,7 @@ function _drive_workers!(
     master::Master;
     affinity=nothing,
     prepare=nothing,
+    key_class=nothing,
 )
     c = master.ctl
     # All dispatch tasks and the ticker are `@async` on this task's thread, so a plain counter and
@@ -1023,6 +1047,7 @@ function _drive_workers!(
                         resume=row.progress,
                         reap=false,
                         watch=StopWatch(master.started, master.id, master.job),
+                        class=_class_of(key_class, row.key),
                     ),
                 )
             catch e
@@ -1224,19 +1249,26 @@ function _run_one_with_retry!(
     tok::AbstractString;
     resume::Union{Progress,Nothing}=nothing,
     watch::StopWatch=StopWatch(time(), "", ""),
+    class::AbstractString="",
 )
     last_err = nothing
     reported = Ref(resume !== nothing)
     for attempt in 1:opts.max_attempts
         log_event(log, :key_start; level=:debug, stage=stage, key=kstr, attempt=attempt)
         t0 = time()
+        cpu0 = _cpu_seconds()
+        notes = Dict{String,Any}()
+        # The peak is counted from here, so it is this key's and not the worker's lifetime's.
+        _reset_peak_rss()
         try
             # What `work_fn` can ask about the key it was handed (`resume_point`,
             # `report_progress`). A retry starts from what the failed attempt reported.
             if attempt > 1 && reported[]
                 resume = _read_progress_one(vault, kstr)
             end
-            ctx = KeyContext(vault, key, kstr, String(tok), resume, opts, reported, watch)
+            ctx = KeyContext(
+                vault, key, kstr, String(tok), resume, opts, reported, watch, notes
+            )
             payload = with(() -> work_fn(key), _KEY => ctx)
             payload isa Dict || error(
                 "work_fn must return a Dict (got $(typeof(payload))). " *
@@ -1271,6 +1303,14 @@ function _run_one_with_retry!(
                 secs=time() - t0,
                 attempt=attempt,
                 sha256=saved.sha256,
+                # What the key cost (Cost.jl reads these back): CPU seconds over all threads,
+                # the cores this worker has, peak resident bytes, where it ran.
+                cpu=_finite(_cpu_seconds() - cpu0),
+                cores=_my_cores(),
+                rss=_peak_rss(),
+                host=gethostname(),
+                class=String(class),
+                note=notes,
             )
             return :ok
         catch e
@@ -1363,7 +1403,7 @@ known to be missing.
 one level deep and resolved inside `work_fn`, so this is "all of the prerequisite, then all of the
 dependents", not a DAG.
 
-`affinity` and `spawn` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
+`affinity`, `spawn` and `key_class` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
 [`Master`](@ref) for all its rounds, so what a [`control!`](@ref) request changed — a cancelled
 filter, enqueued keys, a pause — holds from round to round, and a `:stop` with no scope ends the
 loop (`stopped_by = :request`).
@@ -1384,6 +1424,7 @@ function run_loop!(
     affinity=nothing,
     observe::Bool=true,
     spawn=nothing,
+    key_class=nothing,
 )
     pre = nothing
     if prerequisite !== nothing
@@ -1427,6 +1468,7 @@ function run_loop!(
             observe=observe,
             master=master,
             spawn=spawn,
+            key_class=key_class,
         )
         n_done += result.done
         n_busy = result.busy
@@ -1459,6 +1501,14 @@ function run_loop!(
     end
     master.state = :ended
     master.interval > 0 && write_status(master)
+    # What the keys cost, where the next job (and whatever sizes it) can read it.
+    if n_done > 0
+        try
+            write_cost_table(vault)
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
     return (;
         ran=true,
         rounds=rounds,
@@ -1468,6 +1518,21 @@ function run_loop!(
         prerequisite=pre,
     )
 end
+
+# The class label of a key, for its cost record. A `key_class` that throws costs the label, not
+# the key.
+function _class_of(key_class, key::DataKey)::String
+    key_class === nothing && return ""
+    try
+        return String(string(key_class(key)))
+    catch e
+        e isa InterruptException && rethrow()
+        return ""
+    end
+end
+
+# JSON has no NaN: a reading that could not be taken is `nothing`.
+_finite(x::Real) = isfinite(x) ? Float64(x) : nothing
 
 # `keys` followed by the enqueued keys it does not already hold.
 function _with_extra(keys::AbstractVector{DataKey}, extra::Vector{DataKey})

@@ -25,6 +25,7 @@ independently.
 | `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
 | `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
 | `Control.jl`    | [`control!`](@ref), [`should_stop`](@ref), [`stop_point`](@ref) |
+| `Cost.jl`       | [`key_costs`](@ref), [`cost_summary`](@ref), [`measured_cost`](@ref), [`note_key!`](@ref) |
 | `Campaign.jl`   | [`load_campaign`](@ref), [`plan_campaign`](@ref), [`run_campaign!`](@ref) |
 | `Jobs.jl`       | [`Scheduler`](@ref), [`JobPolicy`](@ref), [`decide`](@ref), [`manage!`](@ref) |
 
@@ -83,6 +84,7 @@ include("Run.jl")
 include("Control.jl")         # control!: requests to a running master; should_stop / stop_point
 include("Progress.jl")        # report_progress / resume_point, the context work_fn runs in
 include("Status.jl")          # the status file a master rewrites, and reading it from outside
+include("Cost.jl")            # what a key cost: key_costs, cost_summary, measured_cost
 include("Observe.jl")         # one source observation per process per run!, for each .done
 include("Artifacts.jl")        # artifact_affinity; ArtifactBusy deferral lives in Run.jl
 include("Prerequisite.jl")

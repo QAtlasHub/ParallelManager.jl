@@ -41,7 +41,9 @@ stay within that guarantee.
 | `key_acquired`  | the per-key lock was taken (includes `acq`); the only durable       |
 |                 | record of a claim, since a SIGKILL skips every later event         |
 | `key_start`     | before each `work_fn(key)` attempt (includes `attempt` field)     |
-| `key_done`      | after a successful `work_fn(key)` (includes `secs`, `attempt`)    |
+| `key_done`      | after a successful `work_fn(key)`: `secs` (wall), `cpu` (CPU       |
+|                 | seconds), `cores`, `rss` (peak bytes), `host`, `class`, `attempt`, |
+|                 | `sha256`, and `note` (what `work_fn` added with `note_key!`)       |
 | `lock_busy`     | another master holds the `.running` lock: found by the master's    |
 |                 | scan before dispatch, or by a worker's acquire (= `:busy`)         |
 | `lock_lost`     | our lock was reclaimed mid-work; result discarded (no double-run) |

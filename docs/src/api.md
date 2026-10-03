@@ -144,6 +144,21 @@ SweepRunner.Prerequisite
 SweepRunner.run_prerequisite!
 ```
 
+## Cost
+
+```@docs
+SweepRunner.note_key!
+SweepRunner.KeyCost
+SweepRunner.key_costs
+SweepRunner.cost_summary
+SweepRunner.write_cost_table
+SweepRunner.load_cost_table
+SweepRunner.cost_table_path
+SweepRunner.measured_cost
+SweepRunner.measured_mem
+SweepRunner.print_costs
+```
+
 ## Campaign
 
 ```@docs
