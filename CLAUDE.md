@@ -9,16 +9,30 @@ for how the three layers fit together.
 ## Role / public API
 
 - `init_workers!(mode=:auto)` — bootstrap the backend
-  (`:sequential`/`:threads`/`:distributed`/`:slurm`, chosen from env vars).
+  (`:sequential`/`:threads`/`:distributed`/`:slurm`, chosen from env vars). `sysimage=` /
+  `SWEEPRUNNER_SYSIMAGE` starts workers from an image; `max_workers=` refuses, with a message,
+  more workers than one master can start under Slurm; `worker_logs=dir` gives each worker its
+  own log file. `todo_count(vault, keys)` answers "anything to do?" before any worker starts.
 - `run!(work_fn, vault, keys; opts=RunOpts())` — execute; returns a counter
   NamedTuple `(stage, done, err, skipped, total, …)`.
 - `run_loop!(...)` — re-scan until the sweep is fully done; the production driver
   (picks up keys freed by crashed sibling masters).
 - `RunOpts(; max_attempts, stale_after, heartbeat_interval, stop_flag, status_interval,
-  control_interval)`.
+  control_interval, checkpoint_every, min_busy_fraction, idle_grace)`.
 - `read_status(vault | outdir)` / `print_status` / `bin/sweeprunner status <outdir>` — what every
   master is doing (tasks, workers planned/launched/joined/busy, per-worker key, CPU, RSS), read
   from the status file each master rewrites. A spawner reports `note_workers!(planned=, launched=)`.
+- Dispatch: `RunOpts(shard=(i, m))` (or `SWEEPRUNNER_SHARD=i/m`, or a Slurm array) makes a
+  master start on its own share of the keys; `RunOpts(order=:longest_first)` with
+  `run!(…; cost)` draws long keys first; with a `deadline`, a key whose `min_time` exceeds the
+  time left is not started (`held_back`). `collisions` counts keys lost to another master.
+- Account: the master books where the core-seconds went as it dispatches — computing (kept /
+  lost after the last `report_progress`), start-up, never started, idle by reason — and writes
+  `job_account` when it ends; `bin/sweeprunner account <outdir>` prints it.
+- Cost: every `key_done` records wall, CPU, cores, peak RSS, host and `class`
+  (`run!(…; key_class = key -> label)`); `SweepRunner.note_key!(…)` adds fields from `work_fn`.
+  `key_costs` / `cost_summary` / `bin/sweeprunner costs <outdir>` read them back, `run_loop!`
+  leaves `state_root/costs.json`, and `measured_cost` / `measured_mem` are hooks built from it.
 - `load_campaign(meta.toml)` / `validate_campaign` / `plan_campaign` / `run_campaign!(open_stage,
   campaign; profile, cost)` — a META config names the per-stage configs of a campaign, their
   order (`needs`, `priority`), which studies are `enabled`, and per-job-kind `[profile.*]`
@@ -59,6 +73,11 @@ for how the three layers fit together.
   `SweepRunner.report_progress(step; of=n)` records one. The master read the progress stamps when
   it built its task table and handed the value over with the key; a `work_fn` that walks its own
   outputs to find where to resume is doing the scan the table exists to remove.
+- **A `work_fn` that takes long keeps a checkpoint through the pipeline**, not by hand:
+  `cp = SweepRunner.checkpoint()`, `load_checkpoint(cp)`, and in the loop
+  `checkpoint_due(cp) && save_checkpoint!(cp, state; step, of)`. `checkpoint_due` is true every
+  `RunOpts.checkpoint_every` s and at once on a stop or a close deadline. Test a checkpointing
+  `work_fn` with `check_checkpoints(work_fn, vault, key).same`.
 - **A `work_fn` that can leave part-way says where: `SweepRunner.stop_point()`** after each
   step whose state is on disk. It throws `StopRequested` when the job's `stop_flag` / `deadline`
   or a `control!(…, :stop)` covers this key; `run!` spends no attempt on it. Without it a stop is
@@ -78,7 +97,7 @@ for how the three layers fit together.
 `AtomicIO` (atomic write) · `EventLog` (JSONL) · `Manifest` (O(1) early-skip) ·
 `InitWorkers` (backend bootstrap) · `Run` (the `run!` facade) · `TaskTable` (the master's table
 of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`) · `Status`
-(the status file and its readers) · `Locks` (ask the holder's master) · `Control` (requests to a
+(the status file and its readers) · `Checkpoint` · `Account` · `Cost` · `Locks` (ask the holder's master) · `Control` (requests to a
 running master) · `Campaign` (the meta config) · `Jobs` (scheduler interface, policy, ledger) ·
 `CLI`. Each is usable
 independently. As of v0.3 the per-key advisory lock lives entirely in

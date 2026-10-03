@@ -37,11 +37,17 @@ stay within that guarantee.
 | kind            | when                                                              |
 | :-------------- | :---------------------------------------------------------------- |
 | `stage_start`   | once at the top of `run!` when `todo` is non-empty                |
-| `stage_done`    | once at the bottom of `run!` when `todo` was non-empty            |
+| `stage_done`    | once at the bottom of `run!` when `todo` was non-empty: the        |
+|                 | round's totals, incl. `held_back` and `collisions` (keys handed    |
+|                 | out that another master had taken), and where its wall time went:  |
+|                 | `prepare_secs`, `scan_secs`, `dispatch_secs`, `manifest_secs`,     |
+|                 | `total_secs`                                                       |
 | `key_acquired`  | the per-key lock was taken (includes `acq`); the only durable       |
 |                 | record of a claim, since a SIGKILL skips every later event         |
 | `key_start`     | before each `work_fn(key)` attempt (includes `attempt` field)     |
-| `key_done`      | after a successful `work_fn(key)` (includes `secs`, `attempt`)    |
+| `key_done`      | after a successful `work_fn(key)`: `secs` (wall), `cpu` (CPU       |
+|                 | seconds), `cores`, `rss` (peak bytes), `host`, `class`, `attempt`, |
+|                 | `sha256`, and `note` (what `work_fn` added with `note_key!`)       |
 | `lock_busy`     | another master holds the `.running` lock: found by the master's    |
 |                 | scan before dispatch, or by a worker's acquire (= `:busy`)         |
 | `lock_lost`     | our lock was reclaimed mid-work; result discarded (no double-run) |
@@ -69,6 +75,11 @@ stay within that guarantee.
 | `campaign_reloaded` / `campaign_reload_refused` | the meta file changed under a        |
 |                 | running campaign and was taken up, or was broken and ignored       |
 | `campaign_done` | the campaign returned (`stages`, `ran`, `stopped_by`)              |
+| `held_back`     | keys this job did not start because they could not get anywhere    |
+|                 | before its deadline (`keys`, `secs_left`); once per round          |
+| `job_account`   | when a master ends: where its core-seconds went (`account`:        |
+|                 | `allocated`, `computing`, `kept`, `lost`, `keys_cut`, `startup`,   |
+|                 | `never_started`, `idle` by reason, `other`)                        |
 | `job_decision`  | what job management concluded for a partition: `action` (`submit`, |
 |                 | `hold`, `refuse`), `reason`, `node_hours`, `dry_run` (in           |
 |                 | `events_jobs_*.jsonl`)                                             |

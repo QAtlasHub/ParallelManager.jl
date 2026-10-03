@@ -69,6 +69,22 @@ end
 
 StopWatch(since, master, job) = StopWatch(since, master, job, Set{String}(), 0.0, false)
 
+# A key's checkpoint bookkeeping during one `work_fn` call (Checkpoint.jl). `mode` is `:normal`
+# under `run!`; `check_checkpoints` uses `:never` (never due) and `:cut` (always due, and cut
+# after every save).
+mutable struct CheckpointState
+    const mode::Symbol
+    last::Float64             # when the key started, then when it was last saved
+    saves::Int
+    used::Bool
+    near::Bool                # the deadline is close
+    near_saved::Bool          # ... and a save has been made since it came close
+end
+
+function CheckpointState(mode::Symbol=:normal)
+    return CheckpointState(mode, time(), 0, false, false, false)
+end
+
 """
     ControlState
 
@@ -127,6 +143,7 @@ own.
 - `table` — the [`TaskTable`](@ref) of the round in progress (or of the last one).
 - `state` — `:starting`, `:running`, `:waiting` (between rounds of a `run_loop!`), `:ended`.
 - `ctl` — the [`ControlState`](@ref): what [`control!`](@ref) requests have changed.
+- `acct` — the [`Account`](@ref): where the core-hours went, kept as it dispatches.
 
 The rest is bookkeeping for the status file (see `Status.jl`).
 """
@@ -143,6 +160,7 @@ mutable struct Master
     const warnings::Vector{String}
     const lock::ReentrantLock
     const ctl::ControlState
+    const acct::Account
     # What the last scan found among the locks (`_scan!`'s return), for the status.
     locks::Dict{String,Any}
     table::Union{TaskTable,Nothing}
@@ -152,6 +170,8 @@ mutable struct Master
     multi::Bool
     interval::Float64
     last_status::Float64
+    # Keys handed to a worker that came back because another master had taken them.
+    collisions::Int
     short_since::Float64
     short_logged::Tuple{Int,Int,Int}
 end
@@ -170,6 +190,7 @@ function Master()
         String[],
         ReentrantLock(),
         ControlState(),
+        Account(),
         Dict{String,Any}(),
         nothing,
         nothing,
@@ -178,6 +199,7 @@ function Master()
         false,
         0.0,
         0.0,
+        0,
         0.0,
         (-1, -1, -1),
     )
@@ -200,10 +222,12 @@ function _identify_workers!(m::Master, pids)
     end
     lock(m.lock) do
         for (p, a) in zip(unknown, answers)
-            a === nothing || (m.who[p] = a)
+            a === nothing && continue
+            m.who[p] = a
+            _acct_join!(m.acct, p, a.cores)
         end
     end
     return nothing
 end
 
-export state_root, Master
+export state_root

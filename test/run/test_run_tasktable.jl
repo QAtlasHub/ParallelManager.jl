@@ -2,6 +2,7 @@
 # token and resume point, and takes a dead worker's lock back itself.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed
+using SweepRunner: progress_dir
 
 const _TT_CFG = joinpath(@__DIR__, "fixtures", "study.toml")
 

@@ -1,6 +1,16 @@
 # TaskTable (#64): the master's table of a round's units, and the queue drawn from it.
 
 using SweepRunner, Test, ParamIO
+using SweepRunner:
+    Progress,
+    next_task!,
+    start_task!,
+    settle!,
+    hold!,
+    requeue!,
+    add_tasks!,
+    settle_queued!,
+    task_counts
 
 function _tt_keys(n; group=i -> 1)
     return [ParamIO.DataKey(Dict{String,Any}("i" => i, "g" => group(i)), 1) for i in 1:n]

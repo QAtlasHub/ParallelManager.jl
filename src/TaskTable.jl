@@ -34,7 +34,8 @@ One unit of a sweep in a [`TaskTable`](@ref).
 - `state` — `:todo` (queued), `:running` (handed to `worker`), `:held` (locked by another master,
   not queued), `:settled` (this round is finished with it; see `outcome`).
 - `outcome` — set when settled: `:ok`, `:already_done`, `:lock_busy`, `:deferred`, `:error`,
-  `:gave_up`, `:stop_flag`, `:stop_deadline`, `:cancelled`.
+  `:gave_up`, `:stop_flag`, `:stop_deadline`, `:cancelled`, `:no_fit` (not started: it could not
+  get anywhere before the deadline).
 - `owner` — the lock token: ours while `:running`, the holder's while `:held`.
 - `worker` — the Distributed id it was handed to (`0` when none).
 - `since` — `time()` at which it entered its current state.
@@ -316,6 +317,7 @@ function task_counts(t::TaskTable)
     end
 end
 
-export Progress, TaskRow, TaskTable
-export add_tasks!, next_task!, start_task!, settle!, hold!, requeue!, settle_queued!
-export task_counts
+# Exported: the names that say what they are. The rest of this file's API is documented and used
+# qualified (`SweepRunner.next_task!`): a name that short or that common is not this package's to put in
+# a caller's namespace.
+export TaskTable

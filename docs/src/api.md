@@ -39,6 +39,9 @@ SweepRunner.merge_and_save_manifest!
 SweepRunner.init_workers!
 SweepRunner.detect_mode
 SweepRunner.verify_workers!
+SweepRunner.srun_worker_limit
+SweepRunner.split_nodes
+SweepRunner.worker_logs!
 ```
 
 ## Run
@@ -47,6 +50,7 @@ SweepRunner.verify_workers!
 SweepRunner.RunOpts
 SweepRunner.run!
 SweepRunner.run_loop!
+SweepRunner.todo_count
 ```
 
 ## Task table
@@ -144,12 +148,47 @@ SweepRunner.Prerequisite
 SweepRunner.run_prerequisite!
 ```
 
+## Checkpoint
+
+```@docs
+SweepRunner.checkpoint
+SweepRunner.Checkpoint
+SweepRunner.load_checkpoint
+SweepRunner.save_checkpoint!
+SweepRunner.checkpoint_due
+SweepRunner.check_checkpoints
+SweepRunner.checkpoint_dir
+```
+
+## Account
+
+```@docs
+SweepRunner.Account
+SweepRunner.account_snapshot
+SweepRunner.print_account
+```
+
+## Cost
+
+```@docs
+SweepRunner.note_key!
+SweepRunner.KeyCost
+SweepRunner.key_costs
+SweepRunner.cost_summary
+SweepRunner.write_cost_table
+SweepRunner.load_cost_table
+SweepRunner.cost_table_path
+SweepRunner.measured_cost
+SweepRunner.measured_mem
+SweepRunner.print_costs
+```
+
 ## Campaign
 
 ```@docs
 SweepRunner.Campaign
 SweepRunner.StageSpec
-SweepRunner.Profile
+SweepRunner.CampaignProfile
 SweepRunner.stage_id
 SweepRunner.load_campaign
 SweepRunner.validate_campaign
