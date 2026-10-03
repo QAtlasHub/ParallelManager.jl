@@ -58,6 +58,7 @@ and owns the coordination story separately.
 | [`src/Status.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Status.jl)       | The status file each master rewrites, and `read_status` / `print_status` to ask it from outside    |
 | [`src/Locks.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Locks.jl)         | `judge_lock`: ask the holder's master whether a `.running` is real; `locks`, `reap_dead_locks!`    |
 | [`src/Control.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Control.jl)     | `control!`: requests a running master applies (enqueue, cancel, stop, prioritise, resize, drain, pause); `should_stop` / `stop_point` |
+| [`src/Pool.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Pool.jl)           | `SizedPool`: workers sized to their keys (`KeyReq`), started where a node has room; `LocalSpawner`, `SlurmStepSpawner`; `plan_spawns` |
 | [`src/Checkpoint.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Checkpoint.jl) | A key's checkpoint inside `work_fn`: `load_checkpoint`, `save_checkpoint!`, `checkpoint_due`; `check_checkpoints` |
 | [`src/Account.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Account.jl)     | Where a job's core-hours went: computing (kept / lost), start-up, never started, idle by reason |
 | [`src/Cost.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Cost.jl)           | What a key cost: `key_costs`, `cost_summary`, the per-stage table, `measured_cost` / `measured_mem` |

@@ -287,6 +287,35 @@ function measured_mem(table::AbstractDict, key_class; margin::Real=1.2, fallback
 end
 
 """
+    measured_speedup(costs, key_class) -> Function
+
+`(key, cores) -> speedup` relative to one core, from cost records taken at more than one thread
+count: per class, the median wall time at the fewest cores measured over the median at the
+largest measured count not above `cores`. A class measured at one count only, or not at all, is
+`1.0`: no claim is made that threads help. This is the `speedup` of a [`SizedPool`](@ref) with
+`threads = :finish_by`.
+"""
+function measured_speedup(costs::AbstractVector{KeyCost}, key_class)
+    by = Dict{String,Dict{Int,Vector{Float64}}}()
+    for c in costs
+        (c.cores > 0 && !isnan(c.wall)) || continue
+        push!(
+            get!(Vector{Float64}, get!(Dict{Int,Vector{Float64}}, by, c.class), c.cores),
+            c.wall,
+        )
+    end
+    med = Dict(cls => Dict(n => _quantile(sort(w), 0.5) for (n, w) in d) for (cls, d) in by)
+    return (key, cores) -> begin
+        d = get(med, String(key_class(key)), nothing)
+        (d === nothing || length(d) < 2) && return 1.0
+        base = minimum(keys(d))
+        at = [n for n in keys(d) if n <= cores]
+        isempty(at) && return 1.0
+        return d[base] / d[maximum(at)]
+    end
+end
+
+"""
     print_costs([io], vault_or_outdir)
 
 The per-class table: keys, median and p90 wall time, cores, how much of them was used, peak
@@ -319,4 +348,4 @@ function print_costs(io::IO, x)
 end
 
 export note_key!, KeyCost, key_costs, cost_summary, write_cost_table, load_cost_table
-export measured_cost, measured_mem, print_costs
+export measured_cost, measured_mem, measured_speedup, print_costs

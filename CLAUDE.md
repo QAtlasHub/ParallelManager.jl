@@ -22,6 +22,11 @@ for how the three layers fit together.
 - `read_status(vault | outdir)` / `print_status` / `bin/sweeprunner status <outdir>` — what every
   master is doing (tasks, workers planned/launched/joined/busy, per-worker key, CPU, RSS), read
   from the status file each master rewrites. A spawner reports `note_workers!(planned=, launched=)`.
+- Pool: `run!(…; pool = SizedPool(spawner; key_req = key -> KeyReq(cores, mem_gb)))` starts
+  workers of the size each key needs (no `init_workers!`), a worker only takes keys it fits,
+  a worker that dies has its key retried with more memory. `threads = :throughput | :fastest |
+  :finish_by`. `LocalSpawner` is tested with real workers; **`SlurmStepSpawner` has not been run
+  from this package** — treat a change to it as untested until it has run in an allocation.
 - Dispatch: `RunOpts(shard=(i, m))` (or `SWEEPRUNNER_SHARD=i/m`, or a Slurm array) makes a
   master start on its own share of the keys; `RunOpts(order=:longest_first)` with
   `run!(…; cost)` draws long keys first; with a `deadline`, a key whose `min_time` exceeds the
@@ -97,7 +102,7 @@ for how the three layers fit together.
 `AtomicIO` (atomic write) · `EventLog` (JSONL) · `Manifest` (O(1) early-skip) ·
 `InitWorkers` (backend bootstrap) · `Run` (the `run!` facade) · `TaskTable` (the master's table
 of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`) · `Status`
-(the status file and its readers) · `Checkpoint` · `Account` · `Cost` · `Locks` (ask the holder's master) · `Control` (requests to a
+(the status file and its readers) · `Pool` (sized workers) · `Checkpoint` · `Account` · `Cost` · `Locks` (ask the holder's master) · `Control` (requests to a
 running master) · `Campaign` (the meta config) · `Jobs` (scheduler interface, policy, ledger) ·
 `CLI`. Each is usable
 independently. As of v0.3 the per-key advisory lock lives entirely in

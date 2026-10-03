@@ -351,6 +351,13 @@ from the same point by the next job occupies a worker for nothing. Such keys are
 time a key is handed out, so as the job runs down the long keys are passed over and the short ones
 still fill it.
 
+# Workers sized to their keys
+
+`pool` is a [`SizedPool`](@ref): instead of `n` identical workers started by `init_workers!`, the
+pool starts a worker of the size a key needs (`key_req`), where a node has the room, as the queue
+is drawn, and a worker only takes the keys it can hold. A worker that dies under a key has the
+key retried with more memory.
+
 `spawn` is `n -> start n more workers`: what a `:resize` request calls to grow the pool. Without
 it the pool can only shrink.
 
@@ -425,6 +432,7 @@ function run!(
     key_class=nothing,
     cost=nothing,
     min_time=nothing,
+    pool=nothing,
 )
     stage = Symbol(vault.run)
     # A master handed in outlives this call (`run_loop!` between rounds); one made here does not.
@@ -432,7 +440,8 @@ function run!(
     master = own ? Master() : master
     log_name = "events_$(master.id).jsonl"
     log = EventLog(joinpath(vault.outdir, log_name); min_level=opts.log_level)
-    multi = opts.workers !== :sequential && nprocs() > 1
+    # A pool starts its own workers as the queue needs them, so there may be none yet.
+    multi = opts.workers !== :sequential && (nprocs() > 1 || pool !== nothing)
     master.vault = vault
     master.stage = String(stage)
     master.multi = multi
@@ -563,6 +572,8 @@ function run!(
             key_class=key_class,
             fits=fits,
             tick=flush_manifest,
+            pool=pool,
+            min_time=something(min_time, cost, Some(nothing)),
         )
     else
         () -> _drive_sequential!(
@@ -1162,6 +1173,8 @@ function _drive_workers!(
     key_class=nothing,
     fits=Returns(true),
     tick=Returns(nothing),
+    pool=nothing,
+    min_time=nothing,
 )
     c = master.ctl
     # All dispatch tasks and the ticker are `@async` on this task's thread, so a plain counter and
@@ -1170,6 +1183,9 @@ function _drive_workers!(
     idle = Condition()
     stopped = Ref(false)
     rid = rand(UInt64)
+    # With a pool: whether anything is queued, kept by the ticker, so a dispatch task whose size
+    # fits nothing right now waits for a key that will come back rather than leaving.
+    queued_now = Ref(pool !== nothing)
     # Whether keys are being held back by other masters' locks: why an idle worker is idle.
     held_now = Ref(any(r -> r.state === :held, table.rows))
     started = Set{Int}()
@@ -1210,11 +1226,24 @@ function _drive_workers!(
                 break
             end
             host in c.drained && break
-            i = (c.paused || stopped[]) ? nothing : _next_fitting!(table, pid, fits)
+            accept = if pool === nothing
+                nothing
+            else
+                row -> _pool_accepts(pool, pid, row, opts.deadline, min_time)
+            end
+            i = if c.paused || stopped[]
+                nothing
+            else
+                _next_fitting!(table, pid, fits; accept=accept)
+            end
             if i === nothing
                 # Leave when nothing is out and nothing can arrive. A paused master keeps its
-                # queue, and its dispatch tasks with it.
-                out[] == 0 && !(c.paused && !stopped[] && _has_queued(table)) && break
+                # queue, and its dispatch tasks with it; so does a pool with keys still queued
+                # that this worker's size does not fit yet.
+                out[] == 0 &&
+                    !(c.paused && !stopped[] && _has_queued(table)) &&
+                    !(queued_now[] && !stopped[]) &&
+                    break
                 w0 = time()
                 why = if c.paused
                     :paused
@@ -1254,6 +1283,7 @@ function _drive_workers!(
                 if e isa ProcessExitedException
                     died = true
                     _release_dead!(vault, row, tok, stage, log)
+                    pool === nothing || _pool_death!(pool, row, pid, log, stage)
                     row.deaths += 1
                     if row.deaths > _WORKER_DEATH_REDISPATCHES
                         log_event(
@@ -1308,11 +1338,13 @@ function _drive_workers!(
     # Start a dispatch task for every worker that does not have one. Workers present when the
     # round began were prepared by `run!`; later ones are prepared here.
     function _adopt!()
-        fresh = [p for p in workers() if !(p in started)]
+        # `workers()` is `[1]` when there are none: the master is not one of its own workers.
+        fresh = [p for p in workers() if !(p in started) && p != myid()]
         isempty(fresh) && return nothing
         late = !isempty(started)
         union!(started, fresh)
-        ready = (late && prepare !== nothing) ? prepare(fresh) : fresh
+        # A pool's workers were started after `run!` readied the ones it found, the first ones too.
+        ready = ((late || pool !== nothing) && prepare !== nothing) ? prepare(fresh) : fresh
         _identify_workers!(master, ready)
         who = lock(() -> copy(master.who), master.lock)
         n = 0
@@ -1331,15 +1363,24 @@ function _drive_workers!(
         return nothing
     end
 
+    pool === nothing || _pool_tick!(pool, table, master, log, stage, opts, min_time)
     _adopt!()
     done = Ref(false)
     idle_since = Ref(0.0)
     tick = opts.control_interval > 0 ? opts.control_interval : 10.0
+    # A pool is looked at more often than requests are: a start it does not make is idle room.
+    pool === nothing || (tick = min(tick, pool.poll))
     @async while true
         sleep(tick)
         done[] && break
         try
-            poll_control!(master, table, log, opts; affinity=affinity, force=true)
+            poll_control!(
+                master, table, log, opts; affinity=affinity, force=pool === nothing
+            )
+            if pool !== nothing
+                _pool_tick!(pool, table, master, log, stage, opts, min_time)
+                queued_now[] = _pool_wants(pool, table)
+            end
             _adopt!()
             _leave_if_underused!(master, table, out[], idle_since, opts, log)
             tick()
@@ -1354,13 +1395,24 @@ function _drive_workers!(
     failure = nothing
     try
         i = 1
-        while i <= length(tasks)                   # the list grows as workers are adopted
-            try
-                wait(tasks[i])
-            catch e
-                failure === nothing && (failure = e)
+        while true
+            while i <= length(tasks)               # the list grows as workers are adopted
+                try
+                    wait(tasks[i])
+                catch e
+                    failure === nothing && (failure = e)
+                end
+                i += 1
             end
-            i += 1
+            # A pool may have nothing started yet, or be starting the workers the queue still
+            # needs: the round is not over while it is working towards them.
+            (
+                pool !== nothing &&
+                failure === nothing &&
+                _stop_reason(opts, master) === nothing
+            ) || break
+            _pool_wants(pool, table) || break
+            sleep(min(tick, 0.2))
         end
     finally
         done[] = true
@@ -1623,7 +1675,7 @@ known to be missing.
 one level deep and resolved inside `work_fn`, so this is "all of the prerequisite, then all of the
 dependents", not a DAG.
 
-`affinity`, `spawn`, `key_class`, `cost` and `min_time` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
+`affinity`, `spawn`, `key_class`, `cost`, `min_time` and `pool` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
 [`Master`](@ref) for all its rounds, so what a [`control!`](@ref) request changed — a cancelled
 filter, enqueued keys, a pause — holds from round to round, and a `:stop` with no scope ends the
 loop (`stopped_by = :request`).
@@ -1647,6 +1699,7 @@ function run_loop!(
     key_class=nothing,
     cost=nothing,
     min_time=nothing,
+    pool=nothing,
 )
     pre = nothing
     if prerequisite !== nothing
@@ -1693,6 +1746,7 @@ function run_loop!(
             key_class=key_class,
             cost=cost,
             min_time=min_time,
+            pool=pool,
         )
         n_done += result.done
         n_busy = result.busy
@@ -1803,9 +1857,9 @@ function _fits(opts::RunOpts, need)
 end
 
 # The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
-function _next_fitting!(table::TaskTable, worker::Int, fits)
+function _next_fitting!(table::TaskTable, worker::Int, fits; accept=nothing)
     while true
-        i = next_task!(table, worker)
+        i = next_task!(table, worker; accept=accept)
         i === nothing && return nothing
         fits(table.rows[i].key) && return i
         settle!(table, i, :no_fit)

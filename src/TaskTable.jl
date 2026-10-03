@@ -145,8 +145,25 @@ function _pop_live!(t::TaskTable, v::Vector{Int})
     return nothing
 end
 
+# The first queued row of `v` (from its end: the next to come out) that `accept`s, removed from
+# `v`; rows that have left the queue are dropped on the way.
+function _pop_accepted!(t::TaskTable, v::Vector{Int}, accept)
+    j = length(v)
+    while j >= 1
+        i = v[j]
+        if !_queued(t, i)
+            deleteat!(v, j)
+        elseif accept(t.rows[i])
+            deleteat!(v, j)
+            return i
+        end
+        j -= 1
+    end
+    return nothing
+end
+
 """
-    next_task!(table, worker) -> Union{Int,Nothing}
+    next_task!(table, worker; accept=nothing) -> Union{Int,Nothing}
 
 The row index `worker` should take next, or `nothing` when the queue is empty. The row is NOT
 marked running; call [`start_task!`](@ref) with the lock token.
@@ -154,8 +171,13 @@ marked running; call [`start_task!`](@ref) with the lock token.
 Order: an urgent row first; then a row from a group this worker has already handled, most recent
 group first; otherwise from the group with the most rows outstanding, which spreads workers over
 groups. Without an affinity there is one group and this is the caller's order.
+
+`accept` is `row -> Bool`: with it, the row returned is the first, in that order, that the worker
+may take (a worker of one size passes over the keys it cannot hold); the rows passed over stay
+queued, in place.
 """
-function next_task!(t::TaskTable, worker::Int)
+function next_task!(t::TaskTable, worker::Int; accept=nothing)
+    accept === nothing || return _next_accepted!(t, worker, accept)
     return lock(t.lock) do
         while !isempty(t.urgent)
             i = popfirst!(t.urgent)
@@ -185,6 +207,33 @@ function next_task!(t::TaskTable, worker::Int)
             pushfirst!(mine, best)
             return i
         end
+    end
+end
+
+function _next_accepted!(t::TaskTable, worker::Int, accept)
+    return lock(t.lock) do
+        for (j, i) in enumerate(t.urgent)
+            _queued(t, i) && accept(t.rows[i]) || continue
+            deleteat!(t.urgent, j)
+            return i
+        end
+        mine = get!(Vector{Any}, t.seen, worker)
+        for (j, g) in enumerate(mine)
+            v = get(t.pending, g, nothing)
+            v === nothing && continue
+            i = _pop_accepted!(t, v, accept)
+            i === nothing && continue
+            j == 1 || (deleteat!(mine, j); pushfirst!(mine, g))
+            return i
+        end
+        # Largest group first, as without `accept`.
+        for g in sort!(collect(keys(t.pending)); by=g -> -length(t.pending[g]))
+            i = _pop_accepted!(t, t.pending[g], accept)
+            i === nothing && continue
+            pushfirst!(mine, g)
+            return i
+        end
+        return nothing
     end
 end
 

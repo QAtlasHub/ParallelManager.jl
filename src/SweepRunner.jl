@@ -25,6 +25,7 @@ independently.
 | `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
 | `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
 | `Control.jl`    | [`control!`](@ref), [`should_stop`](@ref), [`stop_point`](@ref) |
+| `Pool.jl`       | [`SizedPool`](@ref), [`KeyReq`](@ref), [`LocalSpawner`](@ref), [`SlurmStepSpawner`](@ref) |
 | `Checkpoint.jl` | [`save_checkpoint!`](@ref), [`load_checkpoint`](@ref), [`checkpoint_due`](@ref), [`check_checkpoints`](@ref) |
 | `Account.jl`    | [`account_snapshot`](@ref), [`print_account`](@ref) |
 | `Cost.jl`       | [`key_costs`](@ref), [`cost_summary`](@ref), [`measured_cost`](@ref), [`note_key!`](@ref) |
@@ -85,6 +86,7 @@ include("Master.jl")          # a master's identity; state_root
 include("Locks.jl")           # judge_lock: ask the holder's master; locks(), reap_dead_locks!
 include("Run.jl")
 include("Control.jl")         # control!: requests to a running master; should_stop / stop_point
+include("Pool.jl")            # SizedPool: workers sized to the keys they run
 include("Progress.jl")        # report_progress / resume_point, the context work_fn runs in
 include("Checkpoint.jl")      # save_checkpoint! / load_checkpoint / checkpoint_due inside work_fn
 include("Status.jl")          # the status file a master rewrites, and reading it from outside

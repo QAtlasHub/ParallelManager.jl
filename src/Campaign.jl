@@ -435,6 +435,7 @@ function _open(open_stage, c::Campaign, s::StageSpec; need_work::Bool=true)
         prerequisite=get(o, :prerequisite, nothing),
         key_class=get(o, :key_class, nothing),
         min_time=get(o, :min_time, nothing),
+        pool=get(o, :pool, nothing),
     )
 end
 
@@ -514,7 +515,7 @@ end
 Run the stages [`plan_campaign`](@ref) gives, each with [`run_loop!`](@ref).
 
 `open_stage(stage::StageSpec)` is the application's half: it returns a NamedTuple with `work_fn`
-and, optionally, `vault`, `keys`, `load`, `affinity`, `prerequisite`, `key_class`, `min_time`. Left out, the vault is
+and, optionally, `vault`, `keys`, `load`, `affinity`, `prerequisite`, `key_class`, `min_time`, `pool`. Left out, the vault is
 `DataVault.Vault(stage.config; run=stage.name, outdir=campaign.outdir)` and the keys are that
 config's whole grid.
 
@@ -625,6 +626,7 @@ function run_campaign!(
             key_class=o.key_class,
             cost=cost === nothing ? nothing : (k -> cost(s, k)),
             min_time=o.min_time,
+            pool=o.pool,
             loop...,
         )
         log_event(

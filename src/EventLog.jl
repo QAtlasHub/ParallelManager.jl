@@ -75,6 +75,14 @@ stay within that guarantee.
 | `campaign_reloaded` / `campaign_reload_refused` | the meta file changed under a        |
 |                 | running campaign and was taken up, or was broken and ignored       |
 | `campaign_done` | the campaign returned (`stages`, `ran`, `stopped_by`)              |
+| `pool_spawn`    | a [`SizedPool`](@ref) started workers of one size on a node        |
+|                 | (`node`, `cores`, `mem_gb`, `n`); `pool_spawn_failed` when it      |
+|                 | could not (`err`)                                                  |
+| `pool_retire`   | an idle worker whose size no queued key fits gave its room back    |
+| `pool_retry_mem`| a worker died under a key: the key is retried with more memory     |
+|                 | (`had_gb`, `next_gb`)                                              |
+| `key_too_big`   | a key needs more than any node offers, and is reported, not        |
+|                 | retried (`cores`, `mem_gb`, `node_cores`, `node_mem_gb`)           |
 | `held_back`     | keys this job did not start because they could not get anywhere    |
 |                 | before its deadline (`keys`, `secs_left`); once per round          |
 | `job_account`   | when a master ends: where its core-seconds went (`account`:        |

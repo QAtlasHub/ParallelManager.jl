@@ -790,3 +790,66 @@ again one marker at a time.
 **Where the round's time went.** `stage_done` carries `prepare_secs` (loading
 modules on workers, source observation), `scan_secs` (the pass over markers
 and locks), `dispatch_secs`, `manifest_secs` and `total_secs`.
+
+## 19. Workers sized to their keys
+
+`init_workers!` starts `n` identical workers, so a sweep whose keys differ in
+size sizes every worker for its largest key. A pool sizes each worker to the
+key it will run:
+
+```julia
+pool = SweepRunner.SizedPool(;                     # SlurmStepSpawner in a job, LocalSpawner outside
+    key_req = k -> KeyReq(k.params["resources.cores"], mem_gb(k)),
+)
+run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_workers!
+```
+
+- The pool starts a worker of the size a queued key needs, on the node that
+  keeps the most memory free after it, and a worker only takes keys it can
+  hold. Under Slurm each worker is its own job step (`srun --exact`
+  `--cpus-per-task` `--mem`), so its memory limit is its own.
+- **Backfill**: a smaller key starts past a larger one that fits nowhere yet,
+  until the larger has waited `starve_after` (600 s); from then on nothing is
+  started ahead of it, and the room it needs is freed by keys finishing.
+- **Retire**: an idle worker whose size no queued key fits gives its room back
+  after `retire_after` (120 s) when another size is waiting.
+- **Out of memory**: a worker that dies under a key has the key retried with
+  `mem_growth` (1.5×) the memory, up to what a node has (`pool_retry_mem`).
+  A first estimate that is too small costs a retry, not the node.
+- A key that needs more than any node offers is reported once
+  (`key_too_big`) and not retried forever.
+- `measured_mem(table, class; margin, fallback)` (guide 14) is a `key_req`
+  memory from what keys of that class actually peaked at.
+
+### How many threads
+
+A worker is started with more cores than its key declares when that is what
+its size stands for, by policy:
+
+| `threads` | cores given | for |
+| :-- | :-- | :-- |
+| `:throughput` (default) | the cores its memory share stands for on that node (`mem × free cores / free memory`), at most `max_threads` | charged or scarce cores: the most work per node-hour. Where memory binds before cores, a key sized by its declared cores alone strands the rest of the node |
+| `:fastest` | up to `max_threads`, with the memory that comes with them | free or abundant cores, or a key that has to finish |
+| `:finish_by` | as `:throughput`, but a key that would not reach its next checkpoint before the job's `deadline` gets the cores that get it there | a deadline |
+
+`:finish_by` needs to know how a key scales: `speedup = (key, cores) -> factor`.
+Measure it rather than assume it — run a class at more than one thread count
+and build the curve from the cost records:
+
+```julia
+sp = SweepRunner.measured_speedup(SweepRunner.key_costs(vault), class)
+pool = SweepRunner.SizedPool(; key_req, threads = :finish_by, speedup = sp, max_threads = 12)
+```
+
+A class measured at one thread count only gets `1.0`: no claim that threads
+help. (Downstream, 4 threads made a step 1.55× faster — 39% efficiency — so
+`:throughput` is the default.)
+
+### What has and has not been run
+
+The pool, the planner (`plan_spawns`, a pure function you can call with your
+own node list to see what it would start) and `LocalSpawner` are covered by
+the test suite with real local workers. `SlurmStepSpawner` and its
+`StepManager` are the downstream implementation moved here; reading the
+allocation and building the `srun` line are tested, starting job steps is not
+— that needs an allocation.

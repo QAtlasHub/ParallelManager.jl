@@ -148,6 +148,25 @@ SweepRunner.Prerequisite
 SweepRunner.run_prerequisite!
 ```
 
+## Pool
+
+```@docs
+SweepRunner.SizedPool
+SweepRunner.KeyReq
+SweepRunner.PoolNode
+SweepRunner.Spawner
+SweepRunner.LocalSpawner
+SweepRunner.SlurmStepSpawner
+SweepRunner.StepManager
+SweepRunner.default_spawner
+SweepRunner.start_workers
+SweepRunner.worker_size
+SweepRunner.plan_spawns
+SweepRunner.pool_summary
+SweepRunner.shutdown!
+SweepRunner.measured_speedup
+```
+
 ## Checkpoint
 
 ```@docs
