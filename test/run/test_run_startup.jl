@@ -219,6 +219,33 @@ end
     end
 end
 
+@testset "workers: a key that cannot fit before the deadline is not handed to one (#111)" begin
+    _su_workers(2) do
+        _su_vault() do v, outdir
+            ks = DataVault.keys(v)
+            long = Set(ParamIO.canonical.(ks[1:2]))
+            need = k -> ParamIO.canonical(k) in long ? 1000.0 : 0.01
+            r = run!(
+                k -> Dict{String,Any}("pid" => Distributed.myid()),
+                v,
+                ks;
+                opts=RunOpts(; deadline_in=60, control_interval=0),
+                min_time=need,
+            )
+            @test r.held_back == 2
+            @test r.done == length(ks) - 2
+            @test (r.busy, r.err, r.stop) == (0, 0, 0)
+            @test r.stopped_by === nothing
+            @test all(k -> DataVault.is_done(v, k) == !(ParamIO.canonical(k) in long), ks)
+            # The ones that ran, ran on the workers.
+            ran = [k for k in ks if !(ParamIO.canonical(k) in long)]
+            @test all(k -> DataVault.load(v, k)["pid"] != 1, ran)
+            ev = only([e for e in _su_events(outdir) if e.kind == "held_back"])
+            @test ev.keys == 2
+        end
+    end
+end
+
 @testset "a key of a round that is not installed is an error, not a silent nothing" begin
     k = ParamIO.DataKey(Dict{String,Any}("N" => 1), 1)
     @test_throws ErrorException SweepRunner._run_installed(UInt64(42), k)

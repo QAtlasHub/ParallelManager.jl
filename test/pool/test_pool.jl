@@ -541,3 +541,54 @@ end
         nprocs() > 1 && rmprocs(workers())
     end
 end
+
+@testset "an idle worker is retired for a key that needs its room, and a busy one is kept (#111)" begin
+    # One node of 4 cores: a small worker holds a core the large key needs all of.
+    _pl_pool(;
+        key_req=k -> k.params["N"] == 8 ? KeyReq(4, 6.0) : KeyReq(1, 1.0), retire_after=0.3
+    ) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            work = k -> (sleep(0.3); Dict{String,Any}("pid" => Distributed.myid()))
+            r = run!(work, v, ks; pool=pool, load=[:Distributed])
+            @test r.done == length(ks)
+            @test (r.err, r.busy, r.gave_up) == (0, 0, 0)     # no key lost to a retired worker
+            ev = _pl_events(outdir)
+            retired = [e for e in ev if e.kind == "pool_retire"]
+            @test !isempty(retired)
+            # Both sizes ran, which the node cannot hold at once.
+            spawned = [e for e in ev if e.kind == "pool_spawn"]
+            @test Set(e.cores for e in spawned) == Set([1, 4])
+            # No key was running on a worker when it was retired.
+            lost = [e for e in ev if e.kind in ("worker_lost", "key_requeued")]
+            @test isempty(lost)
+            # The room is what the remaining workers hold: retiring gave it back.
+            used = sum((w.size.cores for w in values(pool.workers)); init=0)
+            @test pool.free_c[gethostname()] == 4 - used
+        end
+    end
+end
+
+@testset "with a pool, a key that cannot fit before the deadline gets no worker (#111)" begin
+    _pl_pool(; key_req=k -> k.params["N"] == 8 ? KeyReq(2, 3.0) : KeyReq(1, 1.0)) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            nbig = count(k -> k.params["N"] == 8, ks)
+            need = k -> k.params["N"] == 8 ? 1000.0 : 0.01
+            r = run!(
+                k -> Dict{String,Any}("x" => 1),
+                v,
+                ks;
+                pool=pool,
+                opts=RunOpts(; deadline_in=60),
+                min_time=need,
+            )
+            @test r.held_back == nbig
+            @test r.done == length(ks) - nbig
+            @test (r.err, r.busy) == (0, 0)
+            spawned = [e for e in _pl_events(outdir) if e.kind == "pool_spawn"]
+            @test !isempty(spawned)
+            @test all(e -> e.cores == 1, spawned)             # none of the large size
+        end
+    end
+end
