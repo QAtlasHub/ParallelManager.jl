@@ -621,3 +621,59 @@ attempt.
 
 `SweepRunner.account_snapshot(master)` returns the same numbers as a `Dict`;
 `read_status(vault)[i]["account"]` reads them from outside while the job runs.
+
+## 16. Checkpoints inside a key
+
+Every job end — wall clock, cancel, a lost node, an out-of-memory kill —
+throws away what each running key did since it last saved. If saving is left
+to each `work_fn`, that is up to a whole segment per key, per job, and every
+application solves it again. The pipeline does it:
+
+```julia
+function work_fn(key)
+    cp    = SweepRunner.checkpoint()
+    state = something(SweepRunner.load_checkpoint(cp), initial_state(key))
+    while !finished(state)
+        state = advance(state)                       # one step
+        if SweepRunner.checkpoint_due(cp)
+            SweepRunner.save_checkpoint!(cp, state; step = state.step, of = nsteps)
+        end
+        SweepRunner.stop_point()                     # leave here if told to stop
+    end
+    return result(state)
+end
+```
+
+- `load_checkpoint(cp)` is the state the last attempt saved — on any worker,
+  of any job — or `nothing`.
+- `checkpoint_due(cp)` is the one question the loop asks. It is true every
+  `RunOpts.checkpoint_every` seconds (600 by default), **at once when the unit
+  has been told to stop** (the flag, the deadline, a `stop` request), and once
+  when the job's deadline comes within a minute. The application does not
+  implement the timing.
+- `save_checkpoint!(cp, state; step, of)` writes atomically, replaces the
+  previous checkpoint, and stamps the progress — which is what `sweeprunner
+  status` and `locks` show as "advancing", and what the account counts as
+  `kept` when the key is cut.
+- When the key finishes, its checkpoint and progress stamp are removed.
+
+Put `stop_point()` after the save, so a stop always leaves from a state that
+is on disk: with `checkpoint_every = 600` a 30-minute job loses nothing at its
+wall clock, instead of the tail of every running key.
+
+`state` is saved with JLD2, so it can be any Julia value JLD2 can write.
+
+### Does it really resume?
+
+A result that depends on where the key was interrupted is a wrong result that
+only shows up on a cluster. Test it on a laptop:
+
+```julia
+r = SweepRunner.check_checkpoints(work_fn, scratch_vault, key)
+@test r.same             # identical to an uninterrupted run
+@test r.restarts > 0     # it did take checkpoints
+```
+
+`check_checkpoints` runs the key once straight through and once cut
+immediately after **every** `save_checkpoint!` and restarted from it, and
+compares the two results.

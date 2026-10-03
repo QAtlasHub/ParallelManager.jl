@@ -144,6 +144,18 @@ SweepRunner.Prerequisite
 SweepRunner.run_prerequisite!
 ```
 
+## Checkpoint
+
+```@docs
+SweepRunner.checkpoint
+SweepRunner.Checkpoint
+SweepRunner.load_checkpoint
+SweepRunner.save_checkpoint!
+SweepRunner.checkpoint_due
+SweepRunner.check_checkpoints
+SweepRunner.checkpoint_dir
+```
+
 ## Account
 
 ```@docs
