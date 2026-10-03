@@ -269,3 +269,74 @@ end
         @test r.done == count(k -> ParamIO.param(k, "L") == 8, ks)
     end
 end
+
+# One master as its own process: it runs the sweep with its shard, appends a line to a file per
+# key for every time `work_fn` ran, and writes the order it ran them in.
+const _DP_MASTER = raw"""
+using SweepRunner, DataVault, ParamIO
+cfg, outdir, i, m, go = ARGS[1], ARGS[2], parse(Int, ARGS[3]), parse(Int, ARGS[4]), ARGS[5]
+v = DataVault.Vault(cfg; run="procs", outdir=outdir)
+ks = DataVault.keys(v)
+order = String[]
+work = k -> begin
+    c = ParamIO.canonical(k)
+    open(io -> println(io, getpid()), joinpath(outdir, "ran", string(hash(c))), "a")
+    push!(order, c)
+    sleep(0.2)
+    return Dict{String,Any}("pid" => getpid())
+end
+touch(joinpath(outdir, "ready_$i"))
+while !isfile(go)                       # both start their rounds together
+    sleep(0.02)
+end
+r = run_loop!(work, v, ks; opts=RunOpts(; shard=(i, m), control_interval=0), idle_sleep=0.5)
+write(joinpath(outdir, "order_$i"), join(order, "\n"))
+write(joinpath(outdir, "result_$i"), string(r.remaining))
+"""
+
+@testset "two masters in separate processes: every key once, each starting on its share (#111)" begin
+    _dp_vault(; run="procs") do v, outdir
+        ks = DataVault.keys(v)
+        mkpath(joinpath(outdir, "ran"))
+        script = joinpath(outdir, "master.jl")
+        write(script, _DP_MASTER)
+        go = joinpath(outdir, "go")
+        julia = `$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project()))`
+        procs = [
+            run(
+                pipeline(
+                    `$julia $script $_DP_CFG $outdir $i 2 $go`;
+                    stdout=joinpath(outdir, "out_$i"),
+                    stderr=joinpath(outdir, "err_$i"),
+                );
+                wait=false,
+            ) for i in 0:1
+        ]
+        t0 = time()
+        while !all(i -> isfile(joinpath(outdir, "ready_$i")), 0:1) && time() - t0 < 300
+            all(process_running, procs) || break
+            sleep(0.1)
+        end
+        touch(go)
+        foreach(wait, procs)
+        for (i, p) in zip(0:1, procs)
+            success(p) ||
+                @error "master $i failed" err = read(joinpath(outdir, "err_$i"), String)
+            @test success(p)
+            @test read(joinpath(outdir, "result_$i"), String) == "0"
+        end
+        # Exactly once: `work_fn` ran one time for each key, across both processes.
+        @test all(k -> DataVault.is_done(v, k), ks)
+        for k in ks
+            f = joinpath(outdir, "ran", string(hash(ParamIO.canonical(k))))
+            @test isfile(f) && length(readlines(f)) == 1
+        end
+        # Both took part, and each began with a key of its own share.
+        orders = [readlines(joinpath(outdir, "order_$i")) for i in 0:1]
+        @test all(!isempty, orders)
+        for i in 0:1
+            @test SweepRunner._shard_of(first(orders[i + 1]), 2) == i
+        end
+        @test isempty(intersect(orders...))
+    end
+end

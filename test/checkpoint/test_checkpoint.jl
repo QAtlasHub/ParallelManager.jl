@@ -93,6 +93,83 @@ end
     end
 end
 
+# The file a key's checkpoint lives in.
+function _ck_file(v, k)
+    return joinpath(
+        checkpoint_dir(v), SweepRunner._key_hash(ParamIO.canonical(k)) * ".jld2"
+    )
+end
+
+function _ck_events(outdir)
+    logs = filter(f -> startswith(f, "events_") && endswith(f, ".jsonl"), readdir(outdir))
+    return [JSON3.read(l) for f in logs for l in readlines(joinpath(outdir, f))]
+end
+
+@testset "damaged checkpoints: each kind starts over, is kept aside and said (#111)" begin
+    # A real checkpoint to damage: cut a run after its second step.
+    function real_checkpoint(v, k)
+        run!(_ck_work(3; fail_at=2), v, [k]; opts=RunOpts(; max_attempts=1))
+        @test isfile(_ck_file(v, k))
+        return read(_ck_file(v, k))
+    end
+    damage = [
+        "cut short, its header intact" =>
+            (v, k, bytes) -> write(_ck_file(v, k), bytes[1:(length(bytes) ÷ 2)]),
+        "a JLD2 file without the state" =>
+            (v, k, bytes) -> SweepRunner.JLD2.jldsave(_ck_file(v, k); saved_at=time()),
+        "empty" => (v, k, bytes) -> write(_ck_file(v, k), UInt8[]),
+    ]
+    for (what, break!) in damage
+        _ck_vault() do v, outdir
+            k = DataVault.keys(v)[1]
+            bytes = real_checkpoint(v, k)
+            break!(v, k, bytes)
+            starts = Int[]
+            r = run!(_ck_work(3; starts), v, [k])
+            @testset "$what" begin
+                @test r.done == 1
+                @test starts == [0]                           # from the beginning
+                @test DataVault.load(v, k)["acc"] == sum(1:3) * k.params["N"]
+                ev = [e for e in _ck_events(outdir) if e.kind == "checkpoint_unreadable"]
+                @test length(ev) == 1
+                @test ev[1].kept !== nothing && isfile(ev[1].kept)   # not overwritten
+            end
+        end
+    end
+end
+
+@testset "a temporary file left by a killed save is not a checkpoint (#111)" begin
+    _ck_vault() do v, outdir
+        k = DataVault.keys(v)[1]
+        mkpath(checkpoint_dir(v))
+        orphan = string(_ck_file(v, k)[1:(end - 5)], ".tmp.99999.12345.jld2")
+        write(orphan, "half a save")
+        starts = Int[]
+        r = run!(_ck_work(3; starts), v, [k])
+        @test r.done == 1
+        @test starts == [0]
+        @test !any(e -> e.kind == "checkpoint_unreadable", _ck_events(outdir))
+        @test !isfile(_ck_file(v, k))                         # the key's own is cleaned up
+    end
+end
+
+@testset "through run!, a resumed key gives what an uninterrupted one gives (#111)" begin
+    _ck_vault() do v, _
+        ks = DataVault.keys(v)
+        k, plain = ks[1], ks[2]
+        starts = Int[]
+        # Fails after step 3; the retry resumes from the checkpoint of step 3.
+        r = run!(_ck_work(6; fail_at=3, starts), v, [k]; opts=RunOpts(; max_attempts=2))
+        @test r.done == 1
+        @test starts == [0, 3]
+        got = DataVault.load(v, k)
+        run!(_ck_work(6), v, [plain])
+        want = DataVault.load(v, plain)
+        @test got["steps"] == want["steps"] == 6
+        @test got["acc"] / k.params["N"] == want["acc"] / plain.params["N"] == sum(1:6)
+    end
+end
+
 @testset "checkpoint_due: every checkpoint_every seconds" begin
     _ck_vault() do v, _
         k = DataVault.keys(v)[1]
