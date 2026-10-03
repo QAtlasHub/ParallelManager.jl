@@ -127,6 +127,7 @@ own.
 - `table` — the [`TaskTable`](@ref) of the round in progress (or of the last one).
 - `state` — `:starting`, `:running`, `:waiting` (between rounds of a `run_loop!`), `:ended`.
 - `ctl` — the [`ControlState`](@ref): what [`control!`](@ref) requests have changed.
+- `acct` — the [`Account`](@ref): where the core-hours went, kept as it dispatches.
 
 The rest is bookkeeping for the status file (see `Status.jl`).
 """
@@ -143,6 +144,7 @@ mutable struct Master
     const warnings::Vector{String}
     const lock::ReentrantLock
     const ctl::ControlState
+    const acct::Account
     # What the last scan found among the locks (`_scan!`'s return), for the status.
     locks::Dict{String,Any}
     table::Union{TaskTable,Nothing}
@@ -170,6 +172,7 @@ function Master()
         String[],
         ReentrantLock(),
         ControlState(),
+        Account(),
         Dict{String,Any}(),
         nothing,
         nothing,
@@ -200,7 +203,9 @@ function _identify_workers!(m::Master, pids)
     end
     lock(m.lock) do
         for (p, a) in zip(unknown, answers)
-            a === nothing || (m.who[p] = a)
+            a === nothing && continue
+            m.who[p] = a
+            _acct_join!(m.acct, p, a.cores)
         end
     end
     return nothing

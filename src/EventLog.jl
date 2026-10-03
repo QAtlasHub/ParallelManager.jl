@@ -71,6 +71,9 @@ stay within that guarantee.
 | `campaign_reloaded` / `campaign_reload_refused` | the meta file changed under a        |
 |                 | running campaign and was taken up, or was broken and ignored       |
 | `campaign_done` | the campaign returned (`stages`, `ran`, `stopped_by`)              |
+| `job_account`   | when a master ends: where its core-seconds went (`account`:        |
+|                 | `allocated`, `computing`, `kept`, `lost`, `keys_cut`, `startup`,   |
+|                 | `never_started`, `idle` by reason, `other`)                        |
 | `job_decision`  | what job management concluded for a partition: `action` (`submit`, |
 |                 | `hold`, `refuse`), `reason`, `node_hours`, `dry_run` (in           |
 |                 | `events_jobs_*.jsonl`)                                             |

@@ -471,6 +471,8 @@ function run!(
         # not say.
         master.state = after
         master.interval > 0 && status_tick!(master, log)
+        # A master of its own ends here; one handed in (`run_loop!`) reports when the loop ends.
+        own && log_event(log, :job_account; stage=stage, account=account_snapshot(master))
     end
 
     # Aggregate outcomes into counters + manifest updates.
@@ -883,6 +885,7 @@ function _drive_sequential!(
         tok = owner_token()
         start_task!(table, i, tok, myid())
         _out_add!(tok, vault, row.key)
+        t0 = time()
         outcome = try
             last(
                 _run_one_with_lock!(
@@ -903,8 +906,27 @@ function _drive_sequential!(
             _out_remove!(tok)
         end
         delete!(c.stopping, row.kstr)
+        _account_key!(master, vault, row, myid(), t0, outcome)
         settle!(table, i, outcome)
     end
+    return nothing
+end
+
+# Book the time a key was out. A key that did not finish keeps what it had reported as progress
+# during this attempt; the rest of the attempt is lost.
+function _account_key!(
+    master::Master, vault::Vault, row::TaskRow, worker::Int, t0::Float64, outcome
+)
+    t1 = time()
+    finished = outcome === :ok || outcome === :already_done
+    at = nothing
+    if !finished
+        p = _read_progress_one(vault, row.kstr)
+        (p !== nothing && p.at >= t0) && (at = p.at)
+    end
+    # Work was thrown away, as opposed to the key coming straight back because someone held it.
+    cut = outcome === nothing || outcome in (:error, :gave_up, :stopped)
+    _acct_key!(master.acct, worker, t0, t1, finished, at; cut=cut)
     return nothing
 end
 
@@ -992,6 +1014,8 @@ function _drive_workers!(
     out = Ref(0)
     idle = Condition()
     stopped = Ref(false)
+    # Whether keys are being held back by other masters' locks: why an idle worker is idle.
+    held_now = Ref(any(r -> r.state === :held, table.rows))
     started = Set{Int}()
     tasks = Task[]
 
@@ -1023,7 +1047,18 @@ function _drive_workers!(
                 # Leave when nothing is out and nothing can arrive. A paused master keeps its
                 # queue, and its dispatch tasks with it.
                 out[] == 0 && !(c.paused && !stopped[] && _has_queued(table)) && break
+                w0 = time()
+                why = if c.paused
+                    :paused
+                elseif stopped[]
+                    :stopping
+                elseif held_now[]
+                    :lock_busy
+                else
+                    :queue_empty
+                end
                 wait(idle)
+                _acct_idle!(master.acct, pid, why, w0, time())
                 continue
             end
             row = table.rows[i]
@@ -1031,6 +1066,7 @@ function _drive_workers!(
             start_task!(table, i, tok, pid)
             _out_add!(tok, vault, row.key)
             out[] += 1
+            t0 = time()
             died = false
             outcome = try
                 last(
@@ -1090,6 +1126,7 @@ function _drive_workers!(
                 # not at all. Whatever it is, the unit was stopped, not failed.
                 order.cut && outcome !== :ok && (outcome = :stopped)
             end
+            _account_key!(master, vault, row, pid, t0, outcome)
             if outcome === nothing
                 # What it had reported before it died is where the next worker starts.
                 row.progress = _read_progress_one(vault, row.kstr)
@@ -1140,6 +1177,7 @@ function _drive_workers!(
             poll_control!(master, table, log, opts; affinity=affinity, force=true)
             _adopt!()
             _leave_if_underused!(master, table, out[], idle_since, opts, log)
+            held_now[] = lock(() -> any(r -> r.state === :held, table.rows), table.lock)
         catch e
             log_event(log, :control_failed; level=:warn, stage=stage, err=_short_err(e))
         end
@@ -1501,6 +1539,14 @@ function run_loop!(
     end
     master.state = :ended
     master.interval > 0 && write_status(master)
+    log_event(
+        EventLog(
+            joinpath(vault.outdir, "events_$(master.id).jsonl"); min_level=opts.log_level
+        ),
+        :job_account;
+        stage=Symbol(vault.run),
+        account=account_snapshot(master),
+    )
     # What the keys cost, where the next job (and whatever sizes it) can read it.
     if n_done > 0
         try

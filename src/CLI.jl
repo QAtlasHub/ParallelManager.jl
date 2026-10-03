@@ -22,6 +22,10 @@ usage: sweeprunner <command> <outdir> [options]
       Every .running lock under <outdir>: who holds it, heartbeat and progress age, and whether
       its holder's master says it is held, dead, or cannot be asked. Removes nothing.
 
+  account <outdir>
+      Where each master's core-hours went: computing (kept / lost), start-up, workers that never
+      started, idle by reason.
+
   costs <outdir>
       What finished keys cost, per class: count, median and p90 wall time, cores and how much
       of them was used, peak memory.
@@ -82,6 +86,11 @@ function cli(args::AbstractVector{<:AbstractString}=ARGS; io::IO=stdout)
     end
     if cmd == "jobs"
         return _cli_jobs(io, rest)
+    end
+    if cmd == "account"
+        length(pos) == 1 || return _cli_usage(io, "account takes one <outdir>")
+        print_account(io, pos[1])
+        return 0
     end
     if cmd == "costs"
         length(pos) == 1 || return _cli_usage(io, "costs takes one <outdir>")
