@@ -40,6 +40,11 @@ end
     @test s("UNLIMITED") == Inf
     @test s("N/A") == 0.0
     @test s("") == 0.0
+    t = SweepRunner._slurm_time
+    @test t("1-02:03:04") == s("1-02:03:04")
+    @test t("soon") === nothing                       # unreadable is not zero
+    @test t("1-xx:00") === nothing
+    @test t("x-01:00") === nothing
     @test SweepRunner._slurm_minutes(1800) == "30"
     @test SweepRunner._slurm_minutes(1801) == "31"          # rounded up, never short
     @test SweepRunner._slurm_minutes(5) == "1"
@@ -50,9 +55,9 @@ end
     answers = Dict{String,Any}(
         "sbatch" => "4242;cluster\n",
         "squeue" =>
-            "\"4242|t-short|short|RUNNING|2|30:00|10:00\"\n" *
-            "4243|t-short|short|PENDING|2|30:00|0:00\n" *
-            "4244|other|long|COMPLETING|16|1-00:00:00|23:59:59\n",
+            "\"4242|short|RUNNING|2|30:00|10:00|t-short\"\n" *
+            "4243|short|PENDING|2|30:00|0:00|t-short\n" *
+            "4244|long|COMPLETING|16|1-00:00:00|23:59:59|a|name|with|bars\n",
         "scancel" => "",
         "scontrol" => "",
     )
@@ -91,6 +96,15 @@ end
     @test [j.state for j in js] == [:running, :pending, :other]
     @test (js[1].nodes, js[1].time_limit, js[1].elapsed) == (2, 1800.0, 600.0)
     @test js[3].time_limit == 86400.0
+    @test js[3].name == "a|name|with|bars"            # the separator inside a job name
+    # A line or a time that cannot be read refuses the whole answer: a job skipped is a job
+    # that is not charged.
+    answers["squeue"] = "4242|short|RUNNING|2|30:00\n"
+    @test_throws ErrorException job_states(s)
+    answers["squeue"] = "4242|short|RUNNING|2|soon|10:00|t-short\n"
+    @test_throws ErrorException job_states(s)
+    answers["squeue"] = "4242|short|RUNNING|two|30:00|10:00|t-short\n"
+    @test_throws ErrorException job_states(s)
 
     answers["squeue"] = "20:00\n"
     @test remaining_time(s, "4242") == 1200.0
@@ -115,28 +129,107 @@ end
 @testset "Ledger: node-hours used and committed, kept across restarts" begin
     l = _jb_ledger()
     spec = JobSpec(; name="t-a", partition="a", nodes=4, time_limit=7200.0, script="s")
-    SweepRunner.record_submit!(l, "1", spec)
-    SweepRunner.record_submit!(l, "2", spec)
+    SweepRunner.record_submit!(l, "1", spec; now=1000.0)
+    SweepRunner.record_submit!(l, "2", spec; now=1000.0)
     nh = node_hours(l)
     @test nh.used == 0.0
     @test nh.committed == 2 * 4 * 2.0                        # two jobs, 4 nodes, 2 h each
 
-    # Job 1 has run for an hour; job 2 is gone from the queue without ever being seen running.
-    SweepRunner.observe!(l, [JobState("1", "t-a", "a", :running, 4, 7200.0, 3600.0)])
+    # Job 1 has run for an hour. Job 2 is not listed: absent once is not ended.
+    seen = [JobState("1", "t-a", "a", :running, 4, 7200.0, 3600.0)]
+    SweepRunner.observe!(l, seen; now=5000.0)
+    @test l.jobs["2"]["ended"] == false
+    @test l.jobs["2"]["missing"] == 1
     nh = node_hours(l)
     @test nh.used == 4.0
-    @test nh.committed == 4.0
+    @test nh.committed == 4.0 + 8.0                          # job 2 still commits its 2 h
+    # Absent three polls in a row: ended. It was pending when last seen, 4200 s ago; it can
+    # have run that long, and is billed for it — not for the 0 s that was last read.
+    SweepRunner.observe!(l, seen; now=5100.0)
+    SweepRunner.observe!(l, seen; now=5200.0)
     @test l.jobs["2"]["ended"] == true
-    @test nh.by_partition["a"] == (; used=4.0, committed=4.0)
+    @test l.jobs["2"]["elapsed"] == 4200.0
+    @test node_hours(l).by_partition["a"].used ≈ 4.0 + 4 * 4200 / 3600
 
-    SweepRunner.observe!(l, JobState[])                      # job 1 ended too
-    nh = node_hours(l)
-    @test (nh.used, nh.committed) == (4.0, 0.0)
+    # A job in a state that is neither RUNNING nor PENDING is listed, so it exists.
+    SweepRunner.observe!(
+        l, [JobState("1", "t-a", "a", :other, 4, 7200.0, 3700.0)]; now=5300.0
+    )
+    @test l.jobs["1"]["ended"] == false
+    @test l.jobs["1"]["state"] == "other"
+    @test l.jobs["1"]["elapsed"] == 3700.0
+    # A job taken as ended that is listed again is live again.
+    SweepRunner.observe!(
+        l, [JobState("2", "t-a", "a", :running, 4, 7200.0, 4300.0)]; now=5400.0
+    )
+    @test l.jobs["2"]["ended"] == false
+    @test l.jobs["2"]["missing"] == 0
+    # A vanished running job is billed up to its time limit at most.
+    for t in (9.0e4, 9.1e4, 9.2e4)
+        SweepRunner.observe!(l, JobState[]; now=t)
+    end
+    @test l.jobs["2"]["ended"] == true
+    @test l.jobs["2"]["elapsed"] == 7200.0
 
     SweepRunner.save_ledger(l)
     again = Ledger(l.path)
-    @test node_hours(again).used == 4.0
+    @test node_hours(again).used == node_hours(l).used
     @test again.jobs["1"]["partition"] == "a"
+end
+
+@testset "Ledger: a submission is on record before the scheduler answers" begin
+    l = _jb_ledger()
+    spec = JobSpec(; name="t-a", partition="a", nodes=2, time_limit=3600.0, script="s")
+    tmp = SweepRunner.record_intent!(l, spec; now=100.0)
+    @test isfile(l.path)                                     # saved at once
+    @test Ledger(l.path).jobs[tmp]["state"] == "submitting"
+    @test node_hours(l).committed == 2.0                     # it counts from here
+    SweepRunner.confirm_submit!(l, tmp, "77")
+    @test !haskey(l.jobs, tmp) && l.jobs["77"]["state"] == "pending"
+
+    # sbatch timed out, so the id is not known — but the job is in the queue: found by name.
+    tmp = SweepRunner.record_intent!(l, spec; now=200.0)
+    listed = [
+        JobState("77", "t-a", "a", :running, 2, 3600.0, 60.0),
+        JobState("78", "t-a", "a", :pending, 2, 3600.0, 0.0),
+        JobState("90", "other", "a", :pending, 2, 3600.0, 0.0),
+    ]
+    SweepRunner.observe!(l, listed; now=300.0)
+    @test !haskey(l.jobs, tmp)
+    @test l.jobs["78"]["state"] == "pending"
+    @test !haskey(l.jobs, "90")                              # not ours: not adopted
+    # One that never reached the queue stops counting after it has been absent long enough.
+    tmp = SweepRunner.record_intent!(l, spec; now=400.0)
+    for t in (500.0, 600.0)
+        SweepRunner.observe!(l, listed; now=t)
+        @test l.jobs[tmp]["ended"] == false
+    end
+    SweepRunner.observe!(l, listed; now=700.0)
+    @test l.jobs[tmp]["ended"] == true
+    @test l.jobs[tmp]["elapsed"] == 0.0                      # it never ran
+end
+
+@testset "policies refuse values that would switch the budget off" begin
+    ok = (; name="p", nodes=1, time_limit=60.0, script="s")
+    @test_throws ArgumentError PartitionPolicy(; ok..., nodes=0)
+    @test_throws ArgumentError PartitionPolicy(; ok..., nodes=-2)
+    @test_throws ArgumentError PartitionPolicy(; ok..., time_limit=NaN)
+    @test_throws ArgumentError PartitionPolicy(; ok..., time_limit=-1.0)
+    @test_throws ArgumentError PartitionPolicy(; ok..., time_limit=Inf)
+    @test_throws ArgumentError PartitionPolicy(; ok..., slots_per_node=0)
+    @test_throws ArgumentError PartitionPolicy(; ok..., max_jobs=-1)
+    @test_throws ArgumentError PartitionPolicy(; ok..., key_time=0.0)
+    p = PartitionPolicy(; ok...)
+    @test_throws ArgumentError JobPolicy(; name="t", partitions=[p], budget_node_hours=NaN)
+    @test_throws ArgumentError JobPolicy(; name="t", partitions=[p], budget_node_hours=-1)
+    @test_throws ArgumentError JobPolicy(; name="t", partitions=[p], budget_node_hours=Inf)
+    @test_throws ArgumentError JobPolicy(; name="", partitions=[p], budget_node_hours=1)
+    @test_throws ArgumentError JobPolicy(; name="t", partitions=[p, p], budget_node_hours=1)
+    @test_throws ArgumentError JobPolicy(;
+        name="t", partitions=[p], budget_node_hours=1, default_key_time=0
+    )
+    @test JobPolicy(; name="t", partitions=[p], budget_node_hours=0).budget_node_hours ==
+        0.0
 end
 
 @testset "decide: nothing runnable means nothing submitted" begin
@@ -177,10 +270,17 @@ end
     # As many slots as units are already there: another job would have nothing to take.
     ds = decide(_jb_policy(), _jb_work(8, 1e9), [running("1")], _jb_ledger())
     @test only(ds).action === :hold
-    # Jobs that are not ours do not count.
-    theirs = JobState("9", "someone", "short", :running, 2, 1800.0, 0.0)
-    ds = decide(_jb_policy(), _jb_work(20, 12000), [theirs], _jb_ledger())
-    @test [d.action for d in ds] == [:submit]
+    # Jobs that are not ours do not count — and "ours" is the exact name, not a prefix: a policy
+    # named `t` does not claim the jobs of one named `t2`.
+    for name in ("someone", "t2-short", "t-shorter", "t")
+        theirs = JobState("9", name, "short", :running, 2, 1800.0, 0.0)
+        ds = decide(_jb_policy(), _jb_work(20, 12000), [theirs], _jb_ledger())
+        @test [d.action for d in ds] == [:submit]
+    end
+    # A job of ours in a state that is neither RUNNING nor PENDING still holds its place.
+    odd = JobState("1", "t-short", "short", :other, 2, 1800.0, 0.0)
+    ds = decide(_jb_policy(), _jb_work(20, 12000), [odd], _jb_ledger())
+    @test only(ds).action === :hold
 end
 
 @testset "decide: max_jobs, per partition and overall" begin
@@ -265,10 +365,18 @@ end
 
     # A new controller on the same outdir starts from the ledger on disk.
     ctl2 = JobController(sched, _jb_policy(; dry_run=false, budget_node_hours=5.5), outdir)
+    @test length(ctl2.ledger.jobs) == 5
     empty!(sched.jobs)                                         # they all ended, unused
+    # The scheduler lists nothing while the ledger has live jobs: not trusted at once. Nothing
+    # is submitted on it, and it takes three such answers for the jobs to count as ended.
+    for _ in 1:3
+        ds = manage!(ctl2, _jb_work(100, 60000))
+        @test all(d -> d.action === :refuse && occursin("not trusted", d.reason), ds)
+    end
+    @test length(sched.submitted) == 5
+    @test all(j -> j["ended"] == true, values(ctl2.ledger.jobs))
     ds = manage!(ctl2, _jb_work(100, 60000))
-    @test count(j -> j["ended"] == true, values(ctl2.ledger.jobs)) == 5    # the first five
-    @test count(d -> d.action === :submit, ds) == 5            # nothing was used: 5.5 allows 5
+    @test count(d -> d.action === :submit, ds) == 5            # next to nothing was used
 end
 
 @testset "controller_loop!: stops when nothing is left and nothing of ours is live" begin
@@ -286,7 +394,9 @@ end
         return w
     end
     rounds = controller_loop!(ctl, work; interval=0.01, max_rounds=10)
-    @test rounds == 3            # submit; held while it runs; nothing left and none live
+    # submit; held while it runs; three rounds for its absence to count as ended; then nothing
+    # left and none live.
+    @test rounds == 6
     @test length(sched.submitted) == 1
 end
 
@@ -361,7 +471,6 @@ end
         @test !occursin("dry run", text)
 
         # Once the work is done there is nothing to submit, whatever the queue looks like.
-        empty!(sched.jobs)
         v = DataVault.Vault(joinpath(dir, "study.toml"); run="phase1", outdir=out)
         run!(k -> Dict{String,Any}("x" => 1), v, DataVault.keys(v))
         text = sprint(io -> SweepRunner.cli(["jobs", meta, "--submit"]; io=io))
@@ -407,8 +516,19 @@ end
     )
     ds = manage!(ctl, _jb_work(100, 60000))
     @test count(d -> d.action === :submit, ds) == 2
-    @test isempty(ctl.ledger.jobs)
     @test count(e -> e.kind == "job_submit_failed", _jb_events(outdir)) == 2
+    # Whether the scheduler took them is not known, so they stay on record and committed...
+    @test length(ctl.ledger.jobs) == 2
+    @test all(j -> j["state"] == "submitting", values(ctl.ledger.jobs))
+    @test node_hours(ctl.ledger).committed == 2.0
+    @test node_hours(Ledger(ctl.ledger.path)).committed == 2.0     # and on disk
+    # ...until they have been absent from the queue long enough.
+    quiet = _jb_work(0)
+    for _ in 1:3
+        manage!(ctl, quiet)
+    end
+    @test node_hours(ctl.ledger).committed == 0.0
+    @test node_hours(ctl.ledger).used == 0.0
 end
 
 @testset "cli jobs: usage errors, a file without [jobs], and --loop" begin
@@ -503,4 +623,16 @@ end
         note_workers!(; planned=0, launched=0)
         rm(outdir; recursive=true, force=true)
     end
+end
+
+@testset "manage!: a scheduler answer that cannot be read submits nothing (#104)" begin
+    outdir = mktempdir()
+    garbled = SlurmScheduler(; user="me", run=cmd -> "4242|short|RUNNING\n")
+    ctl = JobController(garbled, _jb_policy(; dry_run=false), outdir)
+    ds = manage!(ctl, _jb_work(100, 60000))
+    @test only(ds).action === :refuse
+    @test occursin("could not be asked", only(ds).reason)
+    @test isempty(ctl.ledger.jobs)
+    ev = only(_jb_events(outdir))
+    @test ev.kind == "job_decision" && ev.action == "refuse"
 end
