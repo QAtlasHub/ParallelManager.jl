@@ -808,8 +808,14 @@ function _pool_tick!(
     needs = KeyReq[]
     rows = TaskRow[]
     for (i, r) in zip(idx, queued)
-        # Not started for a key that will be held back at hand-out.
-        fits(r.key) || continue
+        # No worker is started for a key the deadline holds back. It is settled here: with a
+        # pool no worker of its size may ever exist to draw it and pass it over, and left
+        # queued it kept the round waiting until the deadline itself. The time left only
+        # shrinks, so a key that does not fit now will not fit later in this round.
+        if !fits(r.key)
+            settle!(table, i, :no_fit)
+            continue
+        end
         need = _pool_need(pool, r, opts.deadline, min_time)
         if need.cores > cap_c || need.mem_gb > cap_m
             # Reported now, not retried forever.
@@ -888,12 +894,18 @@ function _pool_tick!(
     end
     isempty(batches) || _pool_report!(pool)
 
-    # A size with nothing to do gives its room back when another is waiting for it.
-    if !isempty(plan.blocked)
-        for (pid, w) in collect(pool.workers)
-            (pid in busy || w.retiring) && continue
+    # A size with nothing to do gives its room back when another is waiting for it: for the
+    # node's cores and memory, or for a place under the worker limit.
+    waiting_for_room = !isempty(plan.blocked) || plan.capped
+    # Idle workers no queued key fits: what retiring can still free.
+    unwanted = Int[
+        pid for (pid, w) in pool.workers if
+        !(pid in busy) && !w.retiring && !any(n -> _fits(w.size, n), needs)
+    ]
+    if waiting_for_room
+        for pid in unwanted
+            w = pool.workers[pid]
             now - w.last_busy >= pool.retire_after || continue
-            any(n -> _fits(w.size, n), needs) && continue
             log_event(
                 log,
                 :pool_retire;
@@ -927,12 +939,18 @@ function _pool_tick!(
     end
 
     # Queued keys, nothing running or starting that could take them, and nothing to start:
-    # waiting would not change that.
+    # waiting would not change that. It WOULD while a worker is on its way out or is about to
+    # be retired for the room: the keys behind it start when it is gone. Without that the round
+    # ended the moment the small keys were done, with the large ones reported `worker_lost`.
+    freeing =
+        any(w -> w.retiring, values(pool.workers)) ||
+        (waiting_for_room && !isempty(unwanted))
     pool.stuck =
         !isempty(needs) &&
         isempty(plan.starts) &&
         isempty(pool.starting) &&
         isempty(busy) &&
+        !freeing &&
         !any(w -> !w.retiring && any(n -> _fits(w.size, n), needs), values(pool.workers))
     return nothing
 end

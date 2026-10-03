@@ -229,7 +229,7 @@ end
                 k -> Dict{String,Any}("pid" => Distributed.myid()),
                 v,
                 ks;
-                opts=RunOpts(; deadline=time() + 60, control_interval=0),
+                opts=RunOpts(; deadline_in=60, control_interval=0),
                 min_time=need,
             )
             @test r.held_back == 2
