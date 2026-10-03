@@ -29,6 +29,8 @@ struct KeyContext
     opts::RunOpts
     # Whether a progress stamp exists for this key (handed in, or written during this call).
     reported::Base.RefValue{Bool}
+    # What `should_stop` needs to recognise a stop request that covers this unit.
+    watch::StopWatch
 end
 
 const _KEY = ScopedValue{Union{KeyContext,Nothing}}(nothing)

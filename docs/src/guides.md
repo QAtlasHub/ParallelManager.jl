@@ -250,3 +250,87 @@ of a round there are none, on an exception or the scheduler's SIGTERM there
 can be — and logs each key that was cut (`lock_released`, `why=master_exit`).
 Orphans are then what a `kill -9` or a lost node leaves, not what every wall
 clock leaves.
+
+## 11. Changing a sweep while it runs
+
+A request is one small file under the sweep's state directory. Every master
+running on that `(project, run)` picks it up within `RunOpts.control_interval`
+seconds (10 by default), applies it, acknowledges it, and logs who asked.
+
+```sh
+bin/sweeprunner pause      out/campaign
+bin/sweeprunner resume     out/campaign
+bin/sweeprunner cancel     out/campaign --select system.N=64,128        # drop queued units
+bin/sweeprunner stop       out/campaign --select study=fdtx --grace 600 # stop running ones too
+bin/sweeprunner stop       out/campaign --node c014 --grace 300         # everything on a node
+bin/sweeprunner stop       out/campaign --grace 900                     # everything; masters return
+bin/sweeprunner prioritise out/campaign --select system.N=16
+bin/sweeprunner resize     out/campaign --n 1200
+bin/sweeprunner drain      out/campaign --node c014
+bin/sweeprunner enqueue    out/campaign --run phase2 --config configs/more_samples.toml
+```
+
+`--project` / `--run` limit a request to one `(project, run)`, `--master` to
+one master (its id or its scheduler job id). From Julia it is
+`SweepRunner.control!(vault, :cancel; select = Dict("system.N" => [64, 128]))`,
+which returns the request id; `read_acks(vault, id)` says what each master did
+with it.
+
+| request | what the master does |
+| :-- | :-- |
+| `enqueue` | adds the keys to its queue (settling the ones already done) and keeps them for its later rounds |
+| `cancel` | drops queued keys matching the filter, for the rest of the job; `--running` also stops the running ones |
+| `stop` | running units in scope leave at their next safe point; queued ones in scope are not started; with no scope the master returns (`stopped_by = :request`) |
+| `prioritise` | moves matching queued keys to the front |
+| `resize` | retires workers down to `n` (idle first, each between units), or calls the `spawn` hook given to `run!` to start more |
+| `drain` | stops dispatching to the workers on a node |
+| `pause` / `resume` | no new dispatch; running units continue |
+
+A master applies only requests made after it started, so a `stop` from last
+week does not stop today's job.
+
+### Giving a stop a bound
+
+A stop — the flag file, the deadline, or a `stop` request — used to be read
+between keys only, so a key already in `work_fn` ran to its end. A `work_fn`
+that can leave part-way says where:
+
+```julia
+function work_fn(key)
+    p = SweepRunner.resume_point()
+    for seg in (p === nothing ? 1 : p.step + 1):nseg
+        run_segment!(key, seg)
+        SweepRunner.report_progress(seg; of=nseg)
+        SweepRunner.stop_point()        # leaves here if told to stop
+    end
+    return collect_result(key)
+end
+```
+
+[`stop_point`](@ref SweepRunner.stop_point) throws `StopRequested`, which
+`run!` takes as "stopped where it was told to": no attempt is spent, the lock
+is released, and the next job resumes from the progress recorded.
+[`should_stop`](@ref SweepRunner.should_stop) is the same question without the
+throw. Both look at the filesystem at most once every `poll` seconds.
+
+A unit that never reaches a safe point is bounded by `--grace`: once it has
+passed, the master releases the lock it named (`key_cut` in the event log), so
+another worker or job can take the key at once. The cut unit is not waited
+for, and whatever it eventually returns is refused at the owner-checked
+commit. `--interrupt` additionally signals the worker, which is best effort
+and depends on the cluster manager.
+
+### Workers that arrive late
+
+At the same cadence the master adopts workers that joined since the round
+began (`workers_joined`), after loading the modules named by `load=` on them.
+A pool that is still ramping up when `run!` is called is used as it arrives,
+not from the next round.
+
+### Limits
+
+- On the sequential path (no workers) requests are read between keys. The
+  running key sees a stop through `should_stop`, but cannot be cut.
+- Enqueued keys run under the stage's `work_fn`; a prerequisite stage is not
+  re-run for them.
+- Growing the pool needs a `spawn` hook: `run!(…; spawn = n -> addprocs(…))`.

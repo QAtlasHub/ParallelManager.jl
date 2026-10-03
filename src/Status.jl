@@ -265,6 +265,18 @@ function status_snapshot(m::Master)
         # asks when it finds a `.running`: see `judge_lock`.
         "held" => _out_tokens(),
         "locks" => copy(m.locks),
+        # What control requests have changed about this master.
+        "control" => Dict{String,Any}(
+            "paused" => m.ctl.paused,
+            "stop_all" => m.ctl.stop_all,
+            "drained" => sort!(collect(m.ctl.drained)),
+            "retired" => length(m.ctl.retired),
+            "stopping" => length(m.ctl.stopping),
+            "cancel_filters" => length(m.ctl.cancels),
+            "priority_filters" => length(m.ctl.priorities),
+            "enqueued" => length(m.ctl.extra),
+            "target_workers" => m.ctl.target,
+        ),
         "warnings" => copy(m.warnings),
     )
 end
@@ -527,6 +539,19 @@ function print_status(io::IO, x; workers::Bool=false)
             "$(lk["reaped"]) reaped ($(lk["dead_jobs"]) dead job(s)), ",
             "$(lk["stale"]) stale, $(lk["unknown"]) unknown",
         )
+        ct = get(d, "control", nothing)
+        if ct !== nothing
+            said = String[]
+            ct["paused"] && push!(said, "paused")
+            ct["stop_all"] && push!(said, "stopping everything")
+            ct["stopping"] > 0 && push!(said, "$(ct["stopping"]) unit(s) told to stop")
+            isempty(ct["drained"]) || push!(said, "drained: " * join(ct["drained"], " "))
+            ct["retired"] > 0 && push!(said, "$(ct["retired"]) worker(s) retired")
+            ct["cancel_filters"] > 0 &&
+                push!(said, "$(ct["cancel_filters"]) cancel filter(s)")
+            ct["enqueued"] > 0 && push!(said, "$(ct["enqueued"]) key(s) enqueued")
+            isempty(said) || println(io, "  control  ", join(said, "; "))
+        end
         none = d["nodes_without_workers"]
         isempty(none) || println(
             io, "  nodes    $(length(none)) allocated with no worker: ", join(none, " ")

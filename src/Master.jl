@@ -6,6 +6,7 @@
 
 using Distributed
 using DataVault: Vault
+using ParamIO: DataKey
 
 """
     state_root(vault) -> String
@@ -40,6 +41,74 @@ end
 
 const WorkerIdentity = @NamedTuple{host::String, pid::Int, cores::Int}
 
+# The control channel's types live here because a `Master` holds them; what is done with them is
+# in `Control.jl`.
+
+struct KeyFilter
+    select::Dict{String,Vector{Any}}
+    samples::Union{Vector{Int},Nothing}
+end
+
+# A running unit that was told to stop: cut once `deadline` passes.
+mutable struct StopOrder
+    deadline::Float64
+    cut::Bool
+    request::String
+    interrupt::Bool
+end
+
+# What a worker needs to tell whether a stop request covers the unit it is on.
+mutable struct StopWatch
+    const since::Float64          # requests older than this are not for this master
+    const master::String
+    const job::String
+    const seen::Set{String}
+    checked::Float64
+    hit::Bool
+end
+
+StopWatch(since, master, job) = StopWatch(since, master, job, Set{String}(), 0.0, false)
+
+"""
+    ControlState
+
+What requests have changed about a master, for the rest of its life: whether it is paused or told
+to stop, the nodes it no longer dispatches to, the workers it is retiring, the filters it has
+cancelled and prioritised, the keys it was given, and the stop orders in force.
+"""
+mutable struct ControlState
+    paused::Bool
+    stop_all::Bool
+    target::Union{Int,Nothing}
+    last_poll::Float64
+    # `n -> start n more workers`, given to `run!` as `spawn`; `nothing` when there is none.
+    spawn::Any
+    const drained::Set{String}
+    const retired::Set{Int}
+    const seen::Set{String}
+    const cancels::Vector{KeyFilter}
+    const priorities::Vector{KeyFilter}
+    const extra::Vector{DataKey}
+    const stopping::Dict{String,StopOrder}
+end
+
+function ControlState()
+    return ControlState(
+        false,
+        false,
+        nothing,
+        0.0,
+        nothing,
+        Set{String}(),
+        Set{Int}(),
+        Set{String}(),
+        KeyFilter[],
+        KeyFilter[],
+        DataKey[],
+        Dict{String,StopOrder}(),
+    )
+end
+
 """
     Master()
 
@@ -54,6 +123,7 @@ own.
 - `samples` — Distributed id => the last [`WorkerSample`](@ref).
 - `table` — the [`TaskTable`](@ref) of the round in progress (or of the last one).
 - `state` — `:starting`, `:running`, `:waiting` (between rounds of a `run_loop!`), `:ended`.
+- `ctl` — the [`ControlState`](@ref): what [`control!`](@ref) requests have changed.
 
 The rest is bookkeeping for the status file (see `Status.jl`).
 """
@@ -69,6 +139,7 @@ mutable struct Master
     const progress::Dict{String,Progress}
     const warnings::Vector{String}
     const lock::ReentrantLock
+    const ctl::ControlState
     # What the last scan found among the locks (`_scan!`'s return), for the status.
     locks::Dict{String,Any}
     table::Union{TaskTable,Nothing}
@@ -95,6 +166,7 @@ function Master()
         Dict{String,Progress}(),
         String[],
         ReentrantLock(),
+        ControlState(),
         Dict{String,Any}(),
         nothing,
         nothing,

@@ -24,6 +24,7 @@ independently.
 | `Progress.jl`   | [`report_progress`](@ref), [`resume_point`](@ref)       |
 | `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
 | `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
+| `Control.jl`    | [`control!`](@ref), [`should_stop`](@ref), [`stop_point`](@ref) |
 
 # Quick start
 
@@ -77,6 +78,7 @@ include("TaskTable.jl")       # the master's table of a round's units, and its q
 include("Master.jl")          # a master's identity; state_root
 include("Locks.jl")           # judge_lock: ask the holder's master; locks(), reap_dead_locks!
 include("Run.jl")
+include("Control.jl")         # control!: requests to a running master; should_stop / stop_point
 include("Progress.jl")        # report_progress / resume_point, the context work_fn runs in
 include("Status.jl")          # the status file a master rewrites, and reading it from outside
 include("Observe.jl")         # one source observation per process per run!, for each .done

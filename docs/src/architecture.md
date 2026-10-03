@@ -57,7 +57,8 @@ and owns the coordination story separately.
 | [`src/Master.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Master.jl)       | A master's identity and its workers'; `state_root(vault)`                                          |
 | [`src/Status.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Status.jl)       | The status file each master rewrites, and `read_status` / `print_status` to ask it from outside    |
 | [`src/Locks.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Locks.jl)         | `judge_lock`: ask the holder's master whether a `.running` is real; `locks`, `reap_dead_locks!`    |
-| [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status <outdir>`, `sweeprunner locks <outdir>` (`bin/sweeprunner`)                    |
+| [`src/Control.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Control.jl)     | `control!`: requests a running master applies (enqueue, cancel, stop, prioritise, resize, drain, pause); `should_stop` / `stop_point` |
+| [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir>` (`bin/sweeprunner`) |
 
 ## Key identity: `canonical(::DataKey)`
 
