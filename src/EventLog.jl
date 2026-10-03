@@ -62,6 +62,13 @@ stay within that guarantee.
 |                 | the re-dispatch bound (includes `deaths`)                          |
 | `worker_lost`   | every worker died with keys still queued; this key was left for a  |
 |                 | later run rather than completed or failed                          |
+| `campaign_start`| [`run_campaign!`](@ref) began: the meta file, its `sha256`, the    |
+|                 | `profile`, the `stages` in order (in `events_campaign_*.jsonl`)    |
+| `campaign_stage`| one stage of a campaign: `ran` or the `reason` it did not, its     |
+|                 | key count and its `run_loop!` totals                               |
+| `campaign_reloaded` / `campaign_reload_refused` | the meta file changed under a        |
+|                 | running campaign and was taken up, or was broken and ignored       |
+| `campaign_done` | the campaign returned (`stages`, `ran`, `stopped_by`)              |
 | `control_request` | a [`control!`](@ref) request was applied (includes `id`, `op`,   |
 |                 | `by`: who asked, `asked_at`, and `detail`: what it changed)        |
 | `key_stopped`   | a unit told to stop left at a safe point ([`stop_point`](@ref));   |

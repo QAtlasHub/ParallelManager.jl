@@ -285,9 +285,10 @@ While it runs, the master rewrites `<state_root>/masters/<id>/status.json` every
 `opts.status_interval` seconds; [`read_status`](@ref) / [`print_status`](@ref) read it from any
 process, during the job or after it.
 
-Returns `(; stage, done, err, busy, gave_up, stop, cancelled, skipped, total, stopped_by)`.
-`cancelled` counts the keys a request took out of this job; `total` includes the keys a request
-added. `stopped_by` is `:flag`, `:deadline`, `:request`, or `nothing`: a stage that finished every key reports `nothing` even if the
+Returns `(; stage, done, err, busy, gave_up, stop, cancelled, skipped, total, remaining,
+stopped_by)`. `cancelled` counts the keys a request took out of this job; `total` includes the
+keys a request added; `remaining` is how many keys are not done after the round (`0`: the sweep
+is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, or `nothing`: a stage that finished every key reports `nothing` even if the
 deadline passed while its last key ran, since no key was ever held back by it.
 The full-done early exit returns the same field set rather than a shorter one.
 
@@ -369,6 +370,7 @@ function run!(
             cancelled=0,
             skipped=length(keys),
             total=length(keys),
+            remaining=0,
             stopped_by=nothing,
         )
     end
@@ -455,14 +457,17 @@ function run!(
     n_gave_up = 0
     n_stop = 0
     n_cancelled = 0
+    n_complete = 0
     stop_seen = nothing
     for row in table.rows
         key, outcome = row.key, row.outcome
         if outcome === :already_done
             add_complete!(m, key)
+            n_complete += 1
         elseif outcome === :ok
             add_complete!(m, key)
             n_done += 1
+            n_complete += 1
         elseif outcome === :stop_flag
             n_stop += 1
             stop_seen = :flag                 # outranks :deadline, as `_stop_reason` does
@@ -521,6 +526,8 @@ function run!(
         # What the manifest already had, plus every row of the table: the keys a request added
         # while the round ran are rows too.
         total=(length(keys) - length(todo)) + length(table),
+        # Keys of this sweep that are not done after the round, whoever would do them.
+        remaining=length(table) - n_complete,
         stopped_by=stopped_by,
     )
 end
@@ -1256,6 +1263,7 @@ more work to do. This is the infra equivalent of FiniteTemperature.jl's
 `_work_loop` driver.
 
 The loop exits when:
+- a round leaves no key undone (`remaining == 0`), at once, or
 - `max_empty_rounds` consecutive rounds produce zero new completions AND leave nothing held by a
   sibling, or
 - `opts.stop_flag` is raised, or `opts.deadline` has passed.
@@ -1363,6 +1371,9 @@ function run_loop!(
         )
         n_done += result.done
         n_busy = result.busy
+        # Every key is done. No later round can find anything, and sitting out
+        # `max_empty_rounds` idle rounds would hold the allocation for nothing.
+        result.remaining == 0 && break
         if result.done > 0
             empty_count = 0
             busy_waited = 0.0

@@ -19,6 +19,11 @@ for how the three layers fit together.
 - `read_status(vault | outdir)` / `print_status` / `bin/sweeprunner status <outdir>` — what every
   master is doing (tasks, workers planned/launched/joined/busy, per-worker key, CPU, RSS), read
   from the status file each master rewrites. A spawner reports `note_workers!(planned=, launched=)`.
+- `load_campaign(meta.toml)` / `validate_campaign` / `plan_campaign` / `run_campaign!(open_stage,
+  campaign; profile, cost)` — a META config names the per-stage configs of a campaign, their
+  order (`needs`, `priority`), which studies are `enabled`, and per-job-kind `[profile.*]`
+  filters. The application supplies `open_stage(stage) -> (; work_fn, …)`.
+  `bin/sweeprunner campaign <meta.toml>` validates and prints the plan.
 - `control!(vault | outdir, op; …)` / `bin/sweeprunner <op> <outdir>` — requests to a RUNNING
   master: `:enqueue`, `:cancel`, `:stop` (with `grace`), `:prioritise`, `:resize`, `:drain`,
   `:pause`, `:resume`. One file per request under `state_root/control`, read by every master on
@@ -68,7 +73,7 @@ for how the three layers fit together.
 `InitWorkers` (backend bootstrap) · `Run` (the `run!` facade) · `TaskTable` (the master's table
 of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`) · `Status`
 (the status file and its readers) · `Locks` (ask the holder's master) · `Control` (requests to a
-running master) · `CLI`. Each is usable
+running master) · `Campaign` (the meta config) · `CLI`. Each is usable
 independently. As of v0.3 the per-key advisory lock lives entirely in
 **DataVault's `.running` markers** (`acquire_running!`); `run!` calls into it
 rather than maintaining its own `locks/` tree.

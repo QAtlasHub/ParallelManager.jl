@@ -58,6 +58,7 @@ and owns the coordination story separately.
 | [`src/Status.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Status.jl)       | The status file each master rewrites, and `read_status` / `print_status` to ask it from outside    |
 | [`src/Locks.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Locks.jl)         | `judge_lock`: ask the holder's master whether a `.running` is real; `locks`, `reap_dead_locks!`    |
 | [`src/Control.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Control.jl)     | `control!`: requests a running master applies (enqueue, cancel, stop, prioritise, resize, drain, pause); `should_stop` / `stop_point` |
+| [`src/Campaign.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Campaign.jl)   | A meta config naming the stages of a campaign: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!`, `remaining_work` |
 | [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir>` (`bin/sweeprunner`) |
 
 ## Key identity: `canonical(::DataKey)`
@@ -170,6 +171,16 @@ for typical jobs.
 SweepRunner's public API **does not include a per-item `println`**.
 Adding one is considered a regression. Use [`log_event`](@ref SweepRunner.log_event)
 with one of the standard event kinds documented on [`EventLog`](@ref SweepRunner.EventLog).
+
+## Campaigns: stages are declared, not composed
+
+`run!` runs one stage. A campaign is many stages of many studies, and which of
+them run, in what order and under which filters is described in one meta
+config ([`load_campaign`](@ref SweepRunner.load_campaign)), not in an entry
+script and a set of environment variables. The dependency between stages is
+declared there (`needs`) and checked as "every key of the needed stage is
+done" before the dependent stage starts; SweepRunner still does not know which
+dependent key reads which needed key. See the campaign guide.
 
 ## Why no Stage / DAG
 

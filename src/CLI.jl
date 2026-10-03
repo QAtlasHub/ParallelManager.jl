@@ -2,6 +2,7 @@
 #
 #     sweeprunner status <outdir> [--workers] [--json]
 #     sweeprunner locks  <outdir>
+#     sweeprunner campaign <meta.toml> [--profile NAME] [--studies a,b]
 #     sweeprunner pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir> [options]
 #
 # `bin/sweeprunner` is the wrapper; `julia -e 'using SweepRunner; SweepRunner.cli(ARGS)' -- …` is
@@ -19,6 +20,10 @@ usage: sweeprunner <command> <outdir> [options]
   locks <outdir>
       Every .running lock under <outdir>: who holds it, heartbeat and progress age, and whether
       its holder's master says it is held, dead, or cannot be asked. Removes nothing.
+
+  campaign <meta.toml> [--profile NAME] [--studies a,b]
+      Validate a meta config and print the stages a job would run, in order. Exit code 1 when
+      it is not launchable.
 
   pause | resume <outdir>
   stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS] [--interrupt]
@@ -61,12 +66,55 @@ function cli(args::AbstractVector{<:AbstractString}=ARGS; io::IO=stdout)
         end
         return 0
     end
+    if cmd == "campaign"
+        return _cli_campaign(io, rest)
+    end
     if cmd == "locks"
         length(pos) == 1 || return _cli_usage(io, "locks takes one <outdir>")
         print_locks(io, pos[1])
         return 0
     end
     return _cli_usage(io, "unknown command: $cmd")
+end
+
+function _cli_campaign(io::IO, rest)
+    meta = nothing
+    profile = nothing
+    studies = nothing
+    i = 1
+    while i <= length(rest)
+        a = rest[i]
+        if a == "--profile" || a == "--studies"
+            i < length(rest) || return _cli_usage(io, "$a needs a value")
+            v = rest[i += 1]
+            a == "--profile" ? (profile = v) : (studies = String.(split(v, ',')))
+        elseif startswith(a, "--")
+            return _cli_usage(io, "unknown option: $a")
+        elseif meta === nothing
+            meta = a
+        else
+            return _cli_usage(io, "campaign takes one <meta.toml>")
+        end
+        i += 1
+    end
+    meta === nothing && return _cli_usage(io, "campaign needs a <meta.toml>")
+    isfile(meta) || return _cli_usage(io, "no such file: $meta")
+    c = load_campaign(meta)
+    show(io, c)
+    report = validate_campaign(c)
+    show(io, report)
+    launchable(report) || return 1
+    plan = try
+        plan_campaign(c; studies=studies, profile=profile)
+    catch e
+        e isa ArgumentError || rethrow()
+        return _cli_usage(io, e.msg)
+    end
+    println(io, "plan", profile === nothing ? "" : " (profile $profile)", ":")
+    for (n, s) in enumerate(plan)
+        println(io, "  ", n, ". ", stage_id(s))
+    end
+    return 0
 end
 
 # Options that take a value, and the ones that do not.

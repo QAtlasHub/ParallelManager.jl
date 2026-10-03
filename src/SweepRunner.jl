@@ -25,6 +25,7 @@ independently.
 | `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
 | `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
 | `Control.jl`    | [`control!`](@ref), [`should_stop`](@ref), [`stop_point`](@ref) |
+| `Campaign.jl`   | [`load_campaign`](@ref), [`plan_campaign`](@ref), [`run_campaign!`](@ref) |
 
 # Quick start
 
@@ -85,6 +86,7 @@ include("Observe.jl")         # one source observation per process per run!, for
 include("Artifacts.jl")        # artifact_affinity; ArtifactBusy deferral lives in Run.jl
 include("Prerequisite.jl")
 include("Preflight.jl")
+include("Campaign.jl")        # a meta config: which stages run, in what order, under which filters
 include("CLI.jl")             # `sweeprunner status …`
 
 end # module SweepRunner
