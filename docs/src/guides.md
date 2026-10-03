@@ -504,6 +504,29 @@ Per partition, [`decide`](@ref SweepRunner.decide):
   budget. The account is the ledger (`<outdir>/sweeprunner/jobs/ledger.json`),
   so it holds across restarts.
 
+What keeps that check from passing on an under-count:
+
+- A submission is written to the ledger, and the ledger saved, **before**
+  `sbatch` is called. If `sbatch` fails or times out, the row stays committed
+  until a later poll finds a job of that name or it has been absent three
+  polls: a job that was queued but not recorded is one a budget cannot see.
+- A job counts as ended only after it has been absent from the scheduler's
+  answer **three polls in a row**, and is then billed for what it can have run
+  since it was last seen (up to its time limit), not for the last elapsed time
+  read. A job in any listed state (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …)
+  exists. A job that reappears is live again.
+- A scheduler answer that cannot be trusted submits nothing: `squeue` failing,
+  a line or a time that cannot be read, or an empty answer while the ledger
+  holds live jobs. The refusal says why.
+- The policy constructors reject values that would switch the check off (a NaN
+  budget or time limit, zero or negative nodes).
+- "Our jobs" are the ledger's ids plus the exact names `<name>-<partition>`;
+  a policy named `ft` does not claim `ft2-…`.
+
+What it still cannot see: jobs submitted outside the controller, and a ledger
+file that was deleted (it reads as nothing used). Nothing reconciles with
+`sacct`.
+
 The batch script is yours; it receives `SWEEPRUNNER_PROFILE` and whatever the
 partition's `env` names.
 

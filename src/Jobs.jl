@@ -103,24 +103,31 @@ it with a `:drain` request for the nodes that are to go, so nothing is dispatche
 """
 shrink(::Scheduler, ::AbstractString, ::Integer) = false
 
-# `D-HH:MM:SS`, `HH:MM:SS`, `MM:SS`, `SS` as Slurm prints them; `Inf` for UNLIMITED, `0` for what
-# it cannot read (a job that has not started prints `0:00` or `N/A`).
-function _slurm_seconds(s::AbstractString)::Float64
+# `D-HH:MM:SS`, `HH:MM:SS`, `MM:SS`, `SS` as Slurm prints them; `Inf` for UNLIMITED; `0` for
+# the placeholders of a job that has not started (`N/A`, empty). `nothing` for anything else it
+# cannot read: an unreadable time is not zero time.
+function _slurm_time(s::AbstractString)::Union{Float64,Nothing}
     s = strip(s)
-    (isempty(s) || s in ("N/A", "INVALID", "NOT_SET")) && return 0.0
+    (isempty(s) || s == "N/A") && return 0.0
     s == "UNLIMITED" && return Inf
     days = 0.0
     if occursin('-', s)
         d, s = split(s, '-'; limit=2)
-        days = something(tryparse(Float64, d), 0.0)
+        dv = tryparse(Float64, d)
+        dv === nothing && return nothing
+        days = dv
     end
-    parts = [something(tryparse(Float64, p), 0.0) for p in split(s, ':')]
     secs = 0.0
-    for p in parts
-        secs = 60secs + p
+    for p in split(s, ':')
+        v = tryparse(Float64, p)
+        v === nothing && return nothing
+        secs = 60secs + v
     end
     return 86400days + secs
 end
+
+# The lenient form: what cannot be read is 0. For display only; nothing that is charged uses it.
+_slurm_seconds(s::AbstractString)::Float64 = something(_slurm_time(s), 0.0)
 
 # Seconds as `sbatch -t` takes them: whole minutes, rounded up.
 _slurm_minutes(secs::Real) = string(max(1, ceil(Int, secs / 60)))
@@ -174,29 +181,32 @@ end
 cancel(s::SlurmScheduler, id::AbstractString) = s.run(`scancel $id`) !== nothing
 
 function job_states(s::SlurmScheduler)::Vector{JobState}
-    out = s.run(`squeue -h -u $(s.user) -o "%i|%j|%P|%T|%D|%l|%M"`)
+    # The name last, and split with a limit: a job name may contain the separator.
+    out = s.run(`squeue -h -u $(s.user) -o "%i|%P|%T|%D|%l|%M|%j"`)
     out === nothing && error("squeue failed: the jobs that exist are not known")
     jobs = JobState[]
     for line in split(out, '\n'; keepempty=false)
-        f = split(strip(line, ['"', ' ']), '|')
-        length(f) == 7 || continue
-        state = if f[4] == "RUNNING"
+        f = split(strip(line, ['"', ' ']), '|'; limit=7)
+        # A line that cannot be read is a job that would go uncounted: the whole answer is
+        # refused rather than trusted in part.
+        length(f) == 7 || error("squeue: cannot read the line $(repr(line))")
+        nodes = tryparse(Int, f[4])
+        limit = _slurm_time(f[5])
+        elapsed = _slurm_time(f[6])
+        (nodes === nothing || limit === nothing || elapsed === nothing) &&
+            error("squeue: cannot read nodes or times in $(repr(line))")
+        state = if f[3] == "RUNNING"
             :running
-        elseif f[4] == "PENDING"
+        elseif f[3] == "PENDING"
             :pending
         else
+            # CONFIGURING, COMPLETING, SUSPENDED, …: listed, so it exists and is charged.
             :other
         end
         push!(
             jobs,
             JobState(
-                String(f[1]),
-                String(f[2]),
-                String(f[3]),
-                state,
-                something(tryparse(Int, f[5]), 0),
-                _slurm_seconds(f[6]),
-                _slurm_seconds(f[7]),
+                String(f[1]), String(f[7]), String(f[2]), state, nodes, limit, elapsed
             ),
         )
     end
@@ -262,16 +272,50 @@ work counts as runnable here), at most `max_jobs` pending or running, `slots_per
 per node (how much work a job can take), and `key_time`, the seconds one unit is assumed to take
 when there is no cost model.
 """
-Base.@kwdef struct PartitionPolicy
+struct PartitionPolicy
     name::String
     nodes::Int
     time_limit::Float64
     script::String
-    profile::Union{String,Nothing} = nothing
-    max_jobs::Int = 1
-    slots_per_node::Int = 1
-    key_time::Union{Float64,Nothing} = nothing
-    env::Dict{String,String} = Dict{String,String}()
+    profile::Union{String,Nothing}
+    max_jobs::Int
+    slots_per_node::Int
+    key_time::Union{Float64,Nothing}
+    env::Dict{String,String}
+end
+
+function PartitionPolicy(;
+    name::AbstractString,
+    nodes::Integer,
+    time_limit::Real,
+    script::AbstractString,
+    profile::Union{AbstractString,Nothing}=nothing,
+    max_jobs::Integer=1,
+    slots_per_node::Integer=1,
+    key_time::Union{Real,Nothing}=nothing,
+    env::AbstractDict=Dict{String,String}(),
+)
+    bad(msg) = throw(ArgumentError("PartitionPolicy $name: $msg"))
+    # Each of these, wrong, makes a job's cost zero, negative or NaN — and a comparison with
+    # the budget that every job passes.
+    nodes >= 1 || bad("nodes must be >= 1, got $nodes")
+    (isfinite(time_limit) && time_limit > 0) ||
+        bad("time_limit must be positive and finite, got $time_limit")
+    slots_per_node >= 1 || bad("slots_per_node must be >= 1, got $slots_per_node")
+    max_jobs >= 0 || bad("max_jobs must be >= 0, got $max_jobs")
+    (key_time === nothing || (isfinite(key_time) && key_time > 0)) ||
+        bad("key_time must be positive and finite, got $key_time")
+    return PartitionPolicy(
+        String(name),
+        Int(nodes),
+        Float64(time_limit),
+        String(script),
+        profile === nothing ? nothing : String(profile),
+        Int(max_jobs),
+        Int(slots_per_node),
+        key_time === nothing ? nothing : Float64(key_time),
+        Dict{String,String}(String(k) => String(v) for (k, v) in env),
+    )
 end
 
 """
@@ -283,14 +327,46 @@ recognises its own. `budget_node_hours` is hard: a submission that would take us
 committed node-hours past it is refused. `dry_run` (the default) decides and logs but submits
 nothing.
 """
-Base.@kwdef struct JobPolicy
+struct JobPolicy
     name::String
     partitions::Vector{PartitionPolicy}
     budget_node_hours::Float64
-    max_jobs::Int = typemax(Int)
-    dry_run::Bool = true
-    default_key_time::Float64 = 600.0
+    max_jobs::Int
+    dry_run::Bool
+    default_key_time::Float64
 end
+
+function JobPolicy(;
+    name::AbstractString,
+    partitions::AbstractVector{PartitionPolicy},
+    budget_node_hours::Real,
+    max_jobs::Integer=typemax(Int),
+    dry_run::Bool=true,
+    default_key_time::Real=600.0,
+)
+    bad(msg) = throw(ArgumentError("JobPolicy $name: $msg"))
+    isempty(name) && bad("name must not be empty: it is how the controller knows its jobs")
+    # NaN would make `spent + job > budget` false for every job.
+    (isfinite(budget_node_hours) && budget_node_hours >= 0) ||
+        bad("budget_node_hours must be finite and >= 0, got $budget_node_hours")
+    max_jobs >= 0 || bad("max_jobs must be >= 0, got $max_jobs")
+    (isfinite(default_key_time) && default_key_time > 0) ||
+        bad("default_key_time must be positive and finite, got $default_key_time")
+    allunique(p.name for p in partitions) || bad("a partition is named twice")
+    return JobPolicy(
+        String(name),
+        collect(PartitionPolicy, partitions),
+        Float64(budget_node_hours),
+        Int(max_jobs),
+        dry_run,
+        Float64(default_key_time),
+    )
+end
+
+# The names this policy gives its jobs: one per partition. Exact, so a policy named `ft` does
+# not claim the jobs of one named `ft2`.
+_job_name(policy::JobPolicy, p::PartitionPolicy) = string(policy.name, "-", p.name)
+_job_names(policy::JobPolicy) = Set(_job_name(policy, p) for p in policy.partitions)
 
 """
     load_job_policy(path) -> JobPolicy
@@ -386,38 +462,110 @@ function save_ledger(l::Ledger)
     return l.path
 end
 
-function record_submit!(l::Ledger, id::AbstractString, spec::JobSpec; now::Real=time())
-    l.jobs[String(id)] = Dict{String,Any}(
+# How many polls in a row a job has to be absent from the scheduler's answer before the ledger
+# takes it as ended. One absence is not evidence: a job between states, a controller that
+# answered for part of the queue.
+const _ENDED_AFTER_MISSING = 3
+
+function _ledger_row(spec::JobSpec, state::AbstractString, now::Real)
+    return Dict{String,Any}(
         "name" => spec.name,
         "partition" => spec.partition,
         "nodes" => spec.nodes,
         "time_limit" => spec.time_limit,
         "submitted" => Float64(now),
         "elapsed" => 0.0,
-        "state" => "pending",
+        "state" => String(state),
         "ended" => false,
+        "missing" => 0,
+        "last_seen" => Float64(now),
     )
+end
+
+function record_submit!(l::Ledger, id::AbstractString, spec::JobSpec; now::Real=time())
+    l.jobs[String(id)] = _ledger_row(spec, "pending", now)
     return nothing
 end
 
 """
-    observe!(ledger, states)
+    record_intent!(ledger, spec) -> String
 
-Bring the ledger up to what the scheduler says: a job it still lists has its elapsed time and
-state updated; one it no longer lists has ended, with the elapsed time last seen.
+Write a ledger row for a submission that is ABOUT to be made, save the ledger, and return the
+row's provisional id. The row commits the job's node-hours from this moment. If `sbatch` then
+succeeds, [`confirm_submit!`](@ref) gives the row its real id; if it fails or the controller dies
+in between, the row stays, and is either matched to the job by name on a later poll or dropped
+after the job has been absent for $(_ENDED_AFTER_MISSING) polls. A job that was queued but never
+recorded is the one a budget cannot see.
 """
-function observe!(l::Ledger, states::AbstractVector{JobState})
+function record_intent!(l::Ledger, spec::JobSpec; now::Real=time())
+    tmp = string("submitting-", round(Int, now * 1000), "-", string(rand(UInt32); base=16))
+    l.jobs[tmp] = _ledger_row(spec, "submitting", now)
+    save_ledger(l)
+    return tmp
+end
+
+"""
+    confirm_submit!(ledger, provisional, id)
+
+The submission recorded as `provisional` got the scheduler's `id`. The ledger is saved.
+"""
+function confirm_submit!(l::Ledger, tmp::AbstractString, id::AbstractString)
+    row = pop!(l.jobs, String(tmp))
+    row["state"] = "pending"
+    l.jobs[String(id)] = row
+    save_ledger(l)
+    return nothing
+end
+
+"""
+    observe!(ledger, states; now=time())
+
+Bring the ledger up to what the scheduler says.
+
+- A job the scheduler lists — in ANY state — exists: its elapsed time and state are updated.
+- A job it does not list is counted absent. Only after $(_ENDED_AFTER_MISSING) polls in a row is
+  it taken as ended, and it is billed for what it can have run since it was last seen (up to its
+  time limit), not for the last elapsed time read. A job that reappears is live again.
+- A row still `submitting` (the controller did not learn the id) takes the id of a listed job
+  with its name that the ledger does not have yet.
+"""
+function observe!(l::Ledger, states::AbstractVector{JobState}; now::Real=time())
     by = Dict(j.id => j for j in states)
-    for (id, j) in l.jobs
-        j["ended"] === true && continue
+    unclaimed = [j for j in states if !haskey(l.jobs, j.id)]
+    for id in collect(keys(l.jobs))
+        j = l.jobs[id]
         s = get(by, id, nothing)
-        if s === nothing || s.state === :other
-            j["ended"] = true
-            j["state"] = "ended"
-        else
+        if s === nothing && j["state"] == "submitting"
+            k = findfirst(
+                u -> u.name == j["name"] && u.partition == j["partition"], unclaimed
+            )
+            if k !== nothing
+                s = unclaimed[k]
+                deleteat!(unclaimed, k)
+                delete!(l.jobs, id)
+                l.jobs[s.id] = j
+            end
+        end
+        if s !== nothing
             j["elapsed"] = max(Float64(j["elapsed"]), s.elapsed)
             j["state"] = String(s.state)
+            j["missing"] = 0
+            j["last_seen"] = Float64(now)
+            j["ended"] = false
+            continue
         end
+        j["ended"] === true && continue
+        j["missing"] = Int(get(j, "missing", 0)) + 1
+        j["missing"] >= _ENDED_AFTER_MISSING || continue
+        j["ended"] = true
+        if j["state"] != "submitting"
+            # It ran, at most, from when it was last seen until now.
+            since = Float64(now) - Float64(get(j, "last_seen", now))
+            j["elapsed"] = min(
+                Float64(j["time_limit"]), Float64(j["elapsed"]) + max(since, 0.0)
+            )
+        end
+        j["state"] = "ended"
     end
     return nothing
 end
@@ -426,7 +574,8 @@ end
     node_hours(ledger) -> NamedTuple
 
 `(; used, committed, by_partition)`: node-hours the ledger's jobs have run, node-hours its live
-jobs can still run (to their time limits), and `partition => (; used, committed)`.
+jobs can still run (to their time limits), and `partition => (; used, committed)`. A job with no
+time limit commits `Inf`: a budget cannot hold an unlimited job.
 """
 function node_hours(l::Ledger)
     used = committed = 0.0
@@ -449,6 +598,9 @@ function node_hours(l::Ledger)
         by_partition=Dict(k => (; used=v[1], committed=v[2]) for (k, v) in by),
     )
 end
+
+# Does the ledger hold a job the scheduler should still know about?
+_ledger_live(l::Ledger) = any(j -> j["ended"] !== true, values(l.jobs))
 
 # ── deciding ────────────────────────────────────────────────────────────────────────────────────
 
@@ -508,10 +660,9 @@ function decide(
     policy::JobPolicy, work, jobs::AbstractVector{JobState}, ledger::Ledger
 )::Vector{Decision}
     out = Decision[]
-    mine = [
-        j for j in jobs if (j.state === :pending || j.state === :running) &&
-            (haskey(ledger.jobs, j.id) || startswith(j.name, policy.name))
-    ]
+    names = _job_names(policy)
+    # Every listed job of ours exists and holds its place, whatever state it is in.
+    mine = [j for j in jobs if haskey(ledger.jobs, j.id) || j.name in names]
     nh = node_hours(ledger)
     spent = nh.used + nh.committed
     live_total = length(mine)
@@ -585,7 +736,7 @@ function decide(
             env = copy(p.env)
             p.profile === nothing || (env["SWEEPRUNNER_PROFILE"] = p.profile)
             spec = JobSpec(;
-                name=string(policy.name, "-", p.name),
+                name=_job_name(policy, p),
                 partition=p.name,
                 nodes=p.nodes,
                 time_limit=p.time_limit,
@@ -639,8 +790,28 @@ Call it from a job that is ending to resubmit only if work remains, or in
 [`controller_loop!`](@ref) to keep a campaign supplied.
 """
 function manage!(ctl::JobController, work)::Vector{Decision}
-    states = job_states(ctl.scheduler)
+    states = try
+        job_states(ctl.scheduler)
+    catch e
+        e isa InterruptException && rethrow()
+        return _refuse_all(ctl, "the scheduler could not be asked: $(_short_err(e))")
+    end
+    # "No jobs" while the ledger holds jobs that should be listed is not an answer to charge
+    # against: a wrapper, the wrong cluster, a filter. Nothing is submitted on it, and the ledger
+    # is taken as one absence, not as the end of every job.
+    if isempty(states) && _ledger_live(ctl.ledger) && !ctl.policy.dry_run
+        # It still counts as one absence for each live job: if the queue really is empty, the
+        # jobs end after the usual number of polls and the controller goes on.
+        observe!(ctl.ledger, states)
+        save_ledger(ctl.ledger)
+        return _refuse_all(
+            ctl,
+            "the scheduler lists no job at all while the ledger has live ones; " *
+            "not trusted, nothing submitted this round",
+        )
+    end
     observe!(ctl.ledger, states)
+    save_ledger(ctl.ledger)
     decisions = decide(ctl.policy, work, states, ctl.ledger)
     for d in decisions
         log_event(
@@ -653,20 +824,26 @@ function manage!(ctl::JobController, work)::Vector{Decision}
             dry_run=ctl.policy.dry_run,
         )
         (d.action === :submit && !ctl.policy.dry_run) || continue
+        # On record BEFORE the scheduler is called: a job that is queued and not in the ledger
+        # is one the budget does not see.
+        tmp = record_intent!(ctl.ledger, d.spec)
         id = try
             submit(ctl.scheduler, d.spec)
         catch e
             e isa InterruptException && rethrow()
+            # It may have been queued all the same (a timeout after sbatch took it). The row
+            # stays, committed, until a poll finds the job or it has been absent long enough.
             log_event(
                 ctl.log,
                 :job_submit_failed;
                 level=:warn,
                 partition=d.partition,
                 err=_short_err(e),
+                ledger_row=tmp,
             )
             continue
         end
-        record_submit!(ctl.ledger, id, d.spec)
+        confirm_submit!(ctl.ledger, tmp, id)
         log_event(
             ctl.log,
             :job_submitted;
@@ -679,6 +856,26 @@ function manage!(ctl::JobController, work)::Vector{Decision}
     end
     save_ledger(ctl.ledger)
     return decisions
+end
+
+# Every partition refused, for one reason, said in the log.
+function _refuse_all(ctl::JobController, why::AbstractString)
+    ds = [
+        Decision(:refuse, p.name, String(why), nothing, 0.0) for p in ctl.policy.partitions
+    ]
+    for d in ds
+        log_event(
+            ctl.log,
+            :job_decision;
+            level=:warn,
+            action="refuse",
+            partition=d.partition,
+            reason=d.reason,
+            node_hours=0.0,
+            dry_run=ctl.policy.dry_run,
+        )
+    end
+    return ds
 end
 
 """
@@ -700,7 +897,7 @@ function controller_loop!(
     while !stop()
         rounds += 1
         decisions = manage!(ctl, work)
-        live = any(j -> j["ended"] !== true, values(ctl.ledger.jobs))
+        live = _ledger_live(ctl.ledger)
         idle = all(
             d -> d.action === :hold && startswith(d.reason, "nothing runnable"), decisions
         )

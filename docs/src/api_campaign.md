@@ -55,6 +55,8 @@ SweepRunner.JobPolicy
 SweepRunner.load_job_policy
 SweepRunner.Ledger
 SweepRunner.observe!
+SweepRunner.record_intent!
+SweepRunner.confirm_submit!
 SweepRunner.node_hours
 SweepRunner.Decision
 SweepRunner.decide
