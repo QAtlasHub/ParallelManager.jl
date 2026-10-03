@@ -52,6 +52,9 @@ and owns the coordination story separately.
 | _(per-key lock)_                                    | moved to DataVault's `.running` (`acquire_running!`, POSIX `link()`) as of v0.3; `Run.jl` calls into it                |
 | [`src/InitWorkers.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/InitWorkers.jl) | Unified `:auto` / `:sequential` / `:threads` / `:distributed` / `:slurm` bootstrap                   |
 | [`src/Run.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Run.jl)             | [`run!(work_fn, vault, keys; opts)`](@ref SweepRunner.run!) facade                               |
+| [`src/TaskTable.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/TaskTable.jl) | The master's table of a round's units (state, owner, progress) and the queue the dispatcher draws from |
+| [`src/Progress.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Progress.jl)   | `report_progress` / `resume_point`: how far a unit got, handed to the next attempt                  |
+| [`src/Master.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Master.jl)       | A master's identity and its workers'; `state_root(vault)`                                          |
 
 ## Key identity: `canonical(::DataKey)`
 
@@ -71,10 +74,17 @@ When you call `run!(work_fn, vault, keys)`, it does:
    `todo = todo_keys(manifest, keys)`. If empty, emit `:skip_complete`
    and return.
 3. Emit `:stage_start`.
-4. For each key in `todo`:
+4. Build the [`TaskTable`](@ref SweepRunner.TaskTable) — the master's one
+   pass over the markers. A key a sibling finished since the manifest is
+   settled; a lock whose holder is provably gone is removed; a key locked by
+   a live sibling is held back (`:lock_busy`) and not dispatched; the progress
+   recorded for partly-done units is attached. What remains is the queue.
+5. Draw the queue. Each key is handed to a worker (or run on the master when
+   there are none) **with its lock token and resume point**, and the row is
+   settled with what comes back:
    - Acquire the per-key lock via `DataVault.acquire_running!` (atomic on
-     NFS, POSIX `link()`). If another master holds a fresh `.running`,
-     emit `:lock_busy` and move on.
+     NFS, POSIX `link()`), under the token the master named. If another
+     master took it in the meantime, the key comes back `:lock_busy`.
    - Re-check `DataVault.is_done(vault, key)` **after** acquiring the lock
      — another master may have finished this key between our manifest
      read and lock acquisition.
@@ -83,8 +93,38 @@ When you call `run!(work_fn, vault, keys)`, it does:
      success, `DataVault.save!` + `DataVault.mark_done!(vault, key, owner)` +
      `Manifest.add_complete!`; the owner form commits nothing if a sibling
      reclaimed the key meanwhile.
-5. `save_manifest(manifest)`.
-6. Emit `:stage_done` and return the aggregate counts.
+6. When the queue drains, ask once more about the keys that came back busy
+   (their holder may have finished or died meanwhile) and requeue the free ones.
+7. `save_manifest(manifest)`.
+8. Emit `:stage_done` and return the aggregate counts.
+
+### Who holds the task state
+
+The markers on disk stay the durable record and the cross-job lock: several
+masters share one vault, and any of them can be killed at its wall clock. What
+changed in 0.7 is who READS them. The master reads them once per round and
+holds the table; a worker does the key it was handed and reports back. It does
+not explore.
+
+The same goes for progress inside a unit. A `work_fn` made of steps calls
+[`report_progress`](@ref SweepRunner.report_progress) after each one and
+[`resume_point`](@ref SweepRunner.resume_point) at the start, instead of
+probing its own outputs step by step:
+
+```julia
+function work_fn(key)
+    p = SweepRunner.resume_point()
+    for seg in (p === nothing ? 1 : p.step + 1):nseg
+        run_segment!(key, seg)                    # writes its own checkpoint
+        SweepRunner.report_progress(seg; of=nseg)
+    end
+    return collect_result(key)
+end
+```
+
+A worker that dies gives its key back with what it had reported, and the
+master releases the lock it named at once rather than leaving it for
+`stale_after`.
 
 ## Concurrency model
 

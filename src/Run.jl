@@ -5,11 +5,13 @@
 #   10: + Manifest (early skip)
 #   11: + KeyLock (multi-master)
 #   12: + retry
-#   13: + automatic `pmap(WorkerPool(workers()), ...)` dispatch when
+#   13: + automatic fan-out over the Distributed workers when
 #       `nprocs() > 1`, so a single master can fan out over local
 #       `addprocs(n)` or a SLURM cluster allocated via
 #       `SlurmClusterManager`.  No per-file change needed in user
 #       compute scripts — they still call `run!(work_fn, vault, keys)`.
+#   0.7: the master holds the task table (TaskTable.jl) and hands keys out itself, with the lock
+#       token and the resume point; `pmap` is gone.
 
 using Distributed
 using DataVault
@@ -24,7 +26,7 @@ Execution options for [`run!`](@ref).
 # Fields
 
 - `workers::Symbol = :auto` — dispatch mode. `:auto` fans out over the
-  Distributed `WorkerPool(workers())` via `pmap` when `nprocs() > 1`, and runs
+  Distributed `workers()` when `nprocs() > 1`, and runs
   sequentially otherwise. `:sequential` forces the sequential path even when
   worker processes are present (useful for debugging a serialization issue).
 - `max_attempts::Int = 3` — per-key retry budget. Set to `1` to disable
@@ -150,9 +152,7 @@ function _stop_outcome(reason::Symbol)::Symbol
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
-# How many times a key whose worker DIED is handed to another one. Both dispatchers bound this,
-# `_run_pmap!` through `pmap`'s `retry_delays` and `_run_affinity!` by counting, and they have to
-# agree: the same bound expressed twice through unrelated mechanisms is how they drift apart.
+# How many times a key whose worker DIED is handed to another one.
 const _WORKER_DEATH_REDISPATCHES = 2
 
 # As of v0.3 the per-key lock lives ENTIRELY in DataVault's `.running`
@@ -187,7 +187,8 @@ derives `(root, stage)` from a `DataVault.Vault`:
 load_manifest(vault::Vault) = load_manifest(manifest_root(vault), Symbol(vault.run))
 
 """
-    run!(work_fn, vault, keys; opts=RunOpts(), load=nothing, observe=true) -> NamedTuple
+    run!(work_fn, vault, keys; opts=RunOpts(), load=nothing, affinity=nothing, observe=true,
+         master=Master()) -> NamedTuple
 
 Run `work_fn(key) -> Dict` for every `key` in `keys`, persisting through
 `vault`. Writes a structured JSONL event log at
@@ -228,7 +229,23 @@ A preference, not a partition: a worker is never idle while a key is pending, so
 does not serialise onto the worker that opened it. When a worker has nothing from its own groups
 left it takes from the group with the most work outstanding, which spreads workers over groups.
 
-Only affects the `pmap` path; the sequential path already visits keys in order.
+Only affects the fan-out; the sequential path visits keys in order.
+
+# The task table
+
+The master reads the markers once, before it dispatches: keys finished by a sibling since the
+manifest was written are settled, a lock whose holder is provably gone is removed, and a key held
+by a live sibling is not handed out at all (it is counted in `busy`). What is left is the queue.
+Each key goes to a worker together with its lock token and the last progress recorded for it, so
+`work_fn` can ask [`resume_point`](@ref) instead of probing its own outputs; see
+[`report_progress`](@ref).
+
+When the queue drains, the keys that came back busy are asked about once more, since their holder
+may have finished or died while the pass ran.
+
+`master` is the [`Master`](@ref) this call runs as. A caller that makes several `run!` calls as
+one job (as [`run_loop!`](@ref) does) passes the same one to each, so they share an event log and
+the worker identities already collected.
 
 Returns `(; stage, done, err, busy, gave_up, stop, skipped, total, stopped_by)`. `stopped_by` is
 `:flag`, `:deadline`, or `nothing`: a stage that finished every key reports `nothing` even if the
@@ -247,9 +264,9 @@ Contract:
 
 If `nprocs() > 1` (i.e. `init_workers!(mode=:distributed|:slurm)` has added
 worker processes), `run!` automatically fans out over the Distributed
-`WorkerPool(workers())` via `pmap`.  Each worker runs the per-key
+`workers()`.  Each worker runs the per-key
 lock-acquire → `work_fn` → `DataVault.save!` → `mark_done!` pipeline
-independently.  All filesystem operations (the `.running` lock, atomic JLD2 write,
+for the key it was handed.  All filesystem operations (the `.running` lock, atomic JLD2 write,
 JSONL event log) are already NFS-safe, so concurrent workers inside one
 master are structurally consistent with multi-master operation.
 
@@ -258,7 +275,7 @@ sequential loop from todo 11.  This means the same compute.jl script is
 valid in three modes:
 
 1. No `init_workers!` call at all → sequential on the master.
-2. `init_workers!(mode=:distributed)` with `addprocs(n)` → local pmap fan-out.
+2. `init_workers!(mode=:distributed)` with `addprocs(n)` → local fan-out.
 3. `init_workers!(mode=:slurm)` inside a SLURM job → cluster fan-out.
 
 Multi-master locking (several separate julia processes writing to the
@@ -273,9 +290,10 @@ function run!(
     load=nothing,
     affinity=nothing,
     observe::Bool=true,
+    master::Master=Master(),
 )
     stage = Symbol(vault.run)
-    log_name = "events_$(gethostname())_$(getpid()).jsonl"
+    log_name = "events_$(master.id).jsonl"
     log = EventLog(joinpath(vault.outdir, log_name); min_level=opts.log_level)
 
     # Early skip: load manifest, subtract completed keys
@@ -299,13 +317,13 @@ function run!(
 
     log_event(log, :stage_start; stage=stage, total=length(keys), todo=length(todo))
 
-    # Dispatch strategy: pmap when Distributed workers are present (unless the
-    # caller forced `workers=:sequential`), otherwise the sequential loop.
+    # Dispatch strategy: fan out when Distributed workers are present (unless the
+    # caller forced `workers=:sequential`), otherwise draw the queue on this process.
     multi = opts.workers !== :sequential && nprocs() > 1
     if multi
         # Ensure the seam packages (+ the user's work module(s) via `load=`) are loaded in `Main`
         # on every worker before fan-out. `init_workers!` spawns workers with `--project` but loads
-        # no packages, so the first pmap task would otherwise die with a cryptic
+        # no packages, so the first dispatched key would otherwise die with a cryptic
         # `KeyError: <Module> not found` (DataKey deserialization / the save! pipeline / work_fn).
         # Idempotent, so it composes with a project that still broadcasts modules by hand.
         _ensure_worker_modules(
@@ -315,14 +333,16 @@ function run!(
     # Every process that will write markers observes its sources now, so each `.done` names the
     # observation of the process that computed it (see Observe.jl).
     _observe_processes!(vault, multi, observe, log, stage)
-    dispatch = ks -> if !multi
-        _run_sequential!(work_fn, vault, ks, stage, log, opts)
-    elseif affinity === nothing
-        _run_pmap!(work_fn, vault, ks, stage, log, opts)
+    # The master's view of the round: one pass over the markers, then the queue the dispatcher
+    # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
+    table = TaskTable(todo; affinity=multi ? affinity : nothing)
+    _scan!(table, vault, stage, log, opts)
+    drive = if multi
+        () -> _drive_workers!(work_fn, vault, table, stage, log, opts, master)
     else
-        _run_affinity!(work_fn, vault, ks, stage, log, opts, affinity)
+        () -> _drive_sequential!(work_fn, vault, table, stage, log, opts)
     end
-    outcomes = _redispatch_deferred(dispatch(todo), dispatch, log, stage, opts)
+    _dispatch!(drive, table, vault, stage, log, opts)
 
     # Aggregate outcomes into counters + manifest updates.
     n_done = 0
@@ -331,10 +351,9 @@ function run!(
     n_gave_up = 0
     n_stop = 0
     stop_seen = nothing
-    for (key, outcome) in outcomes
-        if outcome === :lock_busy || outcome === :deferred
-            n_busy += 1
-        elseif outcome === :already_done
+    for row in table.rows
+        key, outcome = row.key, row.outcome
+        if outcome === :already_done
             add_complete!(m, key)
         elseif outcome === :ok
             add_complete!(m, key)
@@ -348,8 +367,12 @@ function run!(
         elseif outcome === :gave_up
             n_gave_up += 1
             n_err += 1
-        else  # :error
+        elseif outcome === :error
             n_err += 1
+        else
+            # `:lock_busy`, `:deferred`, `:worker_lost`: never attempted to completion here, and
+            # retriable.
+            n_busy += 1
         end
     end
 
@@ -436,12 +459,15 @@ function _run_one_with_lock!(
     key::DataKey,
     stage::Symbol,
     log::EventLog,
-    opts::RunOpts,
+    opts::RunOpts;
+    tok::AbstractString=owner_token(),
+    resume::Union{Progress,Nothing}=nothing,
+    reap::Bool=true,
 )
     kstr = canonical(key)
 
-    # Early exit if stop flag has been raised (checked by both sequential
-    # and pmap paths, so each worker can bail independently).
+    # Early exit if stop flag has been raised (checked here as well as by the dispatcher, so a
+    # key already on its way to a worker is not started).
     # The reason travels back WITH the outcome: a flag file can be removed and a deadline can pass
     # before the outcome is read, so re-deriving it later can name something that did not stop this.
     stop = _stop_reason(opts)
@@ -449,12 +475,14 @@ function _run_one_with_lock!(
 
     # A lock whose holder can be SHOWN to be gone does not have to wait out `stale_after`. The
     # clear is owner-checked, so it is a no-op if the holder changed since the question was asked.
-    _reap_if_dead!(vault, key, stage, log)
+    # Under `run!` the master asked this for every key before dispatching (`_scan!`), and `reap`
+    # is false.
+    reap && _reap_if_dead!(vault, key, stage, log)
 
     # DataVault owns the lock file.  `acquire_running!` is atomic on
     # NFS via POSIX `link()`: concurrent masters see at most one
-    # `:ok` / `:reclaimed`; the losers see `:busy`.
-    tok = owner_token()
+    # `:ok` / `:reclaimed`; the losers see `:busy`. `tok` names this acquisition; under `run!` the
+    # master made it, so its table says who holds what.
     acq = DataVault.acquire_running!(vault, key, tok; stale_after=opts.stale_after)
     if acq === :busy
         log_event(log, :lock_busy; level=:debug, stage=stage, key=kstr)
@@ -486,7 +514,7 @@ function _run_one_with_lock!(
     hb = DataVault.start_heartbeat(vault, key, tok; interval=opts.heartbeat_interval)
 
     outcome = try
-        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, tok)
+        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, tok; resume=resume)
     finally
         DataVault.stop_heartbeat(hb)
         # Release so a sibling can retry the key at once instead of after `stale_after`. On `:ok`
@@ -498,245 +526,323 @@ function _run_one_with_lock!(
     return (key, outcome)
 end
 
+# What `_scan_row!` found for one key.
+#   :done   — finished already (by a sibling, since the manifest was written)
+#   :free   — no lock; queue it
+#   :reaped — a lock whose holder is provably gone was removed; queue it
+#   :stale  — a lock past `stale_after`; queue it, `acquire_running!` reclaims
+#   :held   — a live or not-yet-stale lock; do not queue it this pass
+function _scan_row!(
+    table::TaskTable,
+    i::Int,
+    vault::Vault,
+    stage::Symbol,
+    log::EventLog,
+    opts::RunOpts,
+    progress::Dict{String,Progress},
+)::Symbol
+    r = table.rows[i]
+    if DataVault.is_done(vault, r.key)
+        settle!(table, i, :already_done)
+        return :done
+    end
+    r.progress = get(progress, r.kstr, nothing)
+    DataVault.is_running(vault, r.key) || return :free
+    _reap_if_dead!(vault, r.key, stage, log) && return :reaped
+    DataVault.running_age_secs(vault, r.key) > opts.stale_after && return :stale
+    hold!(table, i, DataVault.running_owner(vault, r.key))
+    log_event(log, :lock_busy; level=:debug, stage=stage, key=r.kstr)
+    return :held
+end
+
 """
-    _run_sequential!(work_fn, vault, todo, stage, log, opts) -> Vector{Tuple{DataKey,Symbol}}
+    _scan!(table, vault, stage, log, opts) -> NamedTuple
+
+The master's one pass over the markers: every queued row is checked for a `.done` written since
+the manifest and for a `.running` lock, and the recorded progress is attached. Returns
+`(; done, held, reaped, stale)`.
+
+This is the read the workers used to do one key at a time. A key that turns out to be locked by a
+live sibling is not dispatched at all.
 """
-function _run_sequential!(
+function _scan!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts)
+    progress = read_progress(vault)
+    done = held = reaped = stale = 0
+    for i in eachindex(table.rows)
+        table.rows[i].state === :todo || continue
+        s = _scan_row!(table, i, vault, stage, log, opts, progress)
+        s === :done && (done += 1)
+        s === :held && (held += 1)
+        s === :reaped && (reaped += 1)
+        s === :stale && (stale += 1)
+    end
+    return (; done, held, reaped, stale)
+end
+
+# How many times a drained queue looks again at the keys it could not get. Their holder may have
+# finished, died or released while this pass ran, and a long pass is hours.
+const _BUSY_RESCANS = 2
+
+# Ask again about every key that came back `:lock_busy`, and requeue the ones that are free now.
+# Returns how many were requeued.
+function _rescan_busy!(
+    table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts
+)::Int
+    busy = [i for (i, r) in enumerate(table.rows) if r.outcome === :lock_busy]
+    isempty(busy) && return 0
+    progress = read_progress(vault)
+    n = 0
+    for i in busy
+        s = _scan_row!(table, i, vault, stage, log, opts, progress)
+        (s === :free || s === :reaped || s === :stale) || continue
+        requeue!(table, i)
+        n += 1
+    end
+    return n
+end
+
+function _n_finished(table::TaskTable)
+    return count(r -> r.outcome === :ok || r.outcome === :already_done, table.rows)
+end
+
+"""
+    _dispatch!(drive, table, vault, stage, log, opts)
+
+Run `drive()` (one pass: the queue is drawn until it is empty and nothing is running) until the
+table has nothing left that another pass could finish.
+
+Two things put a row back on the queue between passes. A key that came back `:lock_busy` is asked
+about again, since its holder may be gone by now. A key whose `work_fn` threw
+`DataVault.ArtifactBusy` is re-dispatched: at once after a pass that finished something (the
+artifact it waited on has usually been built by then), after `opts.defer_poll` seconds otherwise
+(the builder is then another job). A key still deferred when the run stops stays `:deferred`,
+which `run!` counts with `busy`: it was never attempted.
+"""
+function _dispatch!(
+    drive, table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts
+)
+    round = 0
+    while true
+        before = _n_finished(table)
+        for _ in 0:_BUSY_RESCANS
+            drive()
+            _stop_reason(opts) === nothing || break
+            _rescan_busy!(table, vault, stage, log, opts) == 0 && break
+        end
+        deferred = [i for (i, r) in enumerate(table.rows) if r.outcome === :deferred]
+        isempty(deferred) && break
+        _stop_reason(opts) === nothing || break
+        _n_finished(table) > before || sleep(opts.defer_poll)
+        round += 1
+        log_event(log, :deferred_round; stage=stage, round=round, keys=length(deferred))
+        foreach(i -> requeue!(table, i), deferred)
+    end
+    return nothing
+end
+
+"""
+    _drive_sequential!(work_fn, vault, table, stage, log, opts)
+
+Draw the queue on this process, one key at a time.
+"""
+function _drive_sequential!(
     work_fn::Function,
     vault::Vault,
-    todo::AbstractVector{DataKey},
+    table::TaskTable,
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
 )
-    results = Vector{Tuple{DataKey,Symbol}}()
-    for (i, key) in enumerate(todo)
-        # The keys a stop drops are ATTRIBUTED, not silently absent, matching `_run_pmap!`, which
-        # hands every key to `_run_one_with_lock!` regardless. The result vector has one entry per
-        # `todo` key on either path.
+    while true
+        # The keys a stop drops are ATTRIBUTED, not silently absent: every row ends the round
+        # with an outcome.
         stop = _stop_reason(opts)
         if stop !== nothing
-            sym = _stop_outcome(stop)
-            append!(results, ((k, sym) for k in @view todo[i:end]))
+            settle_queued!(table, _stop_outcome(stop))
             break
         end
-        push!(results, _run_one_with_lock!(work_fn, vault, key, stage, log, opts))
+        i = next_task!(table, myid())
+        i === nothing && break
+        row = table.rows[i]
+        tok = owner_token()
+        start_task!(table, i, tok, myid())
+        (_, outcome) = _run_one_with_lock!(
+            work_fn,
+            vault,
+            row.key,
+            stage,
+            log,
+            opts;
+            tok=tok,
+            resume=row.progress,
+            reap=false,
+        )
+        settle!(table, i, outcome)
     end
-    return results
+    return nothing
+end
+
+# A worker exited holding `row`'s lock. The master named that lock, so it can take it back now
+# instead of leaving it for `stale_after`: the heartbeat died with the worker, and whoever is
+# handed the key next would otherwise find it busy. Owner-checked, so it removes nothing a sibling
+# has since reclaimed; and if the worker is in fact alive and only unreachable, its commit is
+# owner-checked too and is refused.
+function _release_dead!(
+    vault::Vault, row::TaskRow, tok::AbstractString, stage::Symbol, log::EventLog
+)
+    try
+        DataVault.clear_running!(vault, row.key, tok) && log_event(
+            log,
+            :lock_released;
+            stage=stage,
+            key=row.kstr,
+            owner=tok,
+            why="worker_exited",
+        )
+    catch e
+        e isa InterruptException && rethrow()
+        log_event(log, :reap_failed; stage=stage, key=row.kstr, err=_short_err(e))
+    end
+    return nothing
 end
 
 """
-    _run_pmap!(work_fn, vault, todo, stage, log, opts) -> Vector{Tuple{DataKey,Symbol}}
+    _drive_workers!(work_fn, vault, table, stage, log, opts, master)
 
-Fan `todo` out across `WorkerPool(workers())` via `pmap`.  Each worker
-invokes `_run_one_with_lock!`, which serialises the per-key lock +
-`work_fn` + save pipeline on that worker.  Returns the list of
-`(key, outcome)` pairs for master-side aggregation.
+Draw the queue over the Distributed workers: one dispatch task per worker, each taking the next
+row [`next_task!`](@ref) gives it, handing the worker the key WITH its lock token and resume
+point, and settling the row with what comes back.
 
-Failures inside `work_fn` are already caught by `_run_one_with_retry!`
-and turned into `(key, :gave_up)` / `(key, :error)`; we additionally set
-`pmap`'s `on_error = identity` so an unexpected thrown exception bubbles
-up as an `Exception` value in the outcomes vector rather than bringing
-down the whole fan-out, and we log + convert those to `:error`. A worker
-that *dies* mid-key (`ProcessExitedException`, e.g. SLURM preemption) is
-re-dispatched to a live worker via `retry_check`.
+The master names the lock (`owner_token(host, pid)` of the worker), so the table knows who holds
+what while it runs, and a worker that dies has its lock released at once.
+
+A dispatch task does not leave while a key is still out: a worker that dies gives its key back,
+and somebody has to be there to take it. A key that has taken down
+`_WORKER_DEATH_REDISPATCHES + 1` workers is reported rather than handed to the next one —
+unbounded, a key that reliably kills whoever takes it is handed to worker after worker forever.
 """
-function _run_pmap!(
+function _drive_workers!(
     work_fn::Function,
     vault::Vault,
-    todo::AbstractVector{DataKey},
+    table::TaskTable,
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
+    master::Master,
 )
-    pool = WorkerPool(workers())
-    # `retry_check` re-dispatches a key whose worker DIED
-    # (`ProcessExitedException`) to a live worker; `work_fn` errors are handled
-    # inside `_run_one_with_lock!` and never escape, so they are not retried.
-    raw = pmap(
-        pool,
-        todo;
-        on_error=identity,
-        retry_delays=ExponentialBackOff(; n=_WORKER_DEATH_REDISPATCHES),
-        retry_check=(s, e) -> (s, e isa ProcessExitedException),
-    ) do key
-        return _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
-    end
+    pids = workers()
+    _identify_workers!(master, pids)
+    who = lock(() -> copy(master.who), master.lock)
+    # All dispatch tasks are `@async` on this task's thread, so a plain counter and Condition are
+    # enough: nothing between a check and the `wait` that follows it can yield.
+    out = Ref(0)
+    idle = Condition()
 
-    # Normalise any thrown exceptions back to (key, :error) tuples.
-    out = Vector{Tuple{DataKey,Symbol}}(undef, length(todo))
-    @inbounds for i in eachindex(todo)
-        item = raw[i]
-        if item isa Tuple{DataKey,Symbol}
-            out[i] = item
-        else
-            # `pmap(; on_error = identity)` returns the exception value at
-            # this slot.  Log it and mark the key as :error.
-            kstr = canonical(todo[i])
-            err = _short_err(item)
-            log_event(log, :error; stage=stage, key=kstr, attempt=0, err=err)
-            out[i] = (todo[i], :error)
-        end
-    end
-    return out
-end
+    stopped = Ref(false)
 
-"""
-    _run_affinity!(work_fn, vault, todo, stage, log, opts, affinity) -> Vector{Tuple{DataKey,Symbol}}
-
-[`_run_pmap!`](@ref) with a PREFERENCE for keys whose `affinity` value the worker has already
-handled. A free worker takes a pending key from its most recently used group if one is left, and
-otherwise from the group with the most work outstanding, which spreads workers over groups instead
-of piling them onto one.
-
-A preference, never a partition. A worker is never idle while a key is pending, so a 200-key group
-does not serialise onto the worker that opened it.
-
-`pmap` is not used here because it hands out work itself. Its `ProcessExitedException` re-dispatch
-is reproduced: a key whose worker died goes back on the queue and the worker is dropped.
-"""
-function _run_affinity!(
-    work_fn::Function,
-    vault::Vault,
-    todo::AbstractVector{DataKey},
-    stage::Symbol,
-    log::EventLog,
-    opts::RunOpts,
-    affinity::Function,
-)
-    groups = Any[affinity(k) for k in todo]
-    by_group = Dict{Any,Vector{Int}}()
-    for (i, g) in enumerate(groups)
-        push!(get!(Vector{Int}, by_group, g), i)
-    end
-    # `pop!` takes from the end, so reverse to hand keys out in the caller's order. That order is
-    # load-bearing: a leading paramset is how a long acquisition is told which slice to close first.
-    for v in values(by_group)
-        reverse!(v)
-    end
-
-    out = Vector{Tuple{DataKey,Symbol}}(undef, length(todo))
-    # `Vector{Bool}`, not `BitVector`: adjacent bits share a word, so two tasks marking neighbouring
-    # indices would read-modify-write the same one.
-    filled = fill(false, length(todo))
-    q = ReentrantLock()
-    seen = Dict{Int,Vector{Any}}()
-
-    function _take!(pid::Int)
-        return lock(q) do
-            mine = get!(Vector{Any}, seen, pid)
-            for (j, g) in enumerate(mine)
-                v = get(by_group, g, nothing)
-                if v !== nothing && !isempty(v)
-                    j == 1 || (deleteat!(mine, j); pushfirst!(mine, g))
-                    return pop!(v)
+    function _loop(pid::Int, host::String, ospid::Int)
+        while true
+            if !stopped[]
+                stop = _stop_reason(opts)
+                if stop !== nothing
+                    settle_queued!(table, _stop_outcome(stop))
+                    stopped[] = true
                 end
             end
-            best, bestn = nothing, 0
-            for (g, v) in by_group
-                length(v) > bestn && ((best, bestn) = (g, length(v)))
+            # A worker that went away while this loop was waiting must not be handed a key: the
+            # call would fail at once and be counted against the key as a death.
+            pid in workers() || break
+            i = next_task!(table, pid)
+            if i === nothing
+                out[] == 0 && break
+                wait(idle)
+                continue
             end
-            best === nothing && return nothing
-            pushfirst!(mine, best)
-            return pop!(by_group[best])
-        end
-    end
-
-    # `pmap` bounds its own `ProcessExitedException` re-dispatch with
-    # `retry_delays=ExponentialBackOff(; n=2)`; this dispatcher has to bound it too. Unbounded, a
-    # key that reliably kills whoever takes it is handed to worker after worker forever, and the
-    # faster a dead holder's lock is reclaimed the faster that cascade runs.
-    const_giveback_limit = _WORKER_DEATH_REDISPATCHES
-    givebacks = zeros(Int, length(todo))
-    _give_back!(i::Int)::Bool = lock(q) do
-        givebacks[i] += 1
-        givebacks[i] > const_giveback_limit && return false
-        push!(get!(Vector{Int}, by_group, groups[i]), i)
-        return true
-    end
-
-    @sync for pid in workers()
-        @async while true
-            i = _take!(pid)
-            i === nothing && break
-            key = todo[i]
-            res = try
-                remotecall_fetch(
-                    _run_one_with_lock!, pid, work_fn, vault, key, stage, log, opts
+            row = table.rows[i]
+            tok = owner_token(host, ospid)
+            start_task!(table, i, tok, pid)
+            out[] += 1
+            died = false
+            outcome = try
+                last(
+                    remotecall_fetch(
+                        _run_one_with_lock!,
+                        pid,
+                        work_fn,
+                        vault,
+                        row.key,
+                        stage,
+                        log,
+                        opts;
+                        tok=tok,
+                        resume=row.progress,
+                        reap=false,
+                    ),
                 )
             catch e
                 if e isa ProcessExitedException
-                    # Requeued, or out of attempts: a key that has taken down `const_giveback_limit`
-                    # workers is reported rather than handed to the next one.
-                    if !_give_back!(i)
+                    died = true
+                    _release_dead!(vault, row, tok, stage, log)
+                    row.deaths += 1
+                    if row.deaths > _WORKER_DEATH_REDISPATCHES
                         log_event(
                             log,
                             :gave_up;
                             stage=stage,
-                            key=canonical(key),
-                            attempts=const_giveback_limit + 1,
+                            key=row.kstr,
+                            attempts=row.deaths,
                             err="worker exited on this key every time it was dispatched",
                         )
-                        out[i] = (key, :error)
-                        filled[i] = true
+                        :error
+                    else
+                        nothing            # goes back on the queue
                     end
-                    break
+                else
+                    log_event(
+                        log,
+                        :error;
+                        stage=stage,
+                        key=row.kstr,
+                        attempt=0,
+                        err=_short_err(e),
+                    )
+                    :error
                 end
-                log_event(
-                    log,
-                    :error;
-                    stage=stage,
-                    key=canonical(key),
-                    attempt=0,
-                    err=_short_err(e),
-                )
-                (key, :error)
+            finally
+                out[] -= 1
             end
-            out[i] = res
-            filled[i] = true
+            if outcome === nothing
+                # What it had reported before it died is where the next worker starts.
+                row.progress = _read_progress_one(vault, row.kstr)
+                requeue!(table, i; front=true)
+            else
+                settle!(table, i, outcome)
+            end
+            notify(idle)
+            died && break
+        end
+        return nothing
+    end
+
+    @sync for pid in pids
+        w = get(who, pid, nothing)
+        w === nothing && continue
+        @async try
+            _loop(pid, w[1], w[2])
+        finally
+            # A loop that leaves on an exception must not strand the ones waiting on it.
+            notify(idle)
         end
     end
 
     # Every worker died while keys were still pending. Those keys were never attempted, so they are
-    # retriable rather than failed: `:lock_busy` is the outcome `run!` already counts that way.
-    for i in eachindex(todo)
-        filled[i] && continue
-        log_event(log, :worker_lost; stage=stage, key=canonical(todo[i]))
-        out[i] = (todo[i], :lock_busy)
+    # retriable rather than failed, and `run!` counts them with `busy`.
+    for (i, r) in enumerate(table.rows)
+        r.state === :todo || continue
+        log_event(log, :worker_lost; stage=stage, key=r.kstr)
+        settle!(table, i, :worker_lost)
     end
-    return out
-end
-
-"""
-    _redispatch_deferred(outcomes, dispatch, log, stage, opts) -> outcomes
-
-Re-run the keys whose `work_fn` threw `DataVault.ArtifactBusy` until none is left or the run is
-stopped. The first re-dispatch follows a pass that finished something, so the artifact it was
-waiting on has usually been built by then and it goes at once; after a pass that finished
-nothing, it waits `opts.defer_poll` seconds first — the builder is then another job. Returns the
-outcomes in the caller's key order. A key still deferred when the run stops is left as
-`:deferred`, which `run!` counts with `busy`: it was never attempted.
-"""
-function _redispatch_deferred(
-    outcomes, dispatch, log::EventLog, stage::Symbol, opts::RunOpts
-)
-    final = Dict{DataKey,Symbol}(k => o for (k, o) in outcomes)
-    progressed = any(o -> o === :ok || o === :already_done, last.(outcomes))
-    round = 0
-    while true
-        deferred = DataKey[k for (k, _) in outcomes if final[k] === :deferred]
-        isempty(deferred) && break
-        _stop_reason(opts) === nothing || break
-        progressed || sleep(opts.defer_poll)
-        round += 1
-        log_event(log, :deferred_round; stage=stage, round=round, keys=length(deferred))
-        res = dispatch(deferred)
-        progressed = any(r -> last(r) === :ok || last(r) === :already_done, res)
-        for (k, o) in res
-            final[k] = o
-        end
-    end
-    return [(k, final[k]) for (k, _) in outcomes]
+    return nothing
 end
 
 """
@@ -758,14 +864,22 @@ function _run_one_with_retry!(
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
-    tok::AbstractString,
+    tok::AbstractString;
+    resume::Union{Progress,Nothing}=nothing,
 )
     last_err = nothing
+    reported = Ref(resume !== nothing)
     for attempt in 1:opts.max_attempts
         log_event(log, :key_start; level=:debug, stage=stage, key=kstr, attempt=attempt)
         t0 = time()
         try
-            payload = work_fn(key)
+            # What `work_fn` can ask about the key it was handed (`resume_point`,
+            # `report_progress`). A retry starts from what the failed attempt reported.
+            if attempt > 1 && reported[]
+                resume = _read_progress_one(vault, kstr)
+            end
+            ctx = KeyContext(vault, key, kstr, String(tok), resume, opts, reported)
+            payload = with(() -> work_fn(key), _KEY => ctx)
             payload isa Dict || error(
                 "work_fn must return a Dict (got $(typeof(payload))). " *
                 "Wrap scalars as e.g. Dict(\"value\" => x).",
@@ -788,6 +902,9 @@ function _run_one_with_retry!(
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
                 return :lock_busy
             end
+            # A finished unit has no resume point. Only when one was written, so a unit that
+            # never reports costs no extra filesystem call.
+            reported[] && _clear_progress(vault, kstr)
             log_event(
                 log,
                 :key_done;
@@ -907,6 +1024,8 @@ function run_loop!(
         )
     end
 
+    # One master for every round: its event log, and what it has learned about its workers.
+    master = Master()
     empty_count = 0
     rounds = 0
     n_done = 0
@@ -925,7 +1044,14 @@ function run_loop!(
         stopped === nothing || break
         rounds += 1
         result = run!(
-            work_fn, vault, keys; opts=opts, load=load, affinity=affinity, observe=observe
+            work_fn,
+            vault,
+            keys;
+            opts=opts,
+            load=load,
+            affinity=affinity,
+            observe=observe,
+            master=master,
         )
         n_done += result.done
         n_busy = result.busy

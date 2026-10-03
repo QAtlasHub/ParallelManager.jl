@@ -26,12 +26,17 @@ for how the three layers fit together.
   or the function breaks under `:distributed`.
 - **Worker module loading is automatic.** `run!` `using`s `ParamIO`/`DataVault`/`SweepRunner`
   in `Main` on every worker before fan-out, so a sweep no longer dies with a cryptic
-  `KeyError: <Module> not found` on the first pmap task (a failure only ever seen on real Slurm).
+  `KeyError: <Module> not found` on the first dispatched key (a failure only ever seen on real Slurm).
   Name any *additional* installed module your `work_fn` needs — its own package, or a stdlib like
   `Statistics` — via `run!(…; load=MyModule)` (also accepts `load=[A, B]`, a `Symbol`, or a
   `String`). This replaces the hand-rolled `for w in workers(); remotecall_fetch(w, …, :(using …));
   end` broadcast. Caveat: a work *function* defined inline in the script (not in a package) must
   still be `@everywhere function …`; `load=` resolves installed modules, not `Main` submodules.
+- **A `work_fn` made of steps asks, it does not probe.** `SweepRunner.resume_point()` returns
+  the last step an earlier attempt reported (on any worker, of any job) and
+  `SweepRunner.report_progress(step; of=n)` records one. The master read the progress stamps when
+  it built its task table and handed the value over with the key; a `work_fn` that walks its own
+  outputs to find where to resume is doing the scan the table exists to remove.
 - **No per-item `println`** — structured events go through `EventLog` (JSONL)
   only. This is deliberate (the old loop generated 300 MB of per-item logs).
 
@@ -45,7 +50,8 @@ for how the three layers fit together.
 ## Module layout — one file, one concern
 
 `AtomicIO` (atomic write) · `EventLog` (JSONL) · `Manifest` (O(1) early-skip) ·
-`InitWorkers` (backend bootstrap) · `Run` (the `run!` facade). Each is usable
+`InitWorkers` (backend bootstrap) · `Run` (the `run!` facade) · `TaskTable` (the master's table
+of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`). Each is usable
 independently. As of v0.3 the per-key advisory lock lives entirely in
 **DataVault's `.running` markers** (`acquire_running!`); `run!` calls into it
 rather than maintaining its own `locks/` tree.

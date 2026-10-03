@@ -42,10 +42,13 @@ stay within that guarantee.
 |                 | record of a claim, since a SIGKILL skips every later event         |
 | `key_start`     | before each `work_fn(key)` attempt (includes `attempt` field)     |
 | `key_done`      | after a successful `work_fn(key)` (includes `secs`, `attempt`)    |
-| `lock_busy`     | another master holds the `.running` lock (acquire = `:busy`)      |
+| `lock_busy`     | another master holds the `.running` lock: found by the master's    |
+|                 | scan before dispatch, or by a worker's acquire (= `:busy`)         |
 | `lock_lost`     | our lock was reclaimed mid-work; result discarded (no double-run) |
 | `lock_reaped`   | a lock whose holder was shown dead was cleared without waiting     |
 | `reap_failed`   | reaping threw; the key falls back to the `stale_after` timeout     |
+| `lock_released` | the master took back a lock it had named (includes `why`, e.g.     |
+|                 | `worker_exited`)                                                   |
 | `lock_reclaimed`| (reserved, not currently emitted)                                 |
 | `error`         | `work_fn` threw on this attempt                                   |
 | `retry`         | another attempt will follow                                       |
