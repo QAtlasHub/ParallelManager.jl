@@ -51,6 +51,7 @@ SweepRunner.RunOpts
 SweepRunner.run!
 SweepRunner.run_loop!
 SweepRunner.todo_count
+SweepRunner.key_seconds
 ```
 
 ## Artifacts

@@ -637,7 +637,7 @@ function _pool_need(pool::SizedPool, key::DataKey, kstr::AbstractString, deadlin
     (pool.threads === :finish_by && deadline !== nothing && min_time !== nothing) ||
         return base
     left = deadline - time()
-    need = _seconds_or(min_time, key, 0.0)
+    need = something(key_seconds(min_time, key), 0.0)
     s0 = max(Float64(pool.speedup(key, base.cores)), 1e-9)
     for c in base.cores:max(pool.max_threads, base.cores)
         need * s0 / max(Float64(pool.speedup(key, c)), 1e-9) <= left &&
@@ -654,7 +654,9 @@ end
 # hold-back asks this, so a key that `:finish_by` gave more cores to is not then refused for the
 # time it would have taken on fewer.
 function _pool_min_time(pool::SizedPool, key::DataKey, deadline, min_time)::Float64
-    need = _seconds_or(min_time, key, 0.0)
+    need = key_seconds(min_time, key)
+    # Unknown stays unknown (NaN): `_fits` decides what that means, not this function.
+    need === nothing && return NaN
     pool.threads === :finish_by || return need
     base = pool.key_req(key)::KeyReq
     size = _pool_need(pool, key, canonical(key), deadline, min_time)

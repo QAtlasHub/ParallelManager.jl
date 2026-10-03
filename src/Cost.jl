@@ -21,13 +21,16 @@ using ParamIO: DataKey
 # ── measuring one key ───────────────────────────────────────────────────────────────────────────
 
 # Start the peak-memory count again, so a key's peak is its own and not the largest key this
-# worker has ever run. Linux only (`/proc/self/clear_refs`); elsewhere the peak is the process's.
-function _reset_peak_rss()
+# worker has ever run. Linux only (`/proc/self/clear_refs`). Returns whether it worked: where it
+# did not, the peak read afterwards is the process's, and the record says so.
+function _reset_peak_rss()::Bool
+    Sys.islinux() || return false
     try
-        Sys.islinux() && write("/proc/self/clear_refs", "5")
+        write("/proc/self/clear_refs", "5")
+        return true
     catch
+        return false
     end
-    return nothing
 end
 
 # Peak resident memory in bytes since the last reset: `VmHWM` on Linux, else the process's
@@ -70,12 +73,15 @@ end
 """
     KeyCost
 
-One finished key, as measured: `stage`, `key` (canonical), `class` (from `run!`'s `key_class`,
+One attempt at a key, as measured: `stage`, `key` (canonical), `class` (from `run!`'s `key_class`,
 `""` when none was given), `wall` and `cpu` in seconds, `cores` the worker had, `rss` peak
-resident bytes, `host`, the `attempt` that succeeded, and `note` (what the application added with
-[`note_key!`](@ref)).
+resident bytes, `host`, the `attempt` number, `note` (what the application added with
+[`note_key!`](@ref)), the attempt's `outcome` (`"ok"`, or `"error"`, `"stopped"`, `"lock_lost"`,
+`"worker_died"` for one that did not finish the key), and `rss_scope`: `"key"` when the peak is
+this attempt's own, `"process"` when it is the worker's since it started (the reset is not
+available there), `""` when no peak was read.
 
-`cpu / (wall * cores)` is how much of its cores the key used.
+`cpu / (wall * cores)` is how much of its cores the attempt used.
 """
 struct KeyCost
     stage::String
@@ -88,6 +94,15 @@ struct KeyCost
     host::String
     attempt::Int
     note::Dict{String,Any}
+    outcome::String
+    rss_scope::String
+end
+
+# A finished attempt whose peak is its own: what a record is unless it says otherwise.
+function KeyCost(stage, key, class, wall, cpu, cores, rss, host, attempt, note)
+    return KeyCost(
+        stage, key, class, wall, cpu, cores, rss, host, attempt, note, "ok", "key"
+    )
 end
 
 function _event_files(outdir::AbstractString)
@@ -102,23 +117,26 @@ end
     key_costs(vault) -> Vector{KeyCost}
     key_costs(outdir::AbstractString; stage=nothing) -> Vector{KeyCost}
 
-Every `key_done` record in the event logs under a vault's outdir — for the vault's stage, or for
-`stage` (all stages when `nothing`). Records written before the measurement existed carry only
-the wall time and are returned with `cpu = NaN`, `cores = 0`, `rss = 0`.
+Every attempt on record in the event logs under a vault's outdir — `key_done` (the attempt that
+finished a key) and `key_spent` (one that did not: failed, stopped, lost its lock, or whose
+worker died) — for the vault's stage, or for `stage` (all stages when `nothing`). Records written
+before the measurement existed carry only the wall time and are returned with `cpu = NaN`,
+`cores = 0`, `rss = 0`.
 """
 function key_costs(outdir::AbstractString; stage=nothing)
     out = KeyCost[]
     want = stage === nothing ? nothing : String(stage)
     for f in _event_files(outdir)
         for line in eachline(f)
-            # A cheap test first: most lines of a log are not `key_done`.
-            occursin("\"key_done\"", line) || continue
+            # A cheap test first: most lines of a log are neither.
+            (occursin("\"key_done\"", line) || occursin("\"key_spent\"", line)) || continue
             e = try
                 JSON3.read(line, Dict{String,Any})
             catch
                 continue
             end
-            get(e, "kind", "") == "key_done" || continue
+            kind = get(e, "kind", "")
+            (kind == "key_done" || kind == "key_spent") || continue
             st = String(get(e, "stage", ""))
             (want === nothing || st == want) || continue
             note = get(e, "note", nothing)
@@ -135,6 +153,8 @@ function key_costs(outdir::AbstractString; stage=nothing)
                     String(get(e, "host", "")),
                     Int(get(e, "attempt", 1)),
                     note isa AbstractDict ? Dict{String,Any}(note) : Dict{String,Any}(),
+                    kind == "key_done" ? "ok" : String(get(e, "outcome", "?")),
+                    String(get(e, "rss_scope", haskey(e, "rss") ? "key" : "")),
                 ),
             )
         end
@@ -152,10 +172,19 @@ end
 """
     cost_summary(costs; by = c -> c.class) -> Dict{String,NamedTuple}
 
-Per class: `(; n, wall_median, wall_p90, cpu_median, cores, rss_peak, efficiency)` — how many keys,
-the median and 90th-percentile wall seconds, the median CPU seconds, the cores a worker of that
-class had (the most common value), the largest peak RSS in bytes, and the median fraction of its
-cores a key used (`NaN` when the CPU time was not recorded).
+Per class: `(; n, wall_median, wall_p90, cpu_median, cores, rss_peak, efficiency, unfinished,
+rss_process)`.
+
+A key's time is the SUM over its attempts — the ones that failed, were stopped or cut, and the
+one that finished it: a key that ran six hours over four jobs took six hours, not the forty
+minutes of its last leg. `n` counts the keys that finished, and the medians and the 90th
+percentile are over those keys' totals. `unfinished` counts keys with attempts on record and none
+that finished: the classes too big for their request show up here rather than nowhere.
+
+`cores` is the most common value among the attempts, `rss_peak` the largest peak of any attempt
+(finished or not), `rss_process` whether any of those peaks is a whole process's rather than the
+key's own, and `efficiency` the median fraction of its cores an attempt used (`NaN` when the CPU
+time was not recorded).
 """
 function cost_summary(costs::AbstractVector{KeyCost}; by=c -> c.class)
     groups = Dict{String,Vector{KeyCost}}()
@@ -164,31 +193,55 @@ function cost_summary(costs::AbstractVector{KeyCost}; by=c -> c.class)
     end
     out = Dict{String,NamedTuple}()
     for (label, cs) in groups
-        wall = sort!([c.wall for c in cs if !isnan(c.wall)])
-        isempty(wall) && continue
-        cpu = sort!([c.cpu for c in cs if !isnan(c.cpu)])
+        # Attempts of one key, together.
+        keys_ = Dict{Tuple{String,String},Vector{KeyCost}}()
+        for c in cs
+            push!(get!(Vector{KeyCost}, keys_, (c.stage, c.key)), c)
+        end
+        wall = Float64[]
+        cpu = Float64[]
+        unfinished = 0
+        for attempts in values(keys_)
+            if !any(a -> a.outcome == "ok", attempts)
+                unfinished += 1
+                continue
+            end
+            w = [a.wall for a in attempts if !isnan(a.wall)]
+            isempty(w) && continue
+            push!(wall, sum(w))
+            c = [a.cpu for a in attempts]
+            any(isnan, c) || push!(cpu, sum(c))
+        end
+        sort!(wall)
+        sort!(cpu)
         eff = sort!([
             c.cpu / (c.wall * c.cores) for
             c in cs if !isnan(c.cpu) && c.cores > 0 && c.wall > 0
         ])
         counts = Dict{Int,Int}()
         for c in cs
-            counts[c.cores] = get(counts, c.cores, 0) + 1
+            c.cores > 0 && (counts[c.cores] = get(counts, c.cores, 0) + 1)
         end
         out[label] = (;
-            n=length(cs),
-            wall_median=_quantile(wall, 0.5),
-            wall_p90=_quantile(wall, 0.9),
+            n=length(wall),
+            wall_median=isempty(wall) ? NaN : _quantile(wall, 0.5),
+            wall_p90=isempty(wall) ? NaN : _quantile(wall, 0.9),
             cpu_median=isempty(cpu) ? NaN : _quantile(cpu, 0.5),
-            cores=findmax(counts)[2],
+            cores=isempty(counts) ? 0 : findmax(counts)[2],
             rss_peak=maximum(c.rss for c in cs),
             efficiency=isempty(eff) ? NaN : _quantile(eff, 0.5),
+            unfinished=unfinished,
+            rss_process=any(c -> c.rss_scope == "process", cs),
         )
     end
     return out
 end
 
 # ── the table the next job reads ────────────────────────────────────────────────────────────────
+
+# JSON has no NaN: a number that is not there is `nothing`.
+_json_value(x::AbstractFloat) = isfinite(x) ? x : nothing
+_json_value(x) = x
 
 """
     cost_table_path(vault) -> String
@@ -210,8 +263,9 @@ function write_cost_table(vault::Vault)
         "updated" => time(),
         "stage" => vault.run,
         "classes" => Dict{String,Any}(
-            k => Dict{String,Any}(String(f) => getfield(v, f) for f in keys(v)) for
-            (k, v) in summary
+            k => Dict{String,Any}(
+                String(f) => _json_value(getfield(v, f)) for f in keys(v)
+            ) for (k, v) in summary
         ),
     )
     atomic_write(io -> JSON3.write(io, doc), cost_table_path(vault))
@@ -219,12 +273,14 @@ function write_cost_table(vault::Vault)
 end
 
 """
-    load_cost_table(vault) -> Dict{String,NamedTuple}
+    load_cost_table(vault; strict=false) -> Dict{String,NamedTuple}
 
-The table [`write_cost_table`](@ref) left, by class; empty when there is none (or it cannot be
-read).
+The table [`write_cost_table`](@ref) left, by class; empty when there is none. A table that is
+there and cannot be read is empty too, with a warning — or, with `strict=true`, an error, for a
+caller that wants to say so itself. Only classes with at least one finished key are returned:
+there is nothing to estimate from for the others.
 """
-function load_cost_table(vault::Vault)
+function load_cost_table(vault::Vault; strict::Bool=false)
     out = Dict{String,NamedTuple}()
     path = cost_table_path(vault)
     isfile(path) || return out
@@ -232,6 +288,7 @@ function load_cost_table(vault::Vault)
         doc = JSON3.read(read(path, String), Dict{String,Any})
         for (k, v) in doc["classes"]
             num(f) = Float64(something(get(v, f, NaN), NaN))
+            Int(v["n"]) > 0 || continue
             out[k] = (;
                 n=Int(v["n"]),
                 wall_median=num("wall_median"),
@@ -240,10 +297,15 @@ function load_cost_table(vault::Vault)
                 cores=Int(v["cores"]),
                 rss_peak=Int(v["rss_peak"]),
                 efficiency=num("efficiency"),
+                unfinished=Int(get(v, "unfinished", 0)),
+                rss_process=get(v, "rss_process", false) === true,
             )
         end
     catch e
         e isa InterruptException && rethrow()
+        strict && rethrow()
+        @warn "SweepRunner: the cost table could not be read; estimates fall back to the application's" path exception =
+            e maxlog = 3
         empty!(out)
     end
     return out
@@ -267,7 +329,8 @@ function measured_cost(
     return key -> begin
         row = get(table, String(key_class(key)), nothing)
         row === nothing && return Float64(fallback(key))
-        return quantile === :median ? row.wall_median : row.wall_p90
+        t = quantile === :median ? row.wall_median : row.wall_p90
+        return isnan(t) ? Float64(fallback(key)) : t
     end
 end
 
@@ -329,7 +392,11 @@ function print_costs(io::IO, x)
         println(io, "no finished keys on record")
         return nothing
     end
-    println(io, rpad("class", 28), "    keys  median s     p90 s  cores  used  peak GB")
+    println(
+        io,
+        rpad("class", 28),
+        "    keys  median s     p90 s  cores  used  peak GB  unfinished",
+    )
     for label in sort!(collect(keys(summary)))
         r = summary[label]
         used = isnan(r.efficiency) ? "-" : string(round(Int, 100 * r.efficiency), "%")
@@ -342,6 +409,7 @@ function print_costs(io::IO, x)
             lpad(r.cores, 7),
             lpad(used, 6),
             lpad(round(r.rss_peak / 2^30; digits=2), 9),
+            lpad(r.unfinished, 12),
         )
     end
     return nothing

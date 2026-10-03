@@ -179,7 +179,7 @@ end
     end
 end
 
-@testset "min_time defaults to cost, and a hook that throws holds nothing back" begin
+@testset "min_time defaults to cost, and a key the caller's hook cannot answer for is not assumed to fit" begin
     _dp_vault() do v, _
         ks = DataVault.keys(v)
         r = run!(
@@ -190,14 +190,26 @@ end
             cost=k -> 1000.0,
         )
         @test (r.done, r.held_back) == (0, length(ks))
-        r = run!(
-            _dp_rec(String[]),
-            v,
-            ks;
-            opts=_dp_quiet(; deadline=time() + 60),
-            min_time=k -> error("no estimate"),
-        )
-        @test (r.done, r.held_back) == (length(ks), 0)
+        # Unknown is not zero: with a deadline, a key the hook has no answer for is held back,
+        # and the event says how many were held for that reason.
+        _dp_vault(; run="dp3") do v3, outdir3
+            ks3 = DataVault.keys(v3)
+            r = run!(
+                _dp_rec(String[]),
+                v3,
+                ks3;
+                opts=_dp_quiet(; deadline=time() + 60),
+                min_time=k -> error("no estimate"),
+            )
+            @test (r.done, r.held_back) == (0, length(ks3))
+            ev = only([e for e in _dp_events(outdir3) if e.kind == "held_back"])
+            @test ev.cost_unknown == length(ks3)
+            # Without a deadline there is nothing to fit, and they run.
+            r = run!(
+                _dp_rec(String[]), v3, ks3; opts=_dp_quiet(), min_time=k -> error("no")
+            )
+            @test r.done == length(ks3)
+        end
     end
 end
 

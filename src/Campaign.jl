@@ -450,7 +450,8 @@ end
     remaining_work(open_stage, campaign; studies=nothing, profile=nothing, cost=nothing)
         -> Vector{NamedTuple}
 
-What is left, per planned stage: `(; stage, total, todo, eligible, cost, longest, blocked_by)`.
+What is left, per planned stage:
+`(; stage, total, todo, eligible, cost, longest, unknown, blocked_by)`.
 `todo` keys are not done; `eligible` of them pass the profile's `max_key_time`; `cost` is the sum
 and `longest` the maximum of `cost(stage, key)` (seconds) over the eligible ones, `NaN` without a
 `cost`; `blocked_by` lists the needed stages that are not complete (the stage cannot run until
@@ -477,7 +478,12 @@ function remaining_work(
         id = stage_id(s)
         todo = look(id)
         elig = _eligible(todo, s, p, cost)
-        costs = cost === nothing ? Float64[] : Float64[cost(s, k) for k in elig]
+        known = if cost === nothing
+            Float64[]
+        else
+            Float64[t for t in (key_seconds(k -> cost(s, k), k) for k in elig) if t !== nothing]
+        end
+        costs = known
         push!(
             out,
             (;
@@ -487,6 +493,9 @@ function remaining_work(
                 eligible=length(elig),
                 cost=cost === nothing ? NaN : sum(costs; init=0.0),
                 longest=cost === nothing ? NaN : maximum(costs; init=0.0),
+                # Keys the cost hook has no answer for: in `eligible` only when no limit applies,
+                # and not in `cost`.
+                unknown=cost === nothing ? 0 : length(elig) - length(costs),
                 blocked_by=String[n for n in s.needs if !isempty(look(n))],
             ),
         )
@@ -503,7 +512,11 @@ function _eligible(keys, s::StageSpec, p::Union{CampaignProfile,Nothing}, cost)
             "profile $(p.name) sets max_key_time, which needs `cost = (stage, key) -> seconds`",
         ),
     )
-    return DataKey[k for k in keys if cost(s, k) <= p.max_key_time]
+    # Asked the guarded way, as the run does. A key whose cost is not known is not assumed to be
+    # short enough.
+    return DataKey[
+        k for k in keys if something(key_seconds(x -> cost(s, x), k), Inf) <= p.max_key_time
+    ]
 end
 
 # ── running ─────────────────────────────────────────────────────────────────────────────────────

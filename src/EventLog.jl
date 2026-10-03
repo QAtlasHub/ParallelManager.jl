@@ -48,6 +48,13 @@ stay within that guarantee.
 | `key_done`      | after a successful `work_fn(key)`: `secs` (wall), `cpu` (CPU       |
 |                 | seconds), `cores`, `rss` (peak bytes), `host`, `class`, `attempt`, |
 |                 | `sha256`, and `note` (what `work_fn` added with `note_key!`)       |
+| `key_spent`     | an attempt that did not finish its key, and what it cost:          |
+|                 | `outcome` (`error`, `stopped`, `lock_lost`, `worker_died`), `secs`,|
+|                 | `cpu`, `cores`, `rss`, `rss_scope`, `host`, `class`                |
+| `cost_source`   | `run!` took its cost from the measured table (`classes`,           |
+|                 | `measured_keys`, `fallback_keys`, `fallback`)                      |
+| `cost_table_unreadable` | the stage's cost table could not be read; the caller's     |
+|                 | hook is used                                                       |
 | `lock_busy`     | another master holds the `.running` lock: found by the master's    |
 |                 | scan before dispatch, or by a worker's acquire (= `:busy`)         |
 | `lock_lost`     | our lock was reclaimed mid-work; result discarded (no double-run) |

@@ -636,3 +636,49 @@ end
     ev = only(_jb_events(outdir))
     @test ev.kind == "job_decision" && ev.action == "refuse"
 end
+
+@testset "cli jobs: a profile with max_key_time and no cost model is said, not thrown (#106)" begin
+    dir = mktempdir()
+    try
+        cp(_JB_CFG, joinpath(dir, "study.toml"))
+        meta = joinpath(dir, "campaign.toml")
+        write(
+            meta,
+            """
+            [campaign]
+            name = "c"
+            outdir = "$(joinpath(dir, "out"))"
+
+            [[study]]
+            name = "pm"
+            stages = { phase1 = "study.toml" }
+
+            [profile.short]
+            max_key_time = "20min"
+
+            [jobs]
+            name = "c"
+            budget_node_hours = 5
+
+            [[jobs.partition]]
+            name = "p"
+            nodes = 1
+            time_limit = "30min"
+            script = "/abs/run.sh"
+            profile = "short"
+            """,
+        )
+        saved = SweepRunner._CLI_SCHEDULER[]
+        SweepRunner._CLI_SCHEDULER[] = () -> MockScheduler()
+        try
+            io = IOBuffer()
+            @test SweepRunner.cli(["jobs", meta]; io=io) == 2
+            text = String(take!(io))
+            @test occursin("max_key_time", text) && occursin("no cost model", text)
+        finally
+            SweepRunner._CLI_SCHEDULER[] = saved
+        end
+    finally
+        rm(dir; recursive=true, force=true)
+    end
+end

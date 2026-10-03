@@ -623,13 +623,39 @@ SweepRunner.run_campaign!(open_stage, campaign; profile = "short",
 ```
 
 A class the table has not seen falls back to the application's estimate, so
-the first job of a new study still has one. `key_costs(vault)` returns the raw
+the first job of a new study still has one.
+
+**It is the default.** With a `key_class`, `run!` loads the stage's table
+itself and uses it as `cost`, falling back to the `cost` you passed for the
+classes it has not seen; a `cost_source` event says how many of the round's
+keys were measured and how many fell back.
+
+**Every attempt is on record**, not only the one that finished: an attempt
+that failed, was stopped or cut, lost its lock, or whose worker died leaves a
+`key_spent` record with its outcome. A key's time in the table is the **sum
+over its attempts** — a key that ran six hours over four jobs took six hours,
+not the forty minutes of its last leg — and `unfinished` counts the keys of a
+class that have attempts and no finish (the ones too big for their request).
+
+**Unknown is not zero.** `SweepRunner.key_seconds(hook, key)` is how the run,
+the campaign and the job controller ask a cost hook: `nothing` when it throws
+or answers something that is not a finite, non-negative number. With a
+`deadline`, a key your hook has no answer for is not assumed to fit: it is
+held back and counted (`held_back`, with `cost_unknown`). A class missing from
+a table this package loaded by itself is different — it has to run once to be
+measured, so it runs. Under a profile's `max_key_time`, a key of unknown cost
+is not eligible. `key_costs(vault)` returns the raw
 records (`KeyCost`) and `cost_summary(costs; by = c -> c.host)` groups them
 any way you like — per node, per thread count.
 
 The peak is counted from the start of the key on Linux (the kernel's
 high-water mark is reset), so it is the key's and not the largest key that
-worker ever ran.
+worker ever ran. Where the reset is not available the record says
+`rss_scope = "process"`, and the class's summary `rss_process = true`.
+
+The table is rewritten with the manifest while a round runs
+(`RunOpts.manifest_interval`) and when `run_loop!` ends, so a job killed at
+its wall clock leaves what it measured.
 
 ## 15. Where a job's core-hours went
 
