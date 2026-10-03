@@ -166,4 +166,17 @@ function _live_slurm_jobs()::Union{Set{String},Nothing}
     end
 end
 
+# `SLURM_JOB_CPUS_PER_NODE` (`128(x72)`, `64(x2),32`) as one count per node, or `nothing` when
+# it is not in that form. The ONE reading of it: the status, the account and the pool used to
+# parse it separately, one answering 0 and another throwing on the same value.
+function _slurm_cpus_per_node(s::AbstractString)::Union{Vector{Int},Nothing}
+    out = Int[]
+    for part in split(s, ','; keepempty=false)
+        m = match(r"^(\d+)(?:\(x(\d+)\))?$", strip(part))
+        m === nothing && return nothing
+        append!(out, fill(parse(Int, m[1]), m[2] === nothing ? 1 : parse(Int, m[2])))
+    end
+    return out
+end
+
 export owner_token, holder_liveness

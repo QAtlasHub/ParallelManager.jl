@@ -1011,11 +1011,10 @@ function _scan_row!(
         return :done
     end
     r.progress = get(progress, r.kstr, nothing)
-    DataVault.is_running(vault, r.key) || return :free
-    owner = DataVault.running_owner(vault, r.key)
-    age = DataVault.running_age_secs(vault, r.key)
-    isfinite(age) || return :free                     # released between the two reads
-    info = _lock_info(r.kstr, owner, age, masters(), _NO_PAGES, opts.stale_after)
+    lk = _lock_now(vault, r.key)
+    lk === nothing && return :free
+    owner = lk.owner
+    info = _lock_info(r.kstr, owner, lk.age, masters(), _NO_PAGES, opts.stale_after)
     push!(infos, info)
     if info.verdict === :dead
         # Owner-checked: `false` means the lock changed hands since it was judged, and whoever

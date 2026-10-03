@@ -206,6 +206,17 @@ function _lock_info(key, owner, age, masters, pages, stale_after)
     return LockInfo(String(key), owner, host, pid, job, age, verdict, why, master, page)
 end
 
+# A key's lock as it is now: `(; owner, age)`, or `nothing` when there is none — also when it
+# was released between the reads (the age is not finite then). The one place a key's `.running`
+# is read to be judged; the listing, the reaper and the scan all ask here.
+function _lock_now(vault::Vault, key::DataKey)
+    DataVault.is_running(vault, key) || return nothing
+    owner = DataVault.running_owner(vault, key)
+    age = DataVault.running_age_secs(vault, key)
+    isfinite(age) || return nothing
+    return (; owner, age)
+end
+
 """
     locks(vault, keys; stale_after=600.0) -> Vector{LockInfo}
     locks(vault; stale_after=600.0) -> Vector{LockInfo}
@@ -220,11 +231,9 @@ function locks(vault::Vault, keys::AbstractVector{DataKey}; stale_after::Real=60
     pages = _progress_ages(masters)
     out = LockInfo[]
     for k in keys
-        DataVault.is_running(vault, k) || continue
-        owner = DataVault.running_owner(vault, k)
-        age = DataVault.running_age_secs(vault, k)
-        isfinite(age) || continue                       # released between the two reads
-        push!(out, _lock_info(canonical(k), owner, age, masters, pages, stale_after))
+        lk = _lock_now(vault, k)
+        lk === nothing && continue
+        push!(out, _lock_info(canonical(k), lk.owner, lk.age, masters, pages, stale_after))
     end
     return out
 end
@@ -367,11 +376,9 @@ function reap_dead_locks!(
     infos = LockInfo[]
     reaped = 0
     for k in keys
-        DataVault.is_running(vault, k) || continue
-        owner = DataVault.running_owner(vault, k)
-        age = DataVault.running_age_secs(vault, k)
-        isfinite(age) || continue
-        info = _lock_info(canonical(k), owner, age, masters, pages, stale_after)
+        lk = _lock_now(vault, k)
+        lk === nothing && continue
+        info = _lock_info(canonical(k), lk.owner, lk.age, masters, pages, stale_after)
         push!(infos, info)
         info.verdict === :dead || continue
         _reap!(vault, k, info, Symbol(vault.run), log) && (reaped += 1)

@@ -114,12 +114,8 @@ end
 
 # `128(x2),64` -> [128, 128, 64]
 function _expand_slurm_counts(s::AbstractString, n::Int)
-    out = Int[]
-    for part in split(s, ','; keepempty=false)
-        m = match(r"^(\d+)(?:\(x(\d+)\))?$", strip(part))
-        m === nothing && error("SLURM_JOB_CPUS_PER_NODE: cannot read $(repr(s))")
-        append!(out, fill(parse(Int, m[1]), m[2] === nothing ? 1 : parse(Int, m[2])))
-    end
+    out = _slurm_cpus_per_node(s)
+    out === nothing && error("SLURM_JOB_CPUS_PER_NODE: cannot read $(repr(s))")
     length(out) == n || error("SLURM_JOB_CPUS_PER_NODE $(repr(s)) does not cover $n nodes")
     return out
 end
