@@ -39,6 +39,9 @@ SweepRunner.merge_and_save_manifest!
 SweepRunner.init_workers!
 SweepRunner.detect_mode
 SweepRunner.verify_workers!
+SweepRunner.srun_worker_limit
+SweepRunner.split_nodes
+SweepRunner.worker_logs!
 ```
 
 ## Run
@@ -47,6 +50,7 @@ SweepRunner.verify_workers!
 SweepRunner.RunOpts
 SweepRunner.run!
 SweepRunner.run_loop!
+SweepRunner.todo_count
 ```
 
 ## Task table

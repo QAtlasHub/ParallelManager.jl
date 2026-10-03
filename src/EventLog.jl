@@ -39,7 +39,9 @@ stay within that guarantee.
 | `stage_start`   | once at the top of `run!` when `todo` is non-empty                |
 | `stage_done`    | once at the bottom of `run!` when `todo` was non-empty: the        |
 |                 | round's totals, incl. `held_back` and `collisions` (keys handed    |
-|                 | out that another master had taken)                                 |
+|                 | out that another master had taken), and where its wall time went:  |
+|                 | `prepare_secs`, `scan_secs`, `dispatch_secs`, `manifest_secs`,     |
+|                 | `total_secs`                                                       |
 | `key_acquired`  | the per-key lock was taken (includes `acq`); the only durable       |
 |                 | record of a claim, since a SIGKILL skips every later event         |
 | `key_start`     | before each `work_fn(key)` attempt (includes `attempt` field)     |
