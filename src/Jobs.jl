@@ -896,7 +896,24 @@ function controller_loop!(
     rounds = 0
     while !stop()
         rounds += 1
-        decisions = manage!(ctl, work)
+        decisions = try
+            manage!(ctl, work)
+        catch e
+            e isa InterruptException && rethrow()
+            # One round that failed (the work could not be counted, the ledger not written) is
+            # not the end of the controller: said, nothing submitted, and asked again.
+            log_event(
+                ctl.log,
+                :controller_round_failed;
+                level=:error,
+                round=rounds,
+                err=_short_err(e),
+            )
+            (max_rounds !== nothing && rounds >= max_rounds) && break
+            ctl.policy.dry_run && rethrow()
+            sleep(interval)
+            continue
+        end
         live = _ledger_live(ctl.ledger)
         idle = all(
             d -> d.action === :hold && startswith(d.reason, "nothing runnable"), decisions

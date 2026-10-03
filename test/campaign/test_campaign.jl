@@ -93,6 +93,64 @@ _cp_errors(r) = [f.message for f in r.findings if f.severity === :error]
     @test parse_duration("30") == 30.0
     @test_throws ArgumentError parse_duration("soon")
     @test_throws ArgumentError parse_duration("3 fortnights")
+    # A duration is finite and not negative (#113).
+    @test parse_duration(0) == 0.0
+    @test_throws ArgumentError parse_duration(-5)
+    @test_throws ArgumentError parse_duration(NaN)
+    @test_throws ArgumentError parse_duration(Inf)
+    @test_throws ArgumentError parse_duration("-5s")
+end
+
+@testset "a profile's numbers are checked, and a campaign that cannot launch has no work to count (#113)" begin
+    bad =
+        out -> replace(
+            _cp_meta(out),
+            "max_key_time = \"5s\"" => "max_key_time = -5",
+            "min_nodes = 16" => "min_nodes = 0",
+        )
+    _cp_setup(; meta=bad) do path, _, _
+        c = load_campaign(path)
+        errs = _cp_errors(validate_campaign(c))
+        @test any(m -> occursin("not a duration", m), errs)
+        @test any(m -> occursin("min_nodes must be an integer >= 1", m), errs)
+        @test_throws ArgumentError remaining_work(_cp_open(String[]), c)
+        @test_throws ArgumentError campaign_work(_cp_open(String[]), c)("short")
+    end
+end
+
+@testset "run_campaign!: the job's profile comes from its environment, and is on record (#113)" begin
+    _cp_setup() do path, _, out
+        c = load_campaign(path)
+        order = String[]
+        withenv("SWEEPRUNNER_PROFILE" => "typ_only", "SLURM_JOB_NUM_NODES" => "4") do
+            r = run_campaign!(_cp_open(order), c; opts=_cp_quiet())
+            @test r.profile == "typ_only"
+            @test unique(order) == ["typ.phase1"]              # the profile's studies only
+        end
+        ev = _cp_events(out)
+        start = only([e for e in ev if e.kind == "campaign_start"])
+        @test (start.profile, start.profile_source) == ("typ_only", "SWEEPRUNNER_PROFILE")
+        # The profile is for jobs of 16 nodes; this one has 4. Said, not refused.
+        small = only([e for e in ev if e.kind == "profile_too_small"])
+        @test (small.min_nodes, small.nodes) == (16, 4)
+    end
+    _cp_setup() do path, _, out
+        c = load_campaign(path)
+        withenv("SWEEPRUNNER_PROFILE" => "typ_only", "SLURM_JOB_NUM_NODES" => nothing) do
+            # An explicit profile wins over the environment.
+            r = run_campaign!(
+                _cp_open(String[]), c; profile="short", cost=(s, k) -> 1.0, opts=_cp_quiet()
+            )
+            @test r.profile == "short"
+        end
+        start = only([e for e in _cp_events(out) if e.kind == "campaign_start"])
+        @test start.profile_source == "argument"
+        withenv("SWEEPRUNNER_PROFILE" => "no_such_profile") do
+            @test_throws ArgumentError run_campaign!(
+                _cp_open(String[]), c; opts=_cp_quiet()
+            )
+        end
+    end
 end
 
 @testset "load_campaign: studies, stages in order, needs resolved" begin

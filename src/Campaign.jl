@@ -104,9 +104,14 @@ _natural(s::AbstractString) = replace(s, r"\d+" => m -> lpad(m, 12, '0'))
     parse_duration(x) -> Float64
 
 Seconds, from a number (already seconds) or a string like `"90s"`, `"20min"`, `"2h"`, `"1.5d"`.
+A duration is finite and not negative; anything else is an `ArgumentError`.
 """
 function parse_duration(x)
-    x isa Real && return Float64(x)
+    if x isa Real
+        (isfinite(x) && x >= 0) ||
+            throw(ArgumentError("not a duration: $(repr(x)) (finite and >= 0)"))
+        return Float64(x)
+    end
     m = match(r"^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*$", String(x))
     m === nothing && throw(ArgumentError("not a duration: $(repr(x))"))
     v = parse(Float64, m[1])
@@ -247,12 +252,22 @@ function load_campaign(path::AbstractString)
             push!(problems, _bad("profile.$pname", e.msg))
             nothing
         end
+        mn = get(p, "min_nodes", nothing)
+        if !(mn === nothing || (mn isa Integer && mn >= 1))
+            push!(
+                problems,
+                _bad(
+                    "profile.$pname", "min_nodes must be an integer >= 1, got $(repr(mn))"
+                ),
+            )
+            mn = nothing
+        end
         profiles[pname] = CampaignProfile(
             pname,
             mkt,
             String.(get(p, "skip_stages", String[])),
             haskey(p, "studies") ? String.(p["studies"]) : nothing,
-            haskey(p, "min_nodes") ? Int(p["min_nodes"]) : nothing,
+            mn === nothing ? nothing : Int(mn),
             Dict{String,Any}(k => v for (k, v) in p if !(k in _PROFILE_KEYS)),
         )
     end
@@ -464,6 +479,11 @@ with the defaults (its config as run `<stage name>` under the campaign's outdir)
 function remaining_work(
     open_stage, c::Campaign; studies=nothing, profile=nothing, cost=nothing
 )
+    # What is left of a campaign that could not be launched is not a number to size jobs by.
+    report = validate_campaign(c)
+    launchable(report) || throw(
+        ArgumentError("campaign $(c.name) is not launchable:\n" * sprint(show, report))
+    )
     p = _profile(c, profile)
     by_id = Dict(stage_id(s) => s for s in c.stages)
     undone = Dict{String,Vector{DataKey}}()
@@ -569,6 +589,16 @@ function run_campaign!(
     launchable(report) || throw(
         ArgumentError("campaign $(c.name) is not launchable:\n" * sprint(show, report))
     )
+    # A job the controller submitted is told its profile through the environment
+    # (`SWEEPRUNNER_PROFILE`); an explicit `profile` wins.
+    profile_source = profile === nothing ? "none" : "argument"
+    if profile === nothing
+        named = get(ENV, "SWEEPRUNNER_PROFILE", "")
+        if !isempty(named)
+            profile = named
+            profile_source = "SWEEPRUNNER_PROFILE"
+        end
+    end
     p = _profile(c, profile)
     (p !== nothing && p.max_key_time !== nothing && cost === nothing) && throw(
         ArgumentError(
@@ -586,9 +616,24 @@ function run_campaign!(
         meta=c.path,
         sha256=c.sha256,
         profile=p === nothing ? nothing : p.name,
+        profile_source=profile_source,
         studies=studies === nothing ? nothing : String.(collect(studies)),
         stages=stage_id.(plan_campaign(c; studies, profile)),
     )
+    # `min_nodes` says what size of job a profile is for. A smaller allocation running it is
+    # said; it is not refused, since the keys it selects are still valid work.
+    nodes = tryparse(Int, get(ENV, "SLURM_JOB_NUM_NODES", ""))
+    if p !== nothing && p.min_nodes !== nothing && nodes !== nothing && nodes < p.min_nodes
+        log_event(
+            log,
+            :profile_too_small;
+            level=:warn,
+            campaign=c.name,
+            profile=p.name,
+            min_nodes=p.min_nodes,
+            nodes=nodes,
+        )
+    end
 
     results = NamedTuple[]
     seen = Set{String}()
