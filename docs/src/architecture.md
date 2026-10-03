@@ -64,7 +64,7 @@ and owns the coordination story separately.
 | [`src/Cost.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Cost.jl)           | What a key cost: `key_costs`, `cost_summary`, the per-stage table, `measured_cost` / `measured_mem` |
 | [`src/Campaign.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Campaign.jl)   | A meta config naming the stages of a campaign: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!`, `remaining_work` |
 | [`src/Jobs.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Jobs.jl)           | `Scheduler` (`SlurmScheduler`, `MockScheduler`), `JobPolicy`, `Ledger`, `decide` / `manage!`: submissions decided from what is left, inside a budget |
-| [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir>` (`bin/sweeprunner`) |
+| [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|costs|account|campaign|jobs|pause|resume|stop|cancel|prioritise|resize|drain|enqueue` (`bin/sweeprunner`) |
 
 ## Key identity: `canonical(::DataKey)`
 
@@ -79,7 +79,7 @@ filesystem encodings.
 When you call `run!(work_fn, vault, keys)`, it does:
 
 1. Open an [`EventLog`](@ref SweepRunner.EventLog) at
-   `joinpath(vault.outdir, "events.jsonl")`.
+   `joinpath(vault.outdir, "events_<host>_<pid>.jsonl")` — one file per master.
 2. Load the stage [`Manifest`](@ref SweepRunner.Manifest) and compute
    `todo = todo_keys(manifest, keys)`. If empty, emit `:skip_complete`
    and return.
@@ -105,7 +105,9 @@ When you call `run!(work_fn, vault, keys)`, it does:
      reclaimed the key meanwhile.
 6. When the queue drains, ask once more about the keys that came back busy
    (their holder may have finished or died meanwhile) and requeue the free ones.
-7. `save_manifest(manifest)`.
+7. Merge the round's completions into the manifest. This also happens
+   during the round, every `opts.manifest_interval` seconds, so a job killed
+   at its wall clock leaves what it finished there.
 8. Emit `:stage_done` and return the aggregate counts.
 
 ### Who holds the task state
@@ -156,7 +158,11 @@ Two things keep this robust against crashes:
    rewrites the lock's `heartbeat_unix=` every `heartbeat_interval`, for as
    long as the holder's pid lives — also while `work_fn` never yields, which
    an in-process task did not survive. If the holder dies, the heartbeat
-   stops; after `stale_after` the next contender reclaims the lock under
+   stops. A master that starts later asks the holder's master, the scheduler
+   and the pid whether the holder is alive, and removes the lock at once when
+   the answer is no; a lock a reporting master lists as held is left alone
+   whatever its age. Only where nobody can be asked does the heartbeat's age
+   decide: after `stale_after` the next contender reclaims the lock under
    DataVault's reclaim mutex (see DataVault's README, "ロックの規約").
 2. **Post-lock `is_done` re-check.** Even on the happy path, two masters
    can start the loop with overlapping `todo`. The re-check inside the

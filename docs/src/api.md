@@ -81,6 +81,8 @@ SweepRunner.run_prerequisite!
 SweepRunner.Finding
 SweepRunner.PreflightReport
 SweepRunner.launchable
+SweepRunner.n_errors
+SweepRunner.n_warns
 SweepRunner.check_injective!
 SweepRunner.check_opens!
 SweepRunner.representative_keys

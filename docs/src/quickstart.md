@@ -68,8 +68,11 @@ run does nothing — it emits `:skip_complete` and exits in milliseconds:
 
 ```
 ┌ Info: stage complete
-└   result = (stage = :phase1, done = 0, err = 0, skipped = 6, total = 6)
+└   result = (stage = :phase1, done = 0, err = 0, …, skipped = 6, total = 6, remaining = 0, stopped_by = nothing)
 ```
+
+The result has more fields than shown (`busy`, `gave_up`, `stop`, `cancelled`,
+`held_back`, `collisions`); [`run!`](@ref SweepRunner.run!) lists them.
 
 ## Phase chaining without Stage/DAG
 
@@ -119,7 +122,8 @@ wait
 
 Both masters will hit the same vault, the per-key `.running` lock (DataVault's
 `acquire_running!`) prevents double execution, and events from both processes
-interleave safely in `out/events.jsonl`.
+go to one log per master, `out/events_<host>_<pid>.jsonl`
+([`merge_event_logs`](@ref SweepRunner.merge_event_logs) puts them in one file).
 
 ## SLURM
 

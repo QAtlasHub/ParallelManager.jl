@@ -1,9 +1,10 @@
 # Pool — workers sized to the keys they run.
 #
 # `init_workers!` starts `n` identical workers and `run!` hands any key to any of them, so a sweep
-# whose keys differ in size has to size every worker for its largest key. Measured downstream
-# (128 cores, 226 GB per node; keys from 1 core / 2 GB to 7 cores / 12 GB): sized per key a node
-# held ~55 small workers, sized for the largest it held 18.
+# whose keys differ in size has to size every worker for its largest key. The figures that
+# prompted this are FiniteTemperature.jl's (128 cores, 226 GB per node; keys from 1 core / 2 GB to
+# 7 cores / 12 GB: ~55 small workers on a node sized per key, 18 sized for the largest). They are
+# that campaign's, reported in #70; nothing in this repository reproduces them.
 #
 # Here a key says what it needs (`key_req(key) -> KeyReq(cores, mem_gb)`), and the pool starts a
 # worker of that size where a node has the room, reuses it for the next key it fits, and retires

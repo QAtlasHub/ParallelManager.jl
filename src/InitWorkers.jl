@@ -20,6 +20,13 @@ mode actually used (useful when `mode=:auto`).
 
 # Modes
 
+- `:auto` — whatever [`detect_mode`](@ref) picks from the environment.
+- `:sequential` — no workers; `run!` runs the keys on the master.
+- `:threads` — no worker processes either: sets the master's BLAS threads and returns. `run!`
+  dispatches over processes, so under `:threads` it runs the keys on the master, one at a time.
+- `:distributed` — `addprocs` of `JULIA_SLURM_N_WORKERS` local workers.
+- `:slurm` — one worker per Slurm task of the current job, through `SlurmClusterManager`.
+
 # Timeouts (relevant to `:slurm` / `:distributed`)
 
 - `launch_timeout::Real = 300.0` — seconds the master will wait for
@@ -284,7 +291,7 @@ function verify_workers!()
 end
 
 # Load `modnames` (e.g. [:ParamIO, :DataVault, :SweepRunner, :MyWork]) into `Main` on EVERY
-# worker, so a pmap'd task — `DataKey` deserialization, `run!`'s `acquire_running!`/`save!`/
+# worker, so a dispatched key — `DataKey` deserialization, `run!`'s `acquire_running!`/`save!`/
 # `mark_done!` pipeline, and the user's `work_fn` — can resolve them. `init_workers!` spawns the
 # workers with `--project` but does NOT load the project's packages; without this a real
 # multi-worker run dies with a cryptic `KeyError: <Module> not found` on a worker (only ever seen on

@@ -20,10 +20,10 @@ Depth = 2
 - **Multi-master safe** — several `julia` processes can hit the same vault
   root without double-executing any key (DataVault `.running` advisory lock).
 - **Crash recovery** — `kill -9` a master mid-run and the next `run!` picks
-  up where it left off via heartbeat-based stale lock reclaim.
+  up where it left off: locks whose holder is gone are removed, the rest reclaimed after `stale_after`.
 - **Early skip** — full-done re-runs take O(1) filesystem operations
   (a single `manifest.jld2` read), not O(N) per-key `.done` stats.
-  3600-key warm re-run ≈ **3.5 ms**.
+  A 3600-key warm re-run takes milliseconds (the test bound is 500 ms).
 - **Structured events** — JSONL event log atomic across concurrent writers;
   per-item `println` is a non-goal, by design.
 - **One entry point for all parallel modes** —

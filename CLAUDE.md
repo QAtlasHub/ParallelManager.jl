@@ -44,7 +44,7 @@ for how the three layers fit together.
   filters. The application supplies `open_stage(stage) -> (; work_fn, …)`.
   `bin/sweeprunner campaign <meta.toml>` validates and prints the plan.
 - Jobs: `Scheduler` (`SlurmScheduler`, `MockScheduler`) · `load_job_policy(meta.toml)` (the
-  `[jobs]` table) · `decide` (pure) · `manage!(JobController(…), campaign_work(…))` ·
+  `[jobs]` table) · `SweepRunner.decide` (pure) · `SweepRunner.manage!(JobController(…), campaign_work(…))` ·
   `bin/sweeprunner jobs <meta.toml> [--submit]`. Submissions are sized to `remaining_work`, held
   when nothing is runnable, refused past `budget_node_hours`. **`dry_run` is the default; a
   change here must not make a path that submits without `dry_run = false` AND an explicit ask.**
@@ -53,7 +53,7 @@ for how the three layers fit together.
   master: `:enqueue`, `:cancel`, `:stop` (with `grace`), `:prioritise`, `:resize`, `:drain`,
   `:pause`, `:resume`. One file per request under `state_root/control`, read by every master on
   the vault, acknowledged and logged with who asked.
-- `locks(vault[, keys] | outdir)` / `bin/sweeprunner locks <outdir>` — every `.running`, who holds
+- `SweepRunner.locks(vault[, keys] | outdir)` (not exported) / `bin/sweeprunner locks <outdir>` — every `.running`, who holds
   it and whether its holder's MASTER says it is held or dead (`judge_lock`). `run!` reconciles
   the locks before it builds its queue; `reap_dead_locks!` does it without running anything.
 
