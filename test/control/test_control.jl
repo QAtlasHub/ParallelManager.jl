@@ -642,7 +642,11 @@ end
         # No sweep has run here yet: there is nobody to tell.
         @test SweepRunner.cli(["pause", outdir]; io=io) == 1
         run!(_ct_ok, v, DataVault.keys(v))
-        @test SweepRunner.cli(["pause", outdir]; io=io) == 0
+        # The job has ended: the requests below are written, and exit 3 says nothing will
+        # apply them.
+        @test isempty(masters_listening(v))
+        @test SweepRunner.cli(["pause", outdir]; io=io) == 3
+        @test occursin("nothing will apply it", String(take!(io)))
         @test SweepRunner.cli(
             [
                 "cancel",
@@ -655,10 +659,11 @@ end
                 "1,2",
             ];
             io=io,
-        ) == 0
+        ) == 3
         @test SweepRunner.cli(["stop", outdir, "--node", "c01", "--grace", "90"]; io=io) ==
-            0
-        @test SweepRunner.cli(["resize", outdir, "--n", "12", "--run", "ct"]; io=io) == 0
+            3
+        @test SweepRunner.cli(["resize", outdir, "--n", "12", "--run", "ct"]; io=io) == 3
+        @test SweepRunner.cli(["pause", outdir, "--wait", "soon"]; io=io) == 2
         reqs = read_requests(v)
         @test [r["op"] for r in reqs] == ["pause", "cancel", "stop", "resize"]
         @test reqs[2]["select"] == Dict("N" => [4, 8], "J" => [0.5])
@@ -671,5 +676,112 @@ end
         @test SweepRunner.cli(["stop", outdir, "--bogus"]; io=io) == 2
         @test SweepRunner.cli(["stop"]; io=io) == 2
         @test SweepRunner.cli(["resize", outdir, "--n", "3", "--run", "nope"]; io=io) == 1
+    end
+end
+
+@testset "cli: with a master running, a request is acknowledged — or said not to be (#107)" begin
+    _ct_vault() do v, outdir
+        ks = DataVault.keys(v)
+        go = joinpath(outdir, "go")
+        codes = Dict{String,Int}()
+        texts = Dict{String,String}()
+        # The first key holds the master in work_fn until the requests have been sent; they
+        # are applied when it returns and the master polls.
+        work = k -> begin
+            t0 = time()
+            while !isfile(go) && time() - t0 < 60
+                sleep(0.05)
+            end
+            return _ct_ok(k)
+        end
+        t = @async run!(
+            work, v, ks; opts=RunOpts(; control_interval=0.05, status_interval=0.1)
+        )
+        t0 = time()
+        while isempty(masters_listening(v)) && time() - t0 < 60
+            sleep(0.05)
+        end
+        @test length(masters_listening(v)) == 1
+        @test masters_listening(outdir; run="ct") == masters_listening(v)
+        @test isempty(masters_listening(outdir; run="other"))
+        # Sent while the master is busy: nobody acknowledges within the wait.
+        io = IOBuffer()
+        @test SweepRunner.cli(
+            ["prioritise", outdir, "--select", "N=8", "--wait", "0.3"]; io=io
+        ) == 4
+        @test occursin("no master acknowledged", String(take!(io)))
+        # A request the master can apply, and one it cannot (there is no worker pool).
+        ok = @async SweepRunner.cli(
+            ["prioritise", outdir, "--select", "N=4", "--wait", "30"]; io=io
+        )
+        sleep(0.2)
+        bad_io = IOBuffer()
+        bad = @async SweepRunner.cli(
+            ["resize", outdir, "--n", "8", "--wait", "30"]; io=bad_io
+        )
+        sleep(0.2)
+        touch(go)
+        @test fetch(ok) == 0
+        @test fetch(bad) == 5
+        @test occursin("unsupported", String(take!(bad_io)))
+        r = fetch(t)
+        @test r.done == length(ks)
+        ev = _ct_events(outdir)
+        @test count(e -> e.kind == "control_not_applied", ev) == 1
+        @test count(e -> e.kind == "control_request", ev) == 2
+    end
+end
+
+@testset "a request file that cannot be read is tried again, then said — not dropped (#107)" begin
+    _ct_vault() do v, outdir
+        ks = DataVault.keys(v)
+        dir = joinpath(control_dir(v), "requests")
+        late = Ref("")
+        work = _ct_once() do
+            mkpath(dir)
+            # Half a request, as a partial read on a network file system would give.
+            write(
+                joinpath(dir, "9999999999999_deadbeef.json"), "{\"id\": \"9999999999999_de"
+            )
+            late[] = control!(v, :prioritise; select=Dict("N" => 8))
+            return nothing
+        end
+        r = run!(work, v, ks; opts=_ct_opts())
+        # The good request after it was applied all the same.
+        @test r.done == length(ks)
+        @test length(read_acks(v, late[])) == 1
+        ev = _ct_events(outdir)
+        bad = only([e for e in ev if e.kind == "control_bad_request"])
+        @test bad.id == "9999999999999_deadbeef"
+        ack = only(read_acks(v, "9999999999999_deadbeef"))
+        @test haskey(ack["detail"], "error")
+
+        # A unit asking should_stop is not stopped by it either, and gives up on it the same way.
+        w = SweepRunner.StopWatch(0.0, "", "")
+        for _ in 1:3
+            @test SweepRunner._stop_requested!(w, v, ks[1]) == false
+        end
+        @test "9999999999999_deadbeef.json" in w.seen
+    end
+end
+
+@testset "wait_acks: the caller learns whether anything took the request (#107)" begin
+    _ct_vault() do v, _
+        ks = DataVault.keys(v)
+        id = control!(v, :pause)
+        @test isempty(wait_acks(v, id; timeout=0.3, poll=0.05))        # nobody is running
+        got = Ref{Any}(nothing)
+        work = _ct_once() do
+            rid = control!(v, :prioritise; select=Dict("N" => 8))
+            @async (got[] = wait_acks(v, rid; timeout=30, poll=0.05))
+            return nothing
+        end
+        run!(work, v, ks; opts=_ct_opts())
+        t0 = time()
+        while got[] === nothing && time() - t0 < 30
+            sleep(0.05)
+        end
+        @test length(got[]) == 1
+        @test got[][1]["op"] == "prioritise"
     end
 end

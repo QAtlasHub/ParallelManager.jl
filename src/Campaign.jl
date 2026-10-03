@@ -607,7 +607,9 @@ function run_campaign!(
 
         blocked = String[n for n in s.needs if !is_complete_stage(c, n)]
         if !isempty(blocked)
-            reason = "needs " * join(blocked, ", ")
+            # With what went wrong there, when this campaign ran it: "needs X" alone reads as
+            # "X has not run yet".
+            reason = "needs " * join((_need_note(n, results) for n in blocked), ", ")
             log_event(log, :campaign_stage; stage=id, ran=false, reason=reason)
             push!(results, (; stage=id, ran=false, reason=reason, keys=0, result=nothing))
             continue
@@ -639,6 +641,9 @@ function run_campaign!(
             of=length(o.keys),
             done=r.done,
             busy=r.busy,
+            err=r.err,
+            gave_up=r.gave_up,
+            remaining=r.remaining,
             rounds=r.rounds,
             stopped_by=r.stopped_by === nothing ? nothing : String(r.stopped_by),
         )
@@ -671,6 +676,15 @@ function run_campaign!(
         stages=results,
         stopped_by=stopped,
     )
+end
+
+# A needed stage, with how it ended if this campaign ran it and it left keys failing.
+function _need_note(id::AbstractString, results)
+    i = findfirst(x -> x.stage == id && x.result !== nothing, results)
+    i === nothing && return String(id)
+    r = results[i].result
+    r.err > 0 || return String(id)
+    return "$id ($(r.err) of its keys failed, $(r.remaining) not done)"
 end
 
 # `c`, remembering `sha` as the version of the file it has looked at.

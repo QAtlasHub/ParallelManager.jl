@@ -371,9 +371,27 @@ function poll_control!(
             endswith(f, ".json") || continue
             id = f[1:(end - 5)]
             id in c.seen && continue
-            push!(c.seen, id)
+            # Read, THEN mark seen: a read that fails (a partial read on a network file system)
+            # is tried again, and one that keeps failing is said, not dropped.
             req = _read_json(joinpath(dir, f))
-            req === nothing && continue
+            if req === nothing || !haskey(req, "op") || !haskey(req, "id")
+                n = c.unread[id] = get(c.unread, id, 0) + 1
+                n >= _UNREADABLE_TRIES || continue
+                push!(c.seen, id)
+                why = "request file could not be read as a request after $n tries"
+                log_event(
+                    log, :control_bad_request; level=:warn, stage=m.stage, id=id, err=why
+                )
+                _ack(
+                    v,
+                    m,
+                    Dict{String,Any}("id" => id, "op" => "?"),
+                    Dict{String,Any}("error" => why),
+                    log,
+                )
+                continue
+            end
+            push!(c.seen, id)
             _for_me(req, m.started, m.id, m.job) || continue
             detail = try
                 _apply_request!(m, table, req, log, opts, affinity)
@@ -381,10 +399,13 @@ function poll_control!(
                 e isa InterruptException && rethrow()
                 Dict{String,Any}("error" => _short_err(e))
             end
-            _ack(v, m, req, detail)
+            _ack(v, m, req, detail, log)
+            # A request that was not carried out is a warning, not one more line at info.
+            failed = haskey(detail, "error") || haskey(detail, "unsupported")
             log_event(
                 log,
-                :control_request;
+                failed ? :control_not_applied : :control_request;
+                level=failed ? :warn : :info,
                 stage=m.stage,
                 id=id,
                 op=get(req, "op", "?"),
@@ -399,7 +420,10 @@ function poll_control!(
     return changed
 end
 
-function _ack(v::Vault, m::Master, req::AbstractDict, detail)
+# How many polls a request file may be unreadable before it is given up on, and said.
+const _UNREADABLE_TRIES = 3
+
+function _ack(v::Vault, m::Master, req::AbstractDict, detail, log=nothing)
     try
         path = joinpath(control_dir(v), "acks", String(req["id"]), m.id * ".json")
         ack = Dict{String,Any}(
@@ -412,6 +436,15 @@ function _ack(v::Vault, m::Master, req::AbstractDict, detail)
         atomic_write(io -> JSON3.write(io, ack), path)
     catch e
         e isa InterruptException && rethrow()
+        # The sender is waiting on this file to know whether anything took the request.
+        log === nothing || log_event(
+            log,
+            :control_ack_failed;
+            level=:warn,
+            stage=m.stage,
+            id=get(req, "id", "?"),
+            err=_short_err(e),
+        )
     end
     return nothing
 end
@@ -712,9 +745,15 @@ function _stop_requested!(w::StopWatch, vault::Vault, key::DataKey)::Bool
     for f in readdir(dir)
         endswith(f, ".json") || continue
         f in w.seen && continue
-        push!(w.seen, f)
         req = _read_json(joinpath(dir, f))
-        req === nothing && continue
+        if req === nothing
+            # Tried again at the next look: a stop whose file could not be read once must not
+            # be a stop this unit never hears of.
+            n = w.unread[f] = get(w.unread, f, 0) + 1
+            n >= _UNREADABLE_TRIES && push!(w.seen, f)
+            continue
+        end
+        push!(w.seen, f)
         _for_me(req, w.since, w.master, w.job) || continue
         op = get(req, "op", "")
         flt = _filter_of(req)
@@ -786,5 +825,50 @@ end
 # Exported: the names that say what they are. The rest of this file's API is documented and used
 # qualified (`SweepRunner.matches`): a name that short or that common is not this package's to put in
 # a caller's namespace.
-export control!, read_requests, read_acks
+"""
+    wait_acks(vault, id; timeout=30.0, poll=0.5) -> Vector{Dict{String,Any}}
+
+Wait until at least one master has acknowledged request `id`, up to `timeout` seconds, and return
+the acknowledgements ([`read_acks`](@ref)). Empty means nobody took it in that time: no master is
+running on this `(project, run)`, or none has polled yet.
+"""
+function wait_acks(vault::Vault, id::AbstractString; timeout::Real=30.0, poll::Real=0.5)
+    t0 = time()
+    while true
+        acks = read_acks(vault, id)
+        (!isempty(acks) || time() - t0 >= timeout) && return acks
+        sleep(poll)
+    end
+end
+
+"""
+    masters_listening(vault) -> Vector{String}
+    masters_listening(outdir::AbstractString; project=nothing, run=nothing) -> Vector{String}
+
+The ids of the masters that will read a request sent now: those whose status says they are
+running or between rounds and that have reported recently. A master applies only requests made
+after it started, so a request sent when this is empty is applied by nobody — not by the next job
+either.
+"""
+function masters_listening(statuses::AbstractVector)
+    return String[
+        d["master"] for d in statuses if !d["stale"] && d["state"] in ("running", "waiting")
+    ]
+end
+
+masters_listening(vault::Vault) = masters_listening(read_status(vault))
+
+function masters_listening(outdir::AbstractString; project=nothing, run=nothing)
+    all = read_status(outdir)
+    keep =
+        d -> begin
+            parts = splitpath(d["path"])
+            # …/sweeprunner/<project>/<run>/masters/<id>/status.json
+            (project === nothing || parts[end - 4] == project) &&
+                (run === nothing || parts[end - 3] == run)
+        end
+    return masters_listening(filter(keep, all))
+end
+
+export control!, read_requests, read_acks, wait_acks, masters_listening
 export KeyFilter, should_stop, stop_point, StopRequested

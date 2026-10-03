@@ -35,6 +35,9 @@ struct KeyContext
     notes::Dict{String,Any}
     # The key's checkpoint bookkeeping for this call (`checkpoint_due`, `save_checkpoint!`).
     cp::CheckpointState
+    # Where this call's warnings go (`nothing` outside the per-key pipeline).
+    log::Union{EventLog,Nothing}
+    stage::Symbol
 end
 
 const _KEY = ScopedValue{Union{KeyContext,Nothing}}(nothing)
@@ -157,9 +160,10 @@ end
     read_progress(vault) -> Dict{String,Progress}
 
 Every recorded [`Progress`](@ref) of this `(project, run)`, by canonical key. One directory
-listing plus one read per partly-done unit; a file that cannot be parsed is skipped.
+listing plus one read per partly-done unit; a file that cannot be parsed is skipped and counted
+in `unreadable`.
 """
-function read_progress(vault::Vault)
+function read_progress(vault::Vault; unreadable::Base.RefValue{Int}=Ref(0))
     out = Dict{String,Progress}()
     dir = progress_dir(vault)
     isdir(dir) || return out
@@ -170,6 +174,8 @@ function read_progress(vault::Vault)
             out[k] = p
         catch e
             e isa InterruptException && rethrow()
+            # Counted, so the caller can say that some keys will start without their resume point.
+            unreadable[] += 1
         end
     end
     return out

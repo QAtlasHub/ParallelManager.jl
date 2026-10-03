@@ -48,7 +48,11 @@ usage: sweeprunner <command> <outdir> [options]
   drain <outdir> --node HOST
   enqueue <outdir> --config FILE
       Requests to the masters running under <outdir>; see `SweepRunner.control!`. Limit them with
-      --project NAME, --run NAME, --master ID. Prints the request ids.
+      --project NAME, --run NAME, --master ID. Prints the request ids. --wait SECONDS waits for a
+      master to acknowledge and prints what it did.
+      Exit codes: 0 sent (and, with --wait, applied); 1 no sweep state there; 3 no master is
+      running, so nothing will apply it; 4 nobody acknowledged in time; 5 a master could not
+      apply it.
 """
 
 """
@@ -217,6 +221,7 @@ const _CLI_VALUED = (
     "--project",
     "--run",
     "--master",
+    "--wait",
 )
 const _CLI_SWITCHES = ("--running", "--interrupt")
 
@@ -233,6 +238,7 @@ function _cli_control(io::IO, op::Symbol, rest)
     outdir = nothing
     select = Dict{String,Vector{Any}}()
     kw = Dict{Symbol,Any}()
+    wait_s = nothing
     i = 1
     while i <= length(rest)
         a = rest[i]
@@ -249,6 +255,9 @@ function _cli_control(io::IO, op::Symbol, rest)
                 kw[:samples] = [parse(Int, x) for x in split(v, ',')]
             elseif a == "--grace"
                 kw[:grace] = parse(Float64, v)
+            elseif a == "--wait"
+                wait_s = tryparse(Float64, v)
+                wait_s === nothing && return _cli_usage(io, "--wait takes seconds")
             elseif a == "--n"
                 kw[:n] = parse(Int, v)
             else
@@ -276,7 +285,58 @@ function _cli_control(io::IO, op::Symbol, rest)
         return 1
     end
     foreach(id -> println(io, id), ids)
-    return 0
+    # A master applies only requests made after it started. With none running, this one is
+    # applied by nobody — not by the next job either — and that is not success.
+    listening = masters_listening(
+        outdir; project=get(kw, :project, nothing), run=get(kw, :run, nothing)
+    )
+    if isempty(listening)
+        println(
+            io,
+            "no master is running under $outdir: the request was written, and nothing will ",
+            "apply it",
+        )
+        return 3
+    end
+    wait_s === nothing && return 0
+    acks = _acks_under(outdir, ids, wait_s)
+    if isempty(acks)
+        println(
+            io, "no master acknowledged within $(wait_s) s (", join(listening, ", "), ")"
+        )
+        return 4
+    end
+    code = 0
+    for a in acks
+        d = a["detail"]
+        println(io, a["master"], ": ", isempty(d) ? "applied" : JSON3.write(d))
+        (haskey(d, "error") || haskey(d, "unsupported")) && (code = 5)
+    end
+    return code
+end
+
+# The acknowledgements of the requests `ids`, wherever under `outdir` they were sent, waiting up
+# to `timeout` seconds for the first.
+function _acks_under(outdir::AbstractString, ids, timeout::Real)
+    t0 = time()
+    while true
+        acks = Dict{String,Any}[]
+        base = joinpath(outdir, "sweeprunner")
+        for p in readdir(base; join=true),
+            r in (isdir(p) ? readdir(p; join=true) : String[])
+
+            for id in ids
+                dir = joinpath(r, "control", "acks", id)
+                isdir(dir) || continue
+                for f in readdir(dir; join=true)
+                    a = _read_json(f)
+                    a === nothing || push!(acks, a)
+                end
+            end
+        end
+        (!isempty(acks) || time() - t0 >= timeout) && return acks
+        sleep(0.2)
+    end
 end
 
 function _cli_usage(io::IO, msg::AbstractString)
