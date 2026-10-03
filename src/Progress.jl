@@ -31,6 +31,8 @@ struct KeyContext
     reported::Base.RefValue{Bool}
     # What `should_stop` needs to recognise a stop request that covers this unit.
     watch::StopWatch
+    # What the application adds to this key's `key_done` record (`note_key!`).
+    notes::Dict{String,Any}
 end
 
 const _KEY = ScopedValue{Union{KeyContext,Nothing}}(nothing)
