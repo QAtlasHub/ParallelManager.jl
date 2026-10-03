@@ -422,3 +422,111 @@ said so once (`campaign_reload_refused`). Within a stage, the control channel
 cost)` returns, per stage, how many keys are undone, how many of them the
 profile lets a job take, their estimated cost and the longest one, and which
 needs block the stage.
+
+## 13. Letting what is left decide the submissions
+
+How many jobs to submit, where, and whether to resubmit used to be decided by
+shell loops that did not know what was left. The pieces here do, and they are
+explicit about it: **nothing is submitted unless the policy says
+`dry_run = false`**, every decision is logged with its reason, and the budget
+is a refusal.
+
+The policy lives in the campaign's meta file:
+
+```toml
+[jobs]
+name              = "ft"          # prefix of every job it submits
+budget_node_hours = 5000          # hard: no default
+max_jobs          = 8
+dry_run           = true
+default_key_time  = "10min"       # used when there is no cost model
+
+[[jobs.partition]]
+name           = "i8cpu"
+nodes          = 8
+time_limit     = "30min"
+script         = "batch/run_campaign.sh"
+profile        = "short"          # the campaign profile such a job runs
+max_jobs       = 1
+slots_per_node = 32               # workers per node: how much a job can take
+
+[[jobs.partition]]
+name           = "F16cpu"
+nodes          = 16
+time_limit     = "24h"
+script         = "batch/run_campaign.sh"
+profile        = "large"
+max_jobs       = 6
+slots_per_node = 32
+```
+
+```sh
+bin/sweeprunner jobs configs/campaign.toml            # decide, print, submit nothing
+bin/sweeprunner jobs configs/campaign.toml --submit   # submits, if the file says dry_run = false
+bin/sweeprunner jobs configs/campaign.toml --submit --loop 300   # every 5 min until nothing is left
+```
+
+```
+budget   812.0 used + 384.0 committed of 5000.0 node-hours
+  hold   i8cpu       nothing runnable under profile short
+  submit F16cpu      1930 unit(s) runnable under profile large, about 5120.4 worker-hours; 2 job(s) there
+  refuse F72cpu      budget: 4871.0 node-hours used or committed, this job needs 1728.0, the budget is 5000.0
+```
+
+Per partition, [`decide`](@ref SweepRunner.decide):
+
+- asks what is runnable under that partition's profile
+  ([`remaining_work`](@ref SweepRunner.remaining_work): undone keys the profile
+  lets a job take, in stages whose needs are complete). **Nothing runnable →
+  nothing submitted** — the loop that kept a short queue busy after the
+  eligible work ran out is this rule missing;
+- counts what the jobs already pending or running there can still take;
+- submits as many jobs as the rest needs, never more worker slots than units,
+  within `max_jobs`;
+- refuses a submission that would take used + committed node-hours past the
+  budget. The account is the ledger (`<outdir>/sweeprunner/jobs/ledger.json`),
+  so it holds across restarts.
+
+The batch script is yours; it receives `SWEEPRUNNER_PROFILE` and whatever the
+partition's `env` names.
+
+From Julia, with a cost model:
+
+```julia
+campaign = SweepRunner.load_campaign("configs/campaign.toml")
+policy   = SweepRunner.load_job_policy("configs/campaign.toml")
+ctl      = SweepRunner.JobController(SweepRunner.SlurmScheduler(), policy, campaign.outdir)
+work     = SweepRunner.campaign_work(open_stage, campaign; cost = (stage, key) -> seconds(stage, key))
+
+SweepRunner.manage!(ctl, work)                       # one round
+SweepRunner.controller_loop!(ctl, work; interval=300) # until nothing is left
+```
+
+`manage!` is also what a job calls as its last act to resubmit **only if work
+remains**, instead of a chain script with a fixed number of generations.
+
+### Leaving on purpose
+
+Inside a job, the master can give the allocation back instead of holding it to
+the wall clock for a few long units:
+
+```julia
+RunOpts(min_busy_fraction = 0.25, idle_grace = 900)
+```
+
+When the queue is empty and fewer than a quarter of the workers have had a
+unit for 15 minutes, the master stops (`underused` in the event log,
+`stopped_by = :underused`). The units still running are told to stop and leave
+at their next [`stop_point`](@ref SweepRunner.stop_point) with their progress
+recorded, so the next job — sized to what is left — resumes them.
+
+Where the scheduler can shrink a job, `SweepRunner.shrink(scheduler, jobid,
+nodes)` gives nodes back; send a `drain` request for those nodes first so
+nothing is dispatched to them.
+
+### The scheduler is behind an interface
+
+`submit / cancel / job_states / remaining_time / shrink` on a
+[`Scheduler`](@ref SweepRunner.Scheduler). `SlurmScheduler` is the first
+backend; `MockScheduler` is what the policy's tests run against, and what you
+can try a policy on before it touches a queue.

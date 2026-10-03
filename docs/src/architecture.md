@@ -59,6 +59,7 @@ and owns the coordination story separately.
 | [`src/Locks.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Locks.jl)         | `judge_lock`: ask the holder's master whether a `.running` is real; `locks`, `reap_dead_locks!`    |
 | [`src/Control.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Control.jl)     | `control!`: requests a running master applies (enqueue, cancel, stop, prioritise, resize, drain, pause); `should_stop` / `stop_point` |
 | [`src/Campaign.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Campaign.jl)   | A meta config naming the stages of a campaign: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!`, `remaining_work` |
+| [`src/Jobs.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Jobs.jl)           | `Scheduler` (`SlurmScheduler`, `MockScheduler`), `JobPolicy`, `Ledger`, `decide` / `manage!`: submissions decided from what is left, inside a budget |
 | [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir>` (`bin/sweeprunner`) |
 
 ## Key identity: `canonical(::DataKey)`

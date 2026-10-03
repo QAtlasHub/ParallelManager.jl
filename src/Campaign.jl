@@ -410,7 +410,7 @@ end
 # What the application's `open_stage(stage)` returned, with the defaults filled in: the vault is
 # the stage's config opened as run `<stage name>` under the campaign's outdir, the keys are that
 # config's grid.
-function _open(open_stage, c::Campaign, s::StageSpec)
+function _open(open_stage, c::Campaign, s::StageSpec; need_work::Bool=true)
     o = open_stage(s)
     o isa NamedTuple || throw(
         ArgumentError(
@@ -418,14 +418,14 @@ function _open(open_stage, c::Campaign, s::StageSpec)
             "got $(typeof(o))",
         ),
     )
-    haskey(o, :work_fn) ||
+    (haskey(o, :work_fn) || !need_work) ||
         throw(ArgumentError("open_stage($(stage_id(s))) returned no `work_fn`"))
     vault = get(o, :vault, nothing)
     vault === nothing && (vault = DataVault.Vault(s.config; run=s.name, outdir=c.outdir))
     keys = get(o, :keys, nothing)
     keys === nothing && (keys = ParamIO.expand(vault.spec))
     return (;
-        work_fn=o.work_fn,
+        work_fn=get(o, :work_fn, nothing),
         vault=vault,
         keys=collect(DataKey, keys),
         load=get(o, :load, nothing),
@@ -452,6 +452,8 @@ and `longest` the maximum of `cost(stage, key)` (seconds) over the eligible ones
 they are).
 
 This is the question a job — or whatever decides whether to submit one — asks of a campaign.
+`open_stage` may leave `work_fn` out here, and `remaining_work(campaign; …)` opens every stage
+with the defaults (its config as run `<stage name>` under the campaign's outdir).
 """
 function remaining_work(
     open_stage, c::Campaign; studies=nothing, profile=nothing, cost=nothing
@@ -461,7 +463,8 @@ function remaining_work(
     undone = Dict{String,Vector{DataKey}}()
     opened = Dict{String,Any}()
     look(id) = get!(undone, id) do
-        o = get!(() -> _open(open_stage, c, by_id[id]), opened, id)
+        # Counting what is left needs the vault and the keys, not the work.
+        o = get!(() -> _open(open_stage, c, by_id[id]; need_work=false), opened, id)
         return _undone(o)
     end
     out = NamedTuple[]
@@ -485,6 +488,8 @@ function remaining_work(
     end
     return out
 end
+
+remaining_work(c::Campaign; kwargs...) = remaining_work(s -> (;), c; kwargs...)
 
 function _eligible(keys, s::StageSpec, p::Union{Profile,Nothing}, cost)
     (p === nothing || p.max_key_time === nothing) && return keys

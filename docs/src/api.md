@@ -159,6 +159,34 @@ SweepRunner.remaining_work
 SweepRunner.parse_duration
 ```
 
+## Jobs
+
+```@docs
+SweepRunner.Scheduler
+SweepRunner.JobSpec
+SweepRunner.JobState
+SweepRunner.submit
+SweepRunner.cancel
+SweepRunner.job_states
+SweepRunner.remaining_time
+SweepRunner.shrink
+SweepRunner.SlurmScheduler
+SweepRunner.MockScheduler
+SweepRunner.PartitionPolicy
+SweepRunner.JobPolicy
+SweepRunner.load_job_policy
+SweepRunner.Ledger
+SweepRunner.observe!
+SweepRunner.node_hours
+SweepRunner.Decision
+SweepRunner.decide
+SweepRunner.campaign_work
+SweepRunner.JobController
+SweepRunner.manage!
+SweepRunner.controller_loop!
+SweepRunner.print_decisions
+```
+
 ## Preflight
 
 ```@docs

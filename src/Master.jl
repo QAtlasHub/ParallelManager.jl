@@ -79,6 +79,8 @@ cancelled and prioritised, the keys it was given, and the stop orders in force.
 mutable struct ControlState
     paused::Bool
     stop_all::Bool
+    # Why `stop_all`: `:request` (someone asked) or `:underused` (the master left on purpose).
+    stop_why::Symbol
     target::Union{Int,Nothing}
     last_poll::Float64
     # `n -> start n more workers`, given to `run!` as `spawn`; `nothing` when there is none.
@@ -96,6 +98,7 @@ function ControlState()
     return ControlState(
         false,
         false,
+        :request,
         nothing,
         0.0,
         nothing,

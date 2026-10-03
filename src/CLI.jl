@@ -3,6 +3,7 @@
 #     sweeprunner status <outdir> [--workers] [--json]
 #     sweeprunner locks  <outdir>
 #     sweeprunner campaign <meta.toml> [--profile NAME] [--studies a,b]
+#     sweeprunner jobs <meta.toml> [--submit] [--loop SECONDS]
 #     sweeprunner pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir> [options]
 #
 # `bin/sweeprunner` is the wrapper; `julia -e 'using SweepRunner; SweepRunner.cli(ARGS)' -- …` is
@@ -24,6 +25,12 @@ usage: sweeprunner <command> <outdir> [options]
   campaign <meta.toml> [--profile NAME] [--studies a,b]
       Validate a meta config and print the stages a job would run, in order. Exit code 1 when
       it is not launchable.
+
+  jobs <meta.toml> [--submit] [--loop SECONDS]
+      Decide what to submit for the campaign in <meta.toml> from its [jobs] table, what is left
+      and what the scheduler lists, and print each decision with its reason and the node-hour
+      account. Nothing is submitted without --submit AND `dry_run = false` in the file.
+      --loop repeats every SECONDS until nothing is left.
 
   pause | resume <outdir>
   stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS] [--interrupt]
@@ -69,6 +76,9 @@ function cli(args::AbstractVector{<:AbstractString}=ARGS; io::IO=stdout)
     if cmd == "campaign"
         return _cli_campaign(io, rest)
     end
+    if cmd == "jobs"
+        return _cli_jobs(io, rest)
+    end
     if cmd == "locks"
         length(pos) == 1 || return _cli_usage(io, "locks takes one <outdir>")
         print_locks(io, pos[1])
@@ -113,6 +123,67 @@ function _cli_campaign(io::IO, rest)
     println(io, "plan", profile === nothing ? "" : " (profile $profile)", ":")
     for (n, s) in enumerate(plan)
         println(io, "  ", n, ". ", stage_id(s))
+    end
+    return 0
+end
+
+# The scheduler `sweeprunner jobs` talks to. A test replaces it.
+const _CLI_SCHEDULER = Ref{Any}(() -> SlurmScheduler())
+
+function _cli_jobs(io::IO, rest)
+    meta = nothing
+    go = false
+    every = nothing
+    i = 1
+    while i <= length(rest)
+        a = rest[i]
+        if a == "--submit"
+            go = true
+        elseif a == "--loop"
+            i < length(rest) || return _cli_usage(io, "--loop needs a value")
+            every = tryparse(Float64, rest[i += 1])
+            every === nothing && return _cli_usage(io, "--loop takes seconds")
+        elseif startswith(a, "--")
+            return _cli_usage(io, "unknown option: $a")
+        elseif meta === nothing
+            meta = a
+        else
+            return _cli_usage(io, "jobs takes one <meta.toml>")
+        end
+        i += 1
+    end
+    meta === nothing && return _cli_usage(io, "jobs needs a <meta.toml>")
+    isfile(meta) || return _cli_usage(io, "no such file: $meta")
+    c = load_campaign(meta)
+    report = validate_campaign(c)
+    if !launchable(report)
+        show(io, report)
+        return 1
+    end
+    policy = try
+        load_job_policy(meta)
+    catch e
+        e isa ArgumentError || rethrow()
+        return _cli_usage(io, e.msg)
+    end
+    # Submitting takes both: the flag here and `dry_run = false` in the file.
+    if policy.dry_run || !go
+        policy = JobPolicy(;
+            name=policy.name,
+            partitions=policy.partitions,
+            budget_node_hours=policy.budget_node_hours,
+            max_jobs=policy.max_jobs,
+            dry_run=true,
+            default_key_time=policy.default_key_time,
+        )
+    end
+    ctl = JobController(_CLI_SCHEDULER[](), policy, c.outdir)
+    work = campaign_work(s -> (;), c)
+    if every === nothing
+        print_decisions(io, manage!(ctl, work), ctl.ledger, policy)
+    else
+        controller_loop!(ctl, work; interval=every)
+        print_decisions(io, Decision[], ctl.ledger, policy)
     end
     return 0
 end
