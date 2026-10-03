@@ -290,3 +290,44 @@ end
         @test SweepRunner._lock_now(v, k) === nothing
     end
 end
+
+# A master as its own process, inside a key that does not end: what a scheduler's SIGTERM finds.
+const _LK_TERM = raw"""
+using SweepRunner, DataVault
+cfg, outdir = ARGS
+v = DataVault.Vault(cfg; run="term", outdir=outdir)
+work = k -> begin
+    touch(joinpath(outdir, "in_key"))
+    while true
+        sleep(0.05)
+    end
+end
+run!(work, v, DataVault.keys(v)[1:1]; opts=RunOpts(; control_interval=0))
+"""
+
+@testset "a master sent SIGTERM releases its lock on the way out (#111)" begin
+    _lk_vault(; run="term") do v, outdir
+        k = DataVault.keys(v)[1]
+        script = joinpath(outdir, "master.jl")
+        write(script, _LK_TERM)
+        julia = `$(Base.julia_cmd()) --startup-file=no --project=$(dirname(Base.active_project()))`
+        err = joinpath(outdir, "err")
+        p = run(pipeline(`$julia $script $_LK_CFG $outdir`; stderr=err); wait=false)
+        t0 = time()
+        while !isfile(joinpath(outdir, "in_key")) && process_running(p) && time() - t0 < 300
+            sleep(0.1)
+        end
+        @test isfile(joinpath(outdir, "in_key"))
+        @test DataVault.is_running(v, k)                        # it holds the key
+        kill(p, Base.SIGTERM)
+        t0 = time()
+        while process_running(p) && time() - t0 < 60
+            sleep(0.1)
+        end
+        @test !process_running(p)
+        process_running(p) && kill(p, Base.SIGKILL)
+        # The lock went with it: the next job does not wait `stale_after` for this key.
+        @test !DataVault.is_running(v, k)
+        @test !DataVault.is_done(v, k)
+    end
+end

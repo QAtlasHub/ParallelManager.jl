@@ -592,3 +592,39 @@ end
         end
     end
 end
+
+@testset "a key that always kills its worker is given up on, in bounded starts and memory (#111)" begin
+    # One node of 4 cores and 8 GB; the key asks for 1 GB and doubles after each death.
+    _pl_pool(; key_req=k -> KeyReq(1, 1.0), mem_growth=2.0) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            bad = ParamIO.canonical(ks[1])
+            work =
+                key -> begin
+                    ParamIO.canonical(key) == bad && ccall(:_exit, Cvoid, (Cint,), 1)
+                    return Dict{String,Any}("x" => 1)
+                end
+            r = run!(work, v, ks; pool=pool)
+            # The key is reported, the other one is not taken down with it, and the run ends.
+            @test r.done == 1
+            @test (r.err, r.gave_up) == (1, 1)
+            @test DataVault.is_done(v, ks[2]) && !DataVault.is_done(v, ks[1])
+            @test !DataVault.is_running(v, ks[1])               # its lock did not stay behind
+            ev = _pl_events(outdir)
+            # It took down a bounded number of workers...
+            deaths = SweepRunner._WORKER_DEATH_REDISPATCHES + 1
+            started = sum(e.n for e in ev if e.kind == "pool_spawn")
+            @test started <= deaths + 2                         # and one for the good key
+            # ...and what it was given never passed what the node has.
+            retries = [e for e in ev if e.kind == "pool_retry_mem"]
+            @test length(retries) <= deaths
+            @test all(e -> e.next_gb <= 8.0, retries)
+            @test all(e -> e.mem_gb <= 8.0, [e for e in ev if e.kind == "pool_spawn"])
+            # The room of every worker that died came back.
+            used = sum((w.size.cores for w in values(pool.workers)); init=0)
+            @test pool.free_c[gethostname()] == 4 - used
+            @test pool.free_m[gethostname()] ≈
+                8.0 - sum((w.size.mem_gb for w in values(pool.workers)); init=0.0)
+        end
+    end
+end
