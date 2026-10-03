@@ -69,6 +69,12 @@ stay within that guarantee.
 | `campaign_reloaded` / `campaign_reload_refused` | the meta file changed under a        |
 |                 | running campaign and was taken up, or was broken and ignored       |
 | `campaign_done` | the campaign returned (`stages`, `ran`, `stopped_by`)              |
+| `job_decision`  | what job management concluded for a partition: `action` (`submit`, |
+|                 | `hold`, `refuse`), `reason`, `node_hours`, `dry_run` (in           |
+|                 | `events_jobs_*.jsonl`)                                             |
+| `job_submitted` | a job was submitted (`id`, `partition`, `nodes`, `node_hours`)     |
+| `underused`     | the queue was empty and too few workers had a unit for             |
+|                 | `idle_grace`: the master stopped on purpose (`busy`, `workers`)    |
 | `control_request` | a [`control!`](@ref) request was applied (includes `id`, `op`,   |
 |                 | `by`: who asked, `asked_at`, and `detail`: what it changed)        |
 | `key_stopped`   | a unit told to stop left at a safe point ([`stop_point`](@ref));   |

@@ -24,6 +24,12 @@ for how the three layers fit together.
   order (`needs`, `priority`), which studies are `enabled`, and per-job-kind `[profile.*]`
   filters. The application supplies `open_stage(stage) -> (; work_fn, …)`.
   `bin/sweeprunner campaign <meta.toml>` validates and prints the plan.
+- Jobs: `Scheduler` (`SlurmScheduler`, `MockScheduler`) · `load_job_policy(meta.toml)` (the
+  `[jobs]` table) · `decide` (pure) · `manage!(JobController(…), campaign_work(…))` ·
+  `bin/sweeprunner jobs <meta.toml> [--submit]`. Submissions are sized to `remaining_work`, held
+  when nothing is runnable, refused past `budget_node_hours`. **`dry_run` is the default; a
+  change here must not make a path that submits without `dry_run = false` AND an explicit ask.**
+  `RunOpts(min_busy_fraction, idle_grace)` lets a master leave an under-used allocation.
 - `control!(vault | outdir, op; …)` / `bin/sweeprunner <op> <outdir>` — requests to a RUNNING
   master: `:enqueue`, `:cancel`, `:stop` (with `grace`), `:prioritise`, `:resize`, `:drain`,
   `:pause`, `:resume`. One file per request under `state_root/control`, read by every master on
@@ -73,7 +79,8 @@ for how the three layers fit together.
 `InitWorkers` (backend bootstrap) · `Run` (the `run!` facade) · `TaskTable` (the master's table
 of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`) · `Status`
 (the status file and its readers) · `Locks` (ask the holder's master) · `Control` (requests to a
-running master) · `Campaign` (the meta config) · `CLI`. Each is usable
+running master) · `Campaign` (the meta config) · `Jobs` (scheduler interface, policy, ledger) ·
+`CLI`. Each is usable
 independently. As of v0.3 the per-key advisory lock lives entirely in
 **DataVault's `.running` markers** (`acquire_running!`); `run!` calls into it
 rather than maintaining its own `locks/` tree.

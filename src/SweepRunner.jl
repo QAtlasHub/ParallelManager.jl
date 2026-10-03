@@ -26,6 +26,7 @@ independently.
 | `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
 | `Control.jl`    | [`control!`](@ref), [`should_stop`](@ref), [`stop_point`](@ref) |
 | `Campaign.jl`   | [`load_campaign`](@ref), [`plan_campaign`](@ref), [`run_campaign!`](@ref) |
+| `Jobs.jl`       | [`Scheduler`](@ref), [`JobPolicy`](@ref), [`decide`](@ref), [`manage!`](@ref) |
 
 # Quick start
 
@@ -87,6 +88,7 @@ include("Artifacts.jl")        # artifact_affinity; ArtifactBusy deferral lives 
 include("Prerequisite.jl")
 include("Preflight.jl")
 include("Campaign.jl")        # a meta config: which stages run, in what order, under which filters
+include("Jobs.jl")            # Scheduler, JobPolicy, Ledger: deciding submissions from what is left
 include("CLI.jl")             # `sweeprunner status …`
 
 end # module SweepRunner

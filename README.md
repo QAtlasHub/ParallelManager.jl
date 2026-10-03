@@ -45,8 +45,35 @@ and the store from [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl).
   and so is `RunOpts(deadline=time() + 25*60)`. The difference is when you set
   it: a deadline is budgeted in advance, so a batch job can subtract its longest
   expected key and reserve the tail of its allocation for the summary it needs
-  to print. Neither interrupts a key already inside `work_fn`; `run!` reports
-  which one fired as `result.stopped_by`.
+  to print. `run!` reports which one fired as `result.stopped_by`. A `work_fn`
+  that calls `SweepRunner.stop_point()` at its safe points sees both from
+  inside a key and leaves there, at no attempt.
+- **The master holds the task table** — it reads the markers once per round,
+  does not dispatch a key a live sibling holds, and hands each worker its key
+  together with the lock token and the last progress recorded for it.
+  `report_progress(step; of)` / `resume_point()` replace a `work_fn` probing its
+  own outputs step by step. A worker that dies has its lock released at once.
+- **Ask a running sweep** — every master rewrites a status file;
+  `bin/sweeprunner status <outdir>` (or `read_status`) shows tasks by state,
+  workers planned / launched / joined / busy, cores in use, nodes with no
+  worker, and per worker its key, CPU utilisation and RSS. A ramp-up that
+  stalls is a `workers_short` warning, not silence.
+- **Whose lock is this** — a `.running` is judged by asking the holder's master,
+  which lists the locks it has out; a job that starts reconciles the locks it
+  finds (`locks: 260 held by 3 job(s), 17 reaped (4 dead job(s)) …`), and
+  `bin/sweeprunner locks <outdir>` answers at any time.
+- **Change a sweep while it runs** — `control!(vault, :cancel; select=…)`,
+  `:enqueue`, `:stop` (with a grace, after which the unit is cut and its lock
+  released), `:prioritise`, `:resize`, `:drain`, `:pause` / `:resume`; also as
+  `bin/sweeprunner <op> <outdir>`. Requests are files every master on the vault
+  reads, acknowledges and logs with who asked.
+- **One file for a campaign** — a meta config names the per-stage configs, what
+  each stage needs, priorities, which studies are enabled and per-job-kind
+  profiles; `run_campaign!` runs it and records which file and profile a job
+  ran. `bin/sweeprunner campaign <meta.toml>` validates and prints the plan.
+- **Submissions decided from what is left** — a scheduler interface (SLURM and a
+  mock), a policy with a hard node-hour budget, and `decide` / `manage!`:
+  nothing runnable means nothing submitted. Dry run by default.
 - **One entry point for all parallel modes** — `init_workers!(mode=:auto)`
   dispatches to `:sequential` / `:threads` / `:distributed` / `:slurm`
   depending on environment.
@@ -175,6 +202,14 @@ path builders that leak phase1's storage layout into phase2's code.
 | [`src/Manifest.jl`](src/Manifest.jl) | Stage-level rollup of `canonical(key)` strings for O(1) early-skip |
 | [`src/InitWorkers.jl`](src/InitWorkers.jl) | Unified `:auto` / `:sequential` / `:threads` / `:distributed` / `:slurm` bootstrap |
 | [`src/Run.jl`](src/Run.jl) | `run!(work_fn, vault, keys; opts)` facade that ties everything to `DataVault` |
+| [`src/TaskTable.jl`](src/TaskTable.jl) | The master's table of a round's units (state, owner, progress) and its queue |
+| [`src/Progress.jl`](src/Progress.jl) | `report_progress` / `resume_point`: how far a unit got, handed to the next attempt |
+| [`src/Status.jl`](src/Status.jl) | The status file each master rewrites; `read_status` / `print_status` |
+| [`src/Locks.jl`](src/Locks.jl) | `judge_lock` (ask the holder's master), `locks`, `reap_dead_locks!` |
+| [`src/Control.jl`](src/Control.jl) | `control!` requests to a running master; `should_stop` / `stop_point` |
+| [`src/Campaign.jl`](src/Campaign.jl) | A meta config: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!` |
+| [`src/Jobs.jl`](src/Jobs.jl) | `Scheduler`, `JobPolicy`, `Ledger`, `decide` / `manage!` |
+| [`src/CLI.jl`](src/CLI.jl) | `bin/sweeprunner status|locks|campaign|jobs|pause|stop|cancel|…` |
 | [`src/Preflight.jl`](src/Preflight.jl) | `check_injective!` / `check_opens!` / `on_grid` — refuse a campaign *before* it burns compute |
 
 Each module is one file, one concern. They can be used independently
@@ -193,6 +228,12 @@ Built from direct experience with the old-style HPC loop pattern used in
 | Multiple masters double-execute the same key | `DataVault.acquire_running!` (POSIX `link()`) + post-lock `is_done` re-check |
 | Half-written JLD2 files after crash | `atomic_write` (tmp + fsync + rename) |
 | Every project reinvents SLURM / Distributed bootstrap | `init_workers!(mode=:auto)` absorbs the pattern |
+| A 72-node job ran at 48% of its cores and nothing said so | Status file + `workers_short` warning; `sweeprunner status` |
+| Every worker re-scans `seg 1 already done. Skipping.` | The master's task table hands out the key with its resume point |
+| Locks of ended jobs sit on disk for hours; a live job proves nothing about a key | `judge_lock` asks the holder's master; reconciliation at job start |
+| Adding work or stopping a study means cancel and resubmit | `control!` requests to the running master |
+| Which configs run is an entry script, env vars and a magic file | One meta config (`load_campaign`) with profiles |
+| A resubmit loop keeps submitting after the eligible work ran out | `decide`: nothing runnable, nothing submitted; a hard budget |
 
 ## Installation
 

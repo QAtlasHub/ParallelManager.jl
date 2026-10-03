@@ -82,6 +82,12 @@ Execution options for [`run!`](@ref).
 - `control_interval::Float64 = 10.0` — how often the master looks for [`control!`](@ref)
   requests (add work, cancel, stop, prioritise, resize, drain, pause) and for workers that joined
   since the round began. `0` takes no requests.
+- `min_busy_fraction::Float64 = 0.0`, `idle_grace::Float64 = 600.0` — leave on purpose. When
+  the queue is empty and fewer than this fraction of the workers have had a unit for
+  `idle_grace` seconds, the master stops: the job is holding its nodes for a few long units.
+  The units still running are told to stop (they leave at their next [`stop_point`](@ref), with
+  their progress recorded), and `run!` returns `stopped_by = :underused`, so the allocation is
+  given back instead of being held to the wall clock. `0` (the default) never does.
 
 # Example
 
@@ -102,6 +108,8 @@ struct RunOpts
     defer_poll::Float64
     status_interval::Float64
     control_interval::Float64
+    min_busy_fraction::Float64
+    idle_grace::Float64
 end
 
 function RunOpts(;
@@ -115,6 +123,8 @@ function RunOpts(;
     defer_poll::Real=30.0,
     status_interval::Real=60.0,
     control_interval::Real=10.0,
+    min_busy_fraction::Real=0.0,
+    idle_grace::Real=600.0,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -144,6 +154,8 @@ function RunOpts(;
         Float64(defer_poll),
         Float64(status_interval),
         Float64(control_interval),
+        Float64(min_busy_fraction),
+        Float64(idle_grace),
     )
 end
 
@@ -160,7 +172,7 @@ end
 function _stop_reason(opts::RunOpts, master::Master)::Union{Symbol,Nothing}
     r = _stop_reason(opts)
     r === nothing || return r
-    return master.ctl.stop_all ? :request : nothing
+    return master.ctl.stop_all ? master.ctl.stop_why : nothing
 end
 
 # The per-key outcome vocabulary names the same reasons `_stop_reason` does, for a
@@ -170,6 +182,7 @@ function _stop_outcome(reason::Symbol)::Symbol
     reason === :flag && return :stop_flag
     reason === :deadline && return :stop_deadline
     reason === :request && return :stop_request
+    reason === :underused && return :stop_request      # the master asked, of itself
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
@@ -288,7 +301,7 @@ process, during the job or after it.
 Returns `(; stage, done, err, busy, gave_up, stop, cancelled, skipped, total, remaining,
 stopped_by)`. `cancelled` counts the keys a request took out of this job; `total` includes the
 keys a request added; `remaining` is how many keys are not done after the round (`0`: the sweep
-is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, or `nothing`: a stage that finished every key reports `nothing` even if the
+is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, `:underused`, or `nothing`: a stage that finished every key reports `nothing` even if the
 deadline passed while its last key ran, since no key was ever held back by it.
 The full-done early exit returns the same field set rather than a shorter one.
 
@@ -478,7 +491,8 @@ function run!(
             # A unit that left at a safe point, or was cut: stopped, whoever asked. The job's own
             # bounds outrank a request when both hold.
             n_stop += 1
-            stop_seen === nothing && (stop_seen = something(_stop_reason(opts), :request))
+            stop_seen === nothing &&
+                (stop_seen = something(_stop_reason(opts), master.ctl.stop_why))
         elseif outcome === :cancelled
             n_cancelled += 1
         elseif outcome === :gave_up
@@ -1092,6 +1106,7 @@ function _drive_workers!(
 
     _adopt!()
     done = Ref(false)
+    idle_since = Ref(0.0)
     tick = opts.control_interval > 0 ? opts.control_interval : 10.0
     @async while true
         sleep(tick)
@@ -1099,6 +1114,7 @@ function _drive_workers!(
         try
             poll_control!(master, table, log, opts; affinity=affinity, force=true)
             _adopt!()
+            _leave_if_underused!(master, table, out[], idle_since, opts, log)
         catch e
             log_event(log, :control_failed; level=:warn, stage=stage, err=_short_err(e))
         end
@@ -1137,6 +1153,49 @@ function _drive_workers!(
         end
     end
     return nothing
+end
+
+# The queue is empty and most of the workers have nothing: the job is holding its nodes for a few
+# long units. After `opts.idle_grace` of that, stop on purpose. The request goes through the
+# control channel so the units still running see it at their next `should_stop`.
+function _leave_if_underused!(
+    m::Master,
+    table::TaskTable,
+    busy::Int,
+    since::Base.RefValue{Float64},
+    opts::RunOpts,
+    log::EventLog,
+)
+    (opts.min_busy_fraction > 0 && !m.ctl.stop_all) || return false
+    who = lock(() -> copy(m.who), m.lock)
+    n = count(
+        p -> !(p in m.ctl.retired) && !(haskey(who, p) && who[p].host in m.ctl.drained),
+        workers(),
+    )
+    if n == 0 || _has_queued(table) || busy / n >= opts.min_busy_fraction
+        since[] = 0.0
+        return false
+    end
+    since[] == 0.0 && (since[] = time())
+    lasted = time() - since[]
+    lasted >= opts.idle_grace || return false
+    m.ctl.stop_all = true
+    m.ctl.stop_why = :underused
+    log_event(
+        log,
+        :underused;
+        level=:warn,
+        stage=m.stage,
+        busy=busy,
+        workers=n,
+        secs=round(Int, lasted),
+    )
+    try
+        opts.control_interval > 0 && control!(m.vault, :stop; master=m.id)
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return true
 end
 
 function _has_queued(table::TaskTable)
