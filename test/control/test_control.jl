@@ -1,6 +1,7 @@
 # Control (#65): a running sweep takes requests — add work, cancel, stop, reorder, resize, pause.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed
+using SweepRunner: matches, control_dir
 
 const _CT_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")
 const _CT_BIG = joinpath(@__DIR__, "..", "run", "fixtures", "affinity.toml")
@@ -401,7 +402,12 @@ end
             ks = DataVault.keys(v)
             work = k -> (sleep(0.3); Dict{String,Any}("x" => 1))
             t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
-            sleep(0.5)
+            # Once a key has finished, not after a fixed wait: how long the first key takes to
+            # start depends on the machine.
+            t0 = time()
+            while !any(k -> DataVault.is_done(v, k), ks) && time() - t0 < 120
+                sleep(0.05)
+            end
             control!(v, :drain; node=gethostname())       # every worker is on this node
             r = fetch(t)
             @test 0 < r.done < length(ks)

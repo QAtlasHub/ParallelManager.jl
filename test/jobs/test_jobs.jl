@@ -1,6 +1,7 @@
 # Jobs (#66): submissions decided from what is left, behind a scheduler interface, inside a budget.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed
+using SweepRunner: Ledger, node_hours, decide, manage!, print_decisions
 using SweepRunner: submit, cancel, job_states, remaining_time, shrink
 
 const _JB_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")

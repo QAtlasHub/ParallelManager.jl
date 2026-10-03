@@ -265,6 +265,8 @@ function status_snapshot(m::Master)
         # asks when it finds a `.running`: see `judge_lock`.
         "held" => _out_tokens(),
         "locks" => copy(m.locks),
+        # Where the core-hours went so far (Account.jl).
+        "account" => account_snapshot(m; now=now),
         # What control requests have changed about this master.
         "control" => Dict{String,Any}(
             "paused" => m.ctl.paused,
@@ -602,5 +604,7 @@ function print_status(io::IO, x; workers::Bool=false)
     return nothing
 end
 
-export note_workers!, WorkerSample, status_path, status_snapshot, write_status
-export status_tick!, read_status, print_status, expand_nodelist
+# Exported: the names that say what they are. The rest of this file's API is documented and used
+# qualified (`SweepRunner.status_snapshot`): a name that short or that common is not this package's to put in
+# a caller's namespace.
+export note_workers!, read_status, print_status

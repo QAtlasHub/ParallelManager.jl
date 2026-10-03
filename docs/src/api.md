@@ -39,6 +39,9 @@ SweepRunner.merge_and_save_manifest!
 SweepRunner.init_workers!
 SweepRunner.detect_mode
 SweepRunner.verify_workers!
+SweepRunner.srun_worker_limit
+SweepRunner.split_nodes
+SweepRunner.worker_logs!
 ```
 
 ## Run
@@ -47,80 +50,7 @@ SweepRunner.verify_workers!
 SweepRunner.RunOpts
 SweepRunner.run!
 SweepRunner.run_loop!
-```
-
-## Task table
-
-```@docs
-SweepRunner.TaskTable
-SweepRunner.TaskRow
-SweepRunner.Progress
-SweepRunner.next_task!
-SweepRunner.start_task!
-SweepRunner.settle!
-SweepRunner.hold!
-SweepRunner.requeue!
-SweepRunner.add_tasks!
-SweepRunner.settle_queued!
-SweepRunner.task_counts
-```
-
-## Progress
-
-```@docs
-SweepRunner.report_progress
-SweepRunner.resume_point
-SweepRunner.read_progress
-SweepRunner.progress_dir
-```
-
-## Master
-
-```@docs
-SweepRunner.Master
-SweepRunner.state_root
-```
-
-## Status
-
-```@docs
-SweepRunner.read_status
-SweepRunner.print_status
-SweepRunner.note_workers!
-SweepRunner.status_snapshot
-SweepRunner.write_status
-SweepRunner.status_path
-SweepRunner.status_tick!
-SweepRunner.WorkerSample
-SweepRunner.expand_nodelist
-SweepRunner.cli
-```
-
-## Locks
-
-```@docs
-SweepRunner.locks
-SweepRunner.LockInfo
-SweepRunner.judge_lock
-SweepRunner.lock_summary
-SweepRunner.print_locks
-SweepRunner.reap_dead_locks!
-```
-
-## Control
-
-```@docs
-SweepRunner.control!
-SweepRunner.should_stop
-SweepRunner.stop_point
-SweepRunner.StopRequested
-SweepRunner.KeyFilter
-SweepRunner.matches
-SweepRunner.read_requests
-SweepRunner.read_acks
-SweepRunner.control_dir
-SweepRunner.poll_control!
-SweepRunner.ControlState
+SweepRunner.todo_count
 ```
 
 ## Artifacts
@@ -142,49 +72,6 @@ SweepRunner.holder_liveness
 ```@docs
 SweepRunner.Prerequisite
 SweepRunner.run_prerequisite!
-```
-
-## Campaign
-
-```@docs
-SweepRunner.Campaign
-SweepRunner.StageSpec
-SweepRunner.Profile
-SweepRunner.stage_id
-SweepRunner.load_campaign
-SweepRunner.validate_campaign
-SweepRunner.plan_campaign
-SweepRunner.run_campaign!
-SweepRunner.remaining_work
-SweepRunner.parse_duration
-```
-
-## Jobs
-
-```@docs
-SweepRunner.Scheduler
-SweepRunner.JobSpec
-SweepRunner.JobState
-SweepRunner.submit
-SweepRunner.cancel
-SweepRunner.job_states
-SweepRunner.remaining_time
-SweepRunner.shrink
-SweepRunner.SlurmScheduler
-SweepRunner.MockScheduler
-SweepRunner.PartitionPolicy
-SweepRunner.JobPolicy
-SweepRunner.load_job_policy
-SweepRunner.Ledger
-SweepRunner.observe!
-SweepRunner.node_hours
-SweepRunner.Decision
-SweepRunner.decide
-SweepRunner.campaign_work
-SweepRunner.JobController
-SweepRunner.manage!
-SweepRunner.controller_loop!
-SweepRunner.print_decisions
 ```
 
 ## Preflight

@@ -530,3 +530,326 @@ nothing is dispatched to them.
 [`Scheduler`](@ref SweepRunner.Scheduler). `SlurmScheduler` is the first
 backend; `MockScheduler` is what the policy's tests run against, and what you
 can try a policy on before it touches a queue.
+
+## 14. What a key cost
+
+Every finished key leaves a `key_done` record with its wall time, CPU time
+(all threads), the cores its worker had, its peak resident memory, the node it
+ran on and its class:
+
+```julia
+run_loop!(work_fn, vault, keys; key_class = k -> "N=$(k.params["system.N"])")
+```
+
+Inside `work_fn`, `SweepRunner.note_key!(segments = nseg, chi = chi)` adds
+fields to the record.
+
+```sh
+bin/sweeprunner costs out/campaign
+```
+
+```
+class                           keys  median s     p90 s  cores  used  peak GB
+N=16                            4120     212.4     388.0      1   97%     1.84
+N=32                            1890    3310.9    5120.2      4   39%     6.10
+N=64                             212   61804.0   94310.5      7   55%    11.72
+```
+
+`used` is CPU time over wall time over cores: 39% at 4 cores is the number
+that says a key class would run more work per node-hour on fewer threads.
+
+`run_loop!` writes the same table to `<state_root>/costs.json` when it ends,
+so the next job reads measurements instead of a hand-fitted formula:
+
+```julia
+table = SweepRunner.load_cost_table(vault)
+class = k -> "N=$(k.params["system.N"])"
+secs  = SweepRunner.measured_cost(table, class; fallback = k -> formula(k))   # key -> seconds
+bytes = SweepRunner.measured_mem(table, class; margin = 1.2, fallback = k -> declared(k))
+
+SweepRunner.run_campaign!(open_stage, campaign; profile = "short",
+                          cost = (stage, key) -> secs(key))
+```
+
+A class the table has not seen falls back to the application's estimate, so
+the first job of a new study still has one. `key_costs(vault)` returns the raw
+records (`KeyCost`) and `cost_summary(costs; by = c -> c.host)` groups them
+any way you like — per node, per thread count.
+
+The peak is counted from the start of the key on Linux (the kernel's
+high-water mark is reset), so it is the key's and not the largest key that
+worker ever ran.
+
+## 15. Where a job's core-hours went
+
+A job is charged nodes × elapsed time. The master keeps an account of it as it
+dispatches, in core-seconds, and writes it to the event log when it ends
+(`job_account`) and to its status while it runs:
+
+```sh
+bin/sweeprunner account out/campaign
+```
+
+```
+phase1  c001_41233 job 3087883  ended  0.83 h
+allocated         7632.0 core-h
+computing         2890.0 core-h (38%)
+  kept            2410.0 core-h (32%)
+  lost             480.0 core-h (6%)   217 key(s) cut
+start-up           410.0 core-h (5%)
+never started     3960.0 core-h (52%)
+idle               350.0 core-h (5%)
+  lock_busy         60.0 core-h (1%)
+  queue_empty      290.0 core-h (4%)
+other               22.0 core-h (0%)
+```
+
+| line | what it is | measured or estimated |
+| :-- | :-- | :-- |
+| `computing` | a worker had a key | measured at each dispatch |
+| `kept` | the key finished, or the part of it up to its last `report_progress` | measured |
+| `lost` | the part after the last progress stamp of a key that was cut, stopped, failed, or whose worker died | measured |
+| `start-up` | each worker's cores from the master's start to that worker's first key | measured |
+| `never started` | (workers planned − joined) × mean cores × elapsed | estimated; needs `note_workers!(planned=…)` |
+| `idle` | a worker that had already had a key had none, by reason: `queue_empty`, `lock_busy`, `paused`, `stopping` | measured |
+| `other` | the rest of the allocation: the master, cores no worker was given | by subtraction |
+
+`lost` is the number the checkpoint interval is tuned against: it is what
+every job end, cancel and out-of-memory kill threw away. A `work_fn` that
+reports progress more often loses less; one that never reports loses the whole
+attempt.
+
+`SweepRunner.account_snapshot(master)` returns the same numbers as a `Dict`;
+`read_status(vault)[i]["account"]` reads them from outside while the job runs.
+
+## 16. Checkpoints inside a key
+
+Every job end — wall clock, cancel, a lost node, an out-of-memory kill —
+throws away what each running key did since it last saved. If saving is left
+to each `work_fn`, that is up to a whole segment per key, per job, and every
+application solves it again. The pipeline does it:
+
+```julia
+function work_fn(key)
+    cp    = SweepRunner.checkpoint()
+    state = something(SweepRunner.load_checkpoint(cp), initial_state(key))
+    while !finished(state)
+        state = advance(state)                       # one step
+        if SweepRunner.checkpoint_due(cp)
+            SweepRunner.save_checkpoint!(cp, state; step = state.step, of = nsteps)
+        end
+        SweepRunner.stop_point()                     # leave here if told to stop
+    end
+    return result(state)
+end
+```
+
+- `load_checkpoint(cp)` is the state the last attempt saved — on any worker,
+  of any job — or `nothing`.
+- `checkpoint_due(cp)` is the one question the loop asks. It is true every
+  `RunOpts.checkpoint_every` seconds (600 by default), **at once when the unit
+  has been told to stop** (the flag, the deadline, a `stop` request), and once
+  when the job's deadline comes within a minute. The application does not
+  implement the timing.
+- `save_checkpoint!(cp, state; step, of)` writes atomically, replaces the
+  previous checkpoint, and stamps the progress — which is what `sweeprunner
+  status` and `locks` show as "advancing", and what the account counts as
+  `kept` when the key is cut.
+- When the key finishes, its checkpoint and progress stamp are removed.
+
+Put `stop_point()` after the save, so a stop always leaves from a state that
+is on disk: with `checkpoint_every = 600` a 30-minute job loses nothing at its
+wall clock, instead of the tail of every running key.
+
+`state` is saved with JLD2, so it can be any Julia value JLD2 can write.
+
+### Does it really resume?
+
+A result that depends on where the key was interrupted is a wrong result that
+only shows up on a cluster. Test it on a laptop:
+
+```julia
+r = SweepRunner.check_checkpoints(work_fn, scratch_vault, key)
+@test r.same             # identical to an uninterrupted run
+@test r.restarts > 0     # it did take checkpoints
+```
+
+`check_checkpoints` runs the key once straight through and once cut
+immediately after **every** `save_checkpoint!` and restarted from it, and
+compares the two results.
+
+## 17. Several masters on one sweep, and keys of very different length
+
+### Sharding the queue
+
+Several jobs running one sweep each build the same queue in the same order
+and start from its head, so they spend their first passes on each other's
+locks. Tell each which share to start on:
+
+```julia
+RunOpts(shard = (i, m))        # master i of m, 0 <= i < m
+```
+
+or set `SWEEPRUNNER_SHARD=i/m` in the batch script; a Slurm array task gets
+its share from the array on its own. A master draws the keys whose hash falls
+in its share first and the others' after, so **every master still covers every
+key** — a share is where it starts. Two masters on 24 keys, measured in the
+test suite: 23 collisions unsharded, 5 sharded.
+
+`run!` returns `collisions` (keys handed to a worker that came back because
+another master had taken them), and `stage_done` logs it, so the cost is
+visible per job.
+
+### Cost and the wall clock
+
+```julia
+run_loop!(work_fn, vault, keys;
+    opts     = RunOpts(deadline = job_end - 120, order = :longest_first),
+    cost     = SweepRunner.measured_cost(table, class; fallback = formula),  # key -> seconds
+    min_time = key -> seconds_to_next_checkpoint(key),
+)
+```
+
+- **`order = :longest_first`** draws the keys with the largest `cost` first:
+  the long keys start while there is time for them, and the short ones fill
+  what is left.
+- **A key that cannot get anywhere is not started.** With a `deadline`, a key
+  whose `min_time` (how long it needs to reach its next checkpoint; `cost`
+  when not given) exceeds the time left is passed over, counted in
+  `held_back` and logged once. The check is made at each hand-out, so as the
+  job runs down the long keys drop out and the short ones still run. This
+  replaces per-partition filters by hand: the keys that occupied half the
+  workers of every short job without advancing are the ones held back.
+- `run_loop!` returns at once (`stopped_by = :deadline`) when all that is left
+  was held back, rather than sitting out idle rounds.
+- With `RunOpts(min_busy_fraction = …)` (guide 13) the master then leaves when
+  what is running is too little to hold the allocation for.
+
+A `work_fn` that keeps a checkpoint (guide 16) needs only `checkpoint_every`
+seconds to get somewhere, so `min_time = _ -> opts.checkpoint_every` makes
+every key fit almost any job.
+
+## 18. Start-up, and what the master carries
+
+**Leave in seconds when there is nothing to do.** Ask before starting a worker:
+
+```julia
+SweepRunner.todo_count(vault, keys) == 0 && exit(0)
+SweepRunner.init_workers!()
+```
+
+**Start workers from a system image.** `init_workers!(sysimage = path)`, or
+`SWEEPRUNNER_SYSIMAGE`, starts every worker with `--sysimage`: a worker is up
+in seconds instead of loading and compiling the application, which matters
+most when workers are started all job long. Building the image
+(PackageCompiler, once per commit, on a login node) is the application's
+step, and the master should run from the same image.
+
+**A limit per master that is a message.** Under `:slurm` every worker is an
+`srun` client on the master's node and takes about seven ports of the
+cluster's `SrunPortRange`. Past the range, workers neither join nor fail: a
+72-node job planned 3735 workers, stopped at 1782 without an error, and ran at
+48% of its cores to the end. `init_workers!` now refuses to start more than
+`max_workers` — `SWEEPRUNNER_MAX_WORKERS`, else `srun_worker_limit()` read from
+`scontrol show config` (1607 on that cluster) — and says how many masters it
+would take.
+
+**Several masters in one allocation.** Above the limit, cut the allocation
+into node groups and run one master per group, each on its own share of the
+keys:
+
+```julia
+groups = SweepRunner.split_nodes(ENV["SLURM_JOB_NODELIST"], m)
+```
+
+```sh
+for i in $(seq 0 $((m-1))); do
+  srun -N ${n[$i]} -w ${group[$i]} --export=ALL,SWEEPRUNNER_SHARD=$i/$m \
+       julia run_campaign.jl &
+done; wait
+```
+
+Start-up rate and every per-master limit then scale with the allocation. The
+masters need no broker: sharding (guide 17) keeps them off each other's keys,
+the locks and the status files do the rest.
+
+**Workers keep their own logs.** `init_workers!(worker_logs = dir)` (or
+`worker_logs!(dir)` once workers exist) makes each worker write stdout and
+stderr to `<dir>/worker_<host>_<pid>.log`, instead of relaying every line
+through the master to be printed with a `From worker N:` prefix.
+
+**The round's context travels once.** The work function, the vault, the log
+and the options are installed on a worker when its dispatch loop starts; each
+key then carries only itself, its lock token and its resume point.
+
+**The manifest is kept while the round runs** (`RunOpts.manifest_interval`,
+300 s). It used to be written only when a round ended, so a job killed at its
+wall clock left none of its completions in it and the next job found them
+again one marker at a time.
+
+**Where the round's time went.** `stage_done` carries `prepare_secs` (loading
+modules on workers, source observation), `scan_secs` (the pass over markers
+and locks), `dispatch_secs`, `manifest_secs` and `total_secs`.
+
+## 19. Workers sized to their keys
+
+`init_workers!` starts `n` identical workers, so a sweep whose keys differ in
+size sizes every worker for its largest key. A pool sizes each worker to the
+key it will run:
+
+```julia
+pool = SweepRunner.SizedPool(;                     # SlurmStepSpawner in a job, LocalSpawner outside
+    key_req = k -> KeyReq(k.params["resources.cores"], mem_gb(k)),
+)
+run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_workers!
+```
+
+- The pool starts a worker of the size a queued key needs, on the node that
+  keeps the most memory free after it, and a worker only takes keys it can
+  hold. Under Slurm each worker is its own job step (`srun --exact`
+  `--cpus-per-task` `--mem`), so its memory limit is its own.
+- **Backfill**: a smaller key starts past a larger one that fits nowhere yet,
+  until the larger has waited `starve_after` (600 s); from then on nothing is
+  started ahead of it, and the room it needs is freed by keys finishing.
+- **Retire**: an idle worker whose size no queued key fits gives its room back
+  after `retire_after` (120 s) when another size is waiting.
+- **Out of memory**: a worker that dies under a key has the key retried with
+  `mem_growth` (1.5×) the memory, up to what a node has (`pool_retry_mem`).
+  A first estimate that is too small costs a retry, not the node.
+- A key that needs more than any node offers is reported once
+  (`key_too_big`) and not retried forever.
+- `measured_mem(table, class; margin, fallback)` (guide 14) is a `key_req`
+  memory from what keys of that class actually peaked at.
+
+### How many threads
+
+A worker is started with more cores than its key declares when that is what
+its size stands for, by policy:
+
+| `threads` | cores given | for |
+| :-- | :-- | :-- |
+| `:throughput` (default) | the cores its memory share stands for on that node (`mem × free cores / free memory`), at most `max_threads` | charged or scarce cores: the most work per node-hour. Where memory binds before cores, a key sized by its declared cores alone strands the rest of the node |
+| `:fastest` | up to `max_threads`, with the memory that comes with them | free or abundant cores, or a key that has to finish |
+| `:finish_by` | as `:throughput`, but a key that would not reach its next checkpoint before the job's `deadline` gets the cores that get it there | a deadline |
+
+`:finish_by` needs to know how a key scales: `speedup = (key, cores) -> factor`.
+Measure it rather than assume it — run a class at more than one thread count
+and build the curve from the cost records:
+
+```julia
+sp = SweepRunner.measured_speedup(SweepRunner.key_costs(vault), class)
+pool = SweepRunner.SizedPool(; key_req, threads = :finish_by, speedup = sp, max_threads = 12)
+```
+
+A class measured at one thread count only gets `1.0`: no claim that threads
+help. (Downstream, 4 threads made a step 1.55× faster — 39% efficiency — so
+`:throughput` is the default.)
+
+### What has and has not been run
+
+The pool, the planner (`plan_spawns`, a pure function you can call with your
+own node list to see what it would start) and `LocalSpawner` are covered by
+the test suite with real local workers. `SlurmStepSpawner` and its
+`StepManager` are the downstream implementation moved here; reading the
+allocation and building the `srun` line are tested, starting job steps is not
+— that needs an allocation.

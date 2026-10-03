@@ -735,11 +735,10 @@ end
 
 print_decisions(ds, l, policy) = print_decisions(stdout, ds, l, policy)
 
-# `submit`, `cancel`, `job_states`, `remaining_time`, `shrink`, `observe!`, `record_submit!` and
-# `save_ledger` are the interface a backend or a caller uses qualified (`SweepRunner.submit`):
-# names that short are not this package's to claim in someone else's namespace.
+# Exported: the types and the entry points whose names say what they are. `submit`, `cancel`,
+# `job_states`, `remaining_time`, `shrink`, `observe!`, `record_submit!`, `save_ledger`, `Ledger`,
+# `node_hours`, `Decision`, `decide`, `manage!` and `print_decisions` are used qualified
+# (`SweepRunner.decide`): names that short are not this package's to claim in a caller's namespace.
 export Scheduler, JobSpec, JobState, SlurmScheduler, MockScheduler
 export PartitionPolicy, JobPolicy, load_job_policy
-export Ledger, node_hours
-export Decision, decide, campaign_work, JobController, manage!, controller_loop!
-export print_decisions
+export campaign_work, JobController, controller_loop!

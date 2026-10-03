@@ -1,6 +1,7 @@
 # Campaign (#67): a meta config names the configs a campaign runs, their order and their filters.
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3
+using SweepRunner: parse_duration
 
 _cp_config(project) = """
 [study]

@@ -61,14 +61,14 @@ event log.
 stage_id(s::StageSpec) = string(s.study, ".", s.name)
 
 """
-    Profile
+    CampaignProfile
 
 A named set of filters for one kind of job (`[profile.<name>]`): `max_key_time` (seconds; keys
 whose estimated cost is above it are left out, see `cost` in [`run_campaign!`](@ref)),
 `skip_stages` (stage names or stage ids), `studies` (limit to these), `min_nodes`, and `extra`
 for anything the application defines.
 """
-struct Profile
+struct CampaignProfile
     name::String
     max_key_time::Union{Float64,Nothing}
     skip_stages::Vector{String}
@@ -92,7 +92,7 @@ struct Campaign
     stages::Vector{StageSpec}
     studies::Vector{String}
     enabled::Dict{String,Bool}
-    profiles::Dict{String,Profile}
+    profiles::Dict{String,CampaignProfile}
     sha256::String
     problems::Vector{Finding}
 end
@@ -238,7 +238,7 @@ function load_campaign(path::AbstractString)
         append!(s.needs, unique(resolved))
     end
 
-    profiles = Dict{String,Profile}()
+    profiles = Dict{String,CampaignProfile}()
     for (pname, p) in get(raw, "profile", Dict{String,Any}())
         mkt = try
             haskey(p, "max_key_time") ? parse_duration(p["max_key_time"]) : nothing
@@ -247,7 +247,7 @@ function load_campaign(path::AbstractString)
             push!(problems, _bad("profile.$pname", e.msg))
             nothing
         end
-        profiles[pname] = Profile(
+        profiles[pname] = CampaignProfile(
             pname,
             mkt,
             String.(get(p, "skip_stages", String[])),
@@ -281,7 +281,9 @@ function _profile(c::Campaign, profile)
     return p
 end
 
-_skipped(p::Profile, s::StageSpec) = s.name in p.skip_stages || stage_id(s) in p.skip_stages
+function _skipped(p::CampaignProfile, s::StageSpec)
+    return s.name in p.skip_stages || stage_id(s) in p.skip_stages
+end
 
 # A stage order in which every stage comes after what it needs, among `cands`; at each step the
 # highest priority goes first, then file order. A stage inherits the priority of what needs it:
@@ -431,6 +433,9 @@ function _open(open_stage, c::Campaign, s::StageSpec; need_work::Bool=true)
         load=get(o, :load, nothing),
         affinity=get(o, :affinity, nothing),
         prerequisite=get(o, :prerequisite, nothing),
+        key_class=get(o, :key_class, nothing),
+        min_time=get(o, :min_time, nothing),
+        pool=get(o, :pool, nothing),
     )
 end
 
@@ -491,7 +496,7 @@ end
 
 remaining_work(c::Campaign; kwargs...) = remaining_work(s -> (;), c; kwargs...)
 
-function _eligible(keys, s::StageSpec, p::Union{Profile,Nothing}, cost)
+function _eligible(keys, s::StageSpec, p::Union{CampaignProfile,Nothing}, cost)
     (p === nothing || p.max_key_time === nothing) && return keys
     cost === nothing && throw(
         ArgumentError(
@@ -510,7 +515,7 @@ end
 Run the stages [`plan_campaign`](@ref) gives, each with [`run_loop!`](@ref).
 
 `open_stage(stage::StageSpec)` is the application's half: it returns a NamedTuple with `work_fn`
-and, optionally, `vault`, `keys`, `load`, `affinity`, `prerequisite`. Left out, the vault is
+and, optionally, `vault`, `keys`, `load`, `affinity`, `prerequisite`, `key_class`, `min_time`, `pool`. Left out, the vault is
 `DataVault.Vault(stage.config; run=stage.name, outdir=campaign.outdir)` and the keys are that
 config's whole grid.
 
@@ -618,6 +623,10 @@ function run_campaign!(
             load=o.load,
             affinity=o.affinity,
             prerequisite=o.prerequisite,
+            key_class=o.key_class,
+            cost=cost === nothing ? nothing : (k -> cost(s, k)),
+            min_time=o.min_time,
+            pool=o.pool,
             loop...,
         )
         log_event(
@@ -739,5 +748,5 @@ function Base.show(io::IO, c::Campaign)
     return nothing
 end
 
-export Campaign, StageSpec, Profile, stage_id, load_campaign, plan_campaign
-export validate_campaign, run_campaign!, remaining_work, parse_duration
+export Campaign, StageSpec, CampaignProfile, stage_id, load_campaign, plan_campaign
+export validate_campaign, run_campaign!, remaining_work

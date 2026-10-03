@@ -405,4 +405,7 @@ function _reap!(vault::Vault, key::DataKey, info::LockInfo, stage::Symbol, log):
     end
 end
 
-export LockInfo, judge_lock, locks, lock_summary, print_locks, reap_dead_locks!
+# Exported: the names that say what they are. The rest of this file's API is documented and used
+# qualified (`SweepRunner.locks`): a name that short or that common is not this package's to put in
+# a caller's namespace.
+export LockInfo, judge_lock, print_locks, reap_dead_locks!
