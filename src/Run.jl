@@ -10,7 +10,7 @@
 #       `addprocs(n)` or a SLURM cluster allocated via
 #       `SlurmClusterManager`.  No per-file change needed in user
 #       compute scripts — they still call `run!(work_fn, vault, keys)`.
-#   0.7: the master holds the task table (TaskTable.jl) and hands keys out itself, with the lock
+#   0.6.9: the master holds the task table (TaskTable.jl) and hands keys out itself, with the lock
 #       token and the resume point; `pmap` is gone.
 
 using Distributed

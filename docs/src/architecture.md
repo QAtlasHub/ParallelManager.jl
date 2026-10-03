@@ -108,7 +108,7 @@ When you call `run!(work_fn, vault, keys)`, it does:
 
 The markers on disk stay the durable record and the cross-job lock: several
 masters share one vault, and any of them can be killed at its wall clock. What
-changed in 0.7 is who READS them. The master reads them once per round and
+changed in 0.6.9 is who READS them. The master reads them once per round and
 holds the table; a worker does the key it was handed and reports back. It does
 not explore.
 
