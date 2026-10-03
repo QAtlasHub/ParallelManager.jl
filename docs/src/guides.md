@@ -4,20 +4,23 @@ Recipes for common situations.
 
 ## 1. Analyzing the event log
 
-`events.jsonl` is one JSON object per line. Any JSONL-aware tool works.
+Each master writes its own log, `events_<host>_<pid>.jsonl` in the vault's
+`outdir`, one JSON object per line. Read them together with a glob, or merge
+them first with [`merge_event_logs`](@ref SweepRunner.merge_event_logs), which
+writes `events_merged.jsonl` in time order. Any JSONL-aware tool works.
 
 With `jq`:
 
 ```bash
 # How many keys completed this session?
-jq -c 'select(.kind == "key_done")' out/events.jsonl | wc -l
+jq -c 'select(.kind == "key_done")' out/events_*.jsonl | wc -l
 
 # Slowest 10 keys by wall-clock:
-jq -c 'select(.kind == "key_done") | {key, secs}' out/events.jsonl \
+jq -c 'select(.kind == "key_done") | {key, secs}' out/events_*.jsonl \
   | jq -s 'sort_by(-.secs) | .[:10]'
 
 # Lock contention across all masters:
-jq -c 'select(.kind == "lock_busy") | .key' out/events.jsonl | sort | uniq -c | sort -nr
+jq -c 'select(.kind == "lock_busy") | .key' out/events_*.jsonl | sort | uniq -c | sort -nr
 ```
 
 With Julia + `DataFrames`:
@@ -25,9 +28,10 @@ With Julia + `DataFrames`:
 ```julia
 using JSON3, DataFrames
 
-rows = [JSON3.read(l) for l in readlines("out/events.jsonl")]
-df = DataFrame(rows)
-filter!(:kind => ==("key_done"), df)
+logs = filter(f -> startswith(f, "events_") && endswith(f, ".jsonl"), readdir("out"))
+rows = [JSON3.read(l) for f in logs for l in readlines(joinpath("out", f))]
+done = [(key=r.key, secs=r.secs) for r in rows if r.kind == "key_done"]
+df = DataFrame(done)
 sort!(df, :secs, rev=true)
 ```
 
@@ -50,15 +54,18 @@ regardless of which master happened to win each race.
 
 If a master is `kill -9`'d (or its node reboots) mid-stage:
 
-1. Its lock directories remain on disk with stale `heartbeat` mtimes.
+1. Its `.running` markers remain on disk, and their heartbeat stops.
 2. Half-written payload files do not exist — [`atomic_write`](@ref SweepRunner.atomic_write)
    renames only after `fsync`, so readers see either the previous version
    or the new one.
-3. Start a new master with the same `run.jl`. After `opts.stale_after`
-   seconds (default 600), the new master will see the abandoned locks as
-   stale, reclaim them, and re-run the affected keys.
+3. Start a new master with the same `run.jl`. Before it builds its queue it
+   asks who holds each lock (guide 10). A lock whose holder can be shown to be
+   gone — its master's status no longer lists it, its Slurm job has ended, its
+   pid is not there — is removed at once and the key re-runs. Where nobody can
+   be asked, the heartbeat's age decides: after `opts.stale_after` seconds
+   (default 600) the lock is reclaimed.
 
-For tests, tighten the window:
+`stale_after` is that last resort, not the usual wait. For tests, tighten it:
 
 ```julia
 SweepRunner.run!(work_fn, vault, keys;
@@ -105,7 +112,7 @@ Because `work_fn` is pure, you can `@enter work_fn(keys[1])` or
 SweepRunner.run!(work_fn, vault, keys;
                      opts=RunOpts(
                          max_attempts=5,
-                         stale_after=1800.0,          # 30 min
+                         stale_after=1800.0,          # 30 min; only for locks nobody answers for
                          heartbeat_interval=120.0,     # 2 min
                      ))
 ```
@@ -241,7 +248,8 @@ locks: 260 held by 3 job(s), 17 dead (4 dead job(s)), 0 stale, 0 unknown
 advancing (the heartbeat is written by a child process; progress is written by
 the computation, see [`report_progress`](@ref SweepRunner.report_progress)).
 
-From Julia: `locks(vault, keys)` (or `locks(vault)`, `locks(outdir)`) returns
+From Julia: `SweepRunner.locks(vault, keys)` (or `SweepRunner.locks(vault)`,
+`SweepRunner.locks(outdir)`; the name is not exported) returns
 [`LockInfo`](@ref SweepRunner.LockInfo) records and removes nothing;
 `reap_dead_locks!(vault, keys)` removes the dead ones without running anything.
 
@@ -385,7 +393,7 @@ priority = 10                       # ahead of the others, with what it needs
 [[study]]
 name    = "typx"
 stages  = { phase2 = "typx_phase2.toml" }
-needs   = ["conv.phase1", "typ.phase1"]
+needs   = ["conv.phase1", "fdtx.phase1"]
 enabled = true
 
 [profile.short]                     # what a 30-minute job may take
@@ -735,8 +743,11 @@ end
 - When the key finishes, its checkpoint and progress stamp are removed.
 
 Put `stop_point()` after the save, so a stop always leaves from a state that
-is on disk: with `checkpoint_every = 600` a 30-minute job loses nothing at its
-wall clock, instead of the tail of every running key.
+is on disk. What a key can lose is the work since its last save: with
+`checkpoint_every = 600`, up to 600 s. `checkpoint_due` is also true at once on
+a stop and within a minute of `opts.deadline`, so a job that is given either
+before its wall clock saves on the way out; a job killed with neither loses up
+to `checkpoint_every` per running key.
 
 `state` is saved with JLD2, so it can be any Julia value JLD2 can write.
 
@@ -770,8 +781,9 @@ RunOpts(shard = (i, m))        # master i of m, 0 <= i < m
 or set `SWEEPRUNNER_SHARD=i/m` in the batch script; a Slurm array task gets
 its share from the array on its own. A master draws the keys whose hash falls
 in its share first and the others' after, so **every master still covers every
-key** — a share is where it starts. Two masters on 24 keys, measured in the
-test suite: 23 collisions unsharded, 5 sharded.
+key** — a share is where it starts. The test suite runs two masters on 24
+keys both ways and requires the sharded pair to collide no more than the
+unsharded one; how much less depends on timing, and it logs both counts.
 
 `run!` returns `collisions` (keys handed to a worker that came back because
 another master had taken them), and `stage_done` logs it, so the cost is

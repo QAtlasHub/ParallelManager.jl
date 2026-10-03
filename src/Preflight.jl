@@ -74,7 +74,18 @@ end
 PreflightReport(fs::Vector{Finding}) = PreflightReport(fs, unique(f.layer for f in fs))
 
 Base.isempty(r::PreflightReport) = isempty(r.findings)
+"""
+    n_errors(report::PreflightReport) -> Int
+
+How many of the report's findings are errors: with any, [`launchable`](@ref) is `false`.
+"""
 n_errors(r::PreflightReport) = count(f -> f.severity === :error, r.findings)
+
+"""
+    n_warns(report::PreflightReport) -> Int
+
+How many of the report's findings are warnings: shown, and they do not refuse.
+"""
 n_warns(r::PreflightReport) = count(f -> f.severity === :warn, r.findings)
 
 """

@@ -2,7 +2,7 @@
 #
 # `DataVault.observe_sources` records what the source looked like and how far THIS process's loaded
 # code was checked against it. A point's marker must carry the token of the process that computed
-# it: under `pmap` that is the worker, whose loaded code need not be the master's. So each process
+# it: with worker processes that is the worker, whose loaded code need not be the master's. So each process
 # observes for itself at `run!` start, keeps the token here, and `_run_one_with_retry!` — which runs
 # on that same process — reads it back.
 #

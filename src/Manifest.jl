@@ -3,7 +3,7 @@
 # A Manifest turns the "is this 3600-key run already done?" question from an
 # O(N) filesystem scan into an O(1) JLD2 read. FiniteTemperature.jl used to
 # stat 3600 `.done` files on every job startup (~10 minutes wall clock); a
-# Manifest closes that loop in under 10 ms.
+# Manifest closes that loop in milliseconds (the test bound is 500 ms for 3600 keys).
 
 using JLD2
 using ParamIO: DataKey, canonical
@@ -169,7 +169,7 @@ the work list for the next [`run!`](@ref); a fully-done run returns an
 empty vector, which triggers the early-skip path.
 
 Cost is O(length(keys)) hash lookups — independent of filesystem state.
-On 3600 keys this takes ~6–12 ms in the benchmark.
+The test suite holds the 3600-key case under 500 ms; on a workstation it is a few milliseconds.
 """
 function todo_keys(m::Manifest, keys::AbstractVector{DataKey})
     return [k for k in keys if !is_complete(m, k)]

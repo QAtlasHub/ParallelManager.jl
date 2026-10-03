@@ -31,11 +31,12 @@ and the store from [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl).
   `DataVault.acquire_running!`, which uses POSIX `link()` for an atomic
   "create iff not exists" that works on NFS — the `.running` marker is the lock.
 - **Crash recovery** — `kill -9` a master mid-run and the next `run!` picks up
-  where it left off: `DataVault` writes a heartbeat into `.running`, and
-  `cleanup_stale` reclaims markers whose heartbeat has gone cold.
+  where it left off: `DataVault` writes a heartbeat into `.running`; the next job
+  removes the locks whose holder is gone and reclaims the ones nobody answers for after
+  `stale_after`.
 - **Early skip** — full-done re-runs take O(1) filesystem operations
   (a single `manifest.jld2` read), not O(N) per-key `.done` stats.
-  Benchmark: 3600 keys warm re-run ≈ 3.5 ms.
+  A 3600-key warm re-run takes milliseconds; the test suite bounds it at 500 ms.
 - **Structured events** — JSONL event log atomic across concurrent writers;
   per-item `println` is a non-goal, by design. Every lock acquisition writes a
   flushed `key_acquired` line, so a run that a `kill -9` truncated still says
@@ -209,7 +210,14 @@ path builders that leak phase1's storage layout into phase2's code.
 | [`src/Control.jl`](src/Control.jl) | `control!` requests to a running master; `should_stop` / `stop_point` |
 | [`src/Campaign.jl`](src/Campaign.jl) | A meta config: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!` |
 | [`src/Jobs.jl`](src/Jobs.jl) | `Scheduler`, `JobPolicy`, `Ledger`, `decide` / `manage!` |
-| [`src/CLI.jl`](src/CLI.jl) | `bin/sweeprunner status|locks|campaign|jobs|pause|stop|cancel|…` |
+| [`src/Master.jl`](src/Master.jl) | A master's identity and its workers'; `state_root(vault)` |
+| [`src/Liveness.jl`](src/Liveness.jl) | Is a process or a Slurm job still there: what a lock's holder is asked through |
+| [`src/Pool.jl`](src/Pool.jl) | `SizedPool`: workers sized to their keys; `LocalSpawner`, `SlurmStepSpawner` |
+| [`src/Checkpoint.jl`](src/Checkpoint.jl) | A key's checkpoint inside `work_fn`: `load_checkpoint`, `save_checkpoint!`, `checkpoint_due` |
+| [`src/Cost.jl`](src/Cost.jl) | What a key cost: `key_costs`, `cost_summary`, `measured_cost` |
+| [`src/Account.jl`](src/Account.jl) | Where a job's core-hours went |
+| [`src/Observe.jl`](src/Observe.jl) | One source observation per process, carried by every `.done` it writes |
+| [`src/CLI.jl`](src/CLI.jl) | `bin/sweeprunner status|locks|costs|account|campaign|jobs|pause|stop|cancel|…` |
 | [`src/Preflight.jl`](src/Preflight.jl) | `check_injective!` / `check_opens!` / `on_grid` — refuse a campaign *before* it burns compute |
 
 Each module is one file, one concern. They can be used independently
@@ -222,9 +230,9 @@ Built from direct experience with the old-style HPC loop pattern used in
 
 | Pain | This package's answer |
 | --- | --- |
-| `.done` files rescanned every job (3600 files, ~10 min) | `Manifest` rollup, one JLD2 read (< 10 ms) |
+| `.done` files rescanned every job (3600 files, ~10 min) | `Manifest` rollup, one JLD2 read (milliseconds) |
 | 300 MB of per-item `println` logs | `EventLog` (JSONL), per-item `println` is not part of the API |
-| Killed samples silently wedge the queue | Heartbeat + `is_stale` + `reclaim!` auto-recover on next run |
+| Killed samples silently wedge the queue | Heartbeat in `.running`; the next job asks who holds each lock (`judge_lock`) and reaps the dead ones, `stale_after` as the last resort |
 | Multiple masters double-execute the same key | `DataVault.acquire_running!` (POSIX `link()`) + post-lock `is_done` re-check |
 | Half-written JLD2 files after crash | `atomic_write` (tmp + fsync + rename) |
 | Every project reinvents SLURM / Distributed bootstrap | `init_workers!(mode=:auto)` absorbs the pattern |
@@ -248,7 +256,7 @@ Requires Julia v1.11+.
 
 ## Tests
 
-`Pkg.test()` runs ~4200 tests in ~22 seconds, including:
+The suite runs on CI in four shards (one directory per module under `test/`), including:
 
 - `atomicio/` — atomic write, exception cleanup, concurrent writers
 - `eventlog/` — JSON roundtrip, 50-task × 40-event concurrent write

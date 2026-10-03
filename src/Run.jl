@@ -18,8 +18,11 @@ using DataVault
 using ParamIO: DataKey, canonical
 
 """
-    RunOpts(; workers=:auto, max_attempts=3, stale_after=600.0,
-             heartbeat_interval=60.0, stop_flag=nothing, deadline=nothing)
+    RunOpts(; workers=:auto, max_attempts=3, stale_after=600.0, heartbeat_interval=60.0,
+             stop_flag=ENV["SWEEPRUNNER_STOP_FLAG"], log_level=:info, deadline=nothing,
+             defer_poll=30.0, status_interval=60.0, control_interval=10.0,
+             min_busy_fraction=0.0, idle_grace=600.0, checkpoint_every=600.0,
+             stop_grace=Inf, shard=<env>, order=:given, manifest_interval=300.0)
 
 Execution options for [`run!`](@ref).
 
@@ -31,8 +34,11 @@ Execution options for [`run!`](@ref).
   worker processes are present (useful for debugging a serialization issue).
 - `max_attempts::Int = 3` — per-key retry budget. Set to `1` to disable
   retry (a failed `work_fn` is logged as `:error` instead of `:gave_up`).
-- `stale_after::Float64 = 600.0` — seconds before another master can reclaim a
-  held lock as stale. Passed through to `DataVault.acquire_running!`.
+- `stale_after::Float64 = 600.0` — the heartbeat age past which a lock NOBODY ANSWERS FOR is
+  reclaimed. It is the last resort, not the usual wait: a lock a reporting master lists as held
+  is left alone whatever its age, and a lock whose holder is known to be gone (its master no
+  longer lists it, its job ended, its pid is not there) is removed when a job starts, without
+  waiting. Passed through to `DataVault.acquire_running!`.
 - `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat
   (a child process, `DataVault.start_heartbeat`) refreshes DataVault's
   `.running` file. It keeps beating while `work_fn` computes without yielding.
@@ -285,7 +291,8 @@ load_manifest(vault::Vault) = load_manifest(manifest_root(vault), Symbol(vault.r
 
 """
     run!(work_fn, vault, keys; opts=RunOpts(), load=nothing, affinity=nothing, observe=true,
-         master=nothing, spawn=nothing) -> NamedTuple
+         master=nothing, spawn=nothing, key_class=nothing, cost=nothing, min_time=nothing,
+         pool=nothing) -> NamedTuple
 
 Run `work_fn(key) -> Dict` for every `key` in `keys`, persisting through
 `vault`. Writes a structured JSONL event log at
@@ -322,7 +329,8 @@ once instead of once per key.
 
     run!(work_fn, vault, keys; affinity = k -> param(k, "system.L"))
 
-A preference, not a partition: a worker is never idle while a key is pending, so a 200-key group
+A preference, not a partition: a worker is never idle while a key it may take is pending (with a
+`pool`, a worker takes only keys of its size), so a 200-key group
 does not serialise onto the worker that opened it. When a worker has nothing from its own groups
 left it takes from the group with the most work outstanding, which spreads workers over groups.
 
@@ -403,7 +411,8 @@ Contract:
 - Exceptions in `work_fn` are caught and logged; the corresponding key's
   `.done` file is not written, so re-runs will pick it up.
 - The stage label used for logging is `Symbol(vault.run)`.
-- Manifest is monotonic: saved at end-of-stage with every newly completed key.
+- Manifest is monotonic: newly completed keys are merged in every `opts.manifest_interval`
+  seconds while the round runs, and once more when it ends.
 
 # Parallel dispatch
 
@@ -1805,8 +1814,10 @@ function _short_err(e)::String
 end
 
 """
-    run_loop!(work_fn, vault, keys; opts=RunOpts(), max_empty_rounds=3,
-              idle_sleep=30.0, load=nothing, prerequisite=nothing) -> NamedTuple
+    run_loop!(work_fn, vault, keys; opts=RunOpts(), max_empty_rounds=3, idle_sleep=30.0,
+              load=nothing, prerequisite=nothing, affinity=nothing, observe=true,
+              spawn=nothing, key_class=nothing, cost=nothing, min_time=nothing,
+              pool=nothing) -> NamedTuple
 
 Work-stealing loop that repeatedly calls [`run!`](@ref) until there is no
 more work to do. This is the infra equivalent of FiniteTemperature.jl's
@@ -1816,14 +1827,22 @@ The loop exits when:
 - a round leaves no key undone (`remaining == 0`), at once, or
 - `max_empty_rounds` consecutive rounds produce zero new completions AND leave nothing held by a
   sibling, or
-- `opts.stop_flag` is raised, or `opts.deadline` has passed.
+- `opts.stop_flag` is raised, or `opts.deadline` has passed, or
+- a round held keys back because they could not get anywhere before `opts.deadline`
+  (`held_back > 0`): the loop returns `stopped_by = :deadline` instead of sitting out idle rounds
+  over keys it will not start, or
+- a round ended `:underused` (`opts.min_busy_fraction`) or on a `:stop` request with no scope, or
+- keys are still held by a sibling after the busy budget below: the loop returns with
+  `busy > 0`, `remaining > 0`.
 
 A round that completes nothing but finds keys `:lock_busy` does NOT count toward
-`max_empty_rounds` until `opts.stale_after` has been waited out. Those keys are either being
-worked on by a live sibling, or held by one the wall clock killed, and `stale_after` is what
-separates the two: past it, `acquire_running!` reclaims the lock on the next attempt. Returning
-before then leaves the campaign short and reports nothing, because `max_empty_rounds *
-idle_sleep` (90 s by default) is an order of magnitude under `stale_after` (600 s).
+`max_empty_rounds` until `opts.stale_after + 2 * idle_sleep` seconds of such rounds have passed
+(the busy budget). Those keys are either being worked on by a live sibling, or held by one the
+wall clock killed. A holder that can be shown to be gone is reaped at the start of the next
+round; `stale_after` separates the two only where nobody can be asked, and past it
+`acquire_running!` reclaims the lock. Returning before then leaves the campaign short and
+reports nothing, because `max_empty_rounds * idle_sleep` (90 s by default) is an order of
+magnitude under `stale_after` (600 s).
 
 Default parameters (`max_empty_rounds=3`, `idle_sleep=30.0`) are the
 battle-tested values from FiniteTemperature.jl.
