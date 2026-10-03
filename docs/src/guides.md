@@ -821,6 +821,32 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
 - `measured_mem(table, class; margin, fallback)` (guide 14) is a `key_req`
   memory from what keys of that class actually peaked at.
 
+- The pool's workers are removed when the `run!` / `run_loop!` it was given
+  to returns (`keep = true` keeps them; then call `SweepRunner.shutdown!`).
+- The pool follows requests to the master (guide 11): nothing is started
+  while it is paused or stopping, a drained node gets no new worker, and a
+  `resize` target caps the pool.
+
+### Limits and failures that are said
+
+- **The per-master limit.** Under Slurm every worker is an `srun` client on
+  the master's node. The pool holds at most `max_workers`:
+  `SWEEPRUNNER_MAX_WORKERS`, else the cluster's `SrunPortRange`, else 1500
+  when that cannot be read — an unknown limit is a cap, not no cap. Which
+  one it used is logged (`pool_limit`), and reaching it is logged once
+  (`pool_at_limit`). Past it, run several masters on node groups:
+  `SWEEPRUNNER_NODELIST=<group>` (and `SWEEPRUNNER_MEM_PER_NODE_MB=<the
+  allocation's per-node memory>` for a master that is itself a job step),
+  with `SWEEPRUNNER_SHARD=i/m`.
+- A start that fails is logged (`pool_spawn_failed`), one that brings fewer
+  workers than asked too (`pool_spawn_short`), and a worker that started but
+  could not be readied is removed. Starts that neither join nor fail for
+  `stall_after` are a `pool_stalled` warning. **Ten failed starts in a row
+  with keys still queued is an error from `run!`** (`pool_gave_up`), not a
+  round that quietly ended.
+- A worker whose launching process has exited is treated as gone even before
+  Distributed notices the connection drop.
+
 ### How many threads
 
 A worker is started with more cores than its key declares when that is what
@@ -829,7 +855,7 @@ its size stands for, by policy:
 | `threads` | cores given | for |
 | :-- | :-- | :-- |
 | `:throughput` (default) | the cores its memory share stands for on that node (`mem × free cores / free memory`), at most `max_threads` | charged or scarce cores: the most work per node-hour. Where memory binds before cores, a key sized by its declared cores alone strands the rest of the node |
-| `:fastest` | up to `max_threads`, with the memory that comes with them | free or abundant cores, or a key that has to finish |
+| `:fastest` | for a key that declares more than one core: up to `max_threads`, with the memory that comes with them (a one-core key stays as under `:throughput`) | free or abundant cores, or a key that has to finish |
 | `:finish_by` | as `:throughput`, but a key that would not reach its next checkpoint before the job's `deadline` gets the cores that get it there | a deadline |
 
 `:finish_by` needs to know how a key scales: `speedup = (key, cores) -> factor`.

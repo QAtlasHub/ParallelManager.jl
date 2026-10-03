@@ -78,6 +78,12 @@ stay within that guarantee.
 | `pool_spawn`    | a [`SizedPool`](@ref) started workers of one size on a node        |
 |                 | (`node`, `cores`, `mem_gb`, `n`); `pool_spawn_failed` when it      |
 |                 | could not (`err`)                                                  |
+| `pool_limit`    | the most workers the pool will hold and where that number came     |
+|                 | from (`max_workers`, `source`); once per pool                      |
+| `pool_at_limit` | a start was wanted past that limit (`held`, `queued`); once        |
+| `pool_spawn_short` | a start brought fewer workers than asked (`asked`, `started`)   |
+| `pool_stalled`  | starts have neither joined nor failed for `stall_after`            |
+| `pool_gave_up`  | ten starts failed in a row with keys still queued; `run!` throws   |
 | `pool_retire`   | an idle worker whose size no queued key fits gave its room back    |
 | `pool_retry_mem`| a worker died under a key: the key is retried with more memory     |
 |                 | (`had_gb`, `next_gb`)                                              |

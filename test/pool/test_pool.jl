@@ -22,7 +22,8 @@ end
 # A pool over "one node" of this machine, cleaned up whatever happens.
 function _pl_pool(f; cores=4, mem_gb=8.0, kw...)
     nprocs() > 1 && rmprocs(workers())
-    pool = SizedPool(LocalSpawner(; cores, mem_gb); poll=0.2, kw...)
+    # `keep`: these tests look at the pool's workers after the run.
+    pool = SizedPool(LocalSpawner(; cores, mem_gb); poll=0.2, keep=true, kw...)
     try
         f(pool)
     finally
@@ -49,6 +50,8 @@ _pl_node(c=127, m=223.0) = PoolNode("n1", c, m)
     f = worker_size(KeyReq(2, 4.0), n, 127, 223.0; threads=:fastest)
     @test f.cores == 8 && f.mem_gb ≈ 8 * 223 / 127
     @test worker_size(KeyReq(2, 40.0), n, 3, 223.0; threads=:fastest) == KeyReq(3, 40.0)
+    # A key that says it is serial stays serial under :fastest.
+    @test worker_size(KeyReq(1, 1.0), n, 127, 223.0; threads=:fastest) == KeyReq(1, 1.0)
 end
 
 @testset "plan_spawns: cover, place, backfill, and stop backfilling for a starved key" begin
@@ -87,6 +90,11 @@ end
     # No more than there is room for (the per-master worker limit).
     p = plan_spawns(fill(small, 6), zeros(6), nodes, free_c, free_m, KeyReq[]; room=2)
     @test length(p.starts) == 2
+    @test p.capped                                    # more were wanted than there was room for
+    @test !plan_spawns(fill(small, 2), zeros(2), nodes, free_c, free_m, KeyReq[]; room=2).capped
+    # A node left out (drained) is not used, whatever room it has.
+    p = plan_spawns([big], [0.0], nodes[1:1], free_c, free_m, KeyReq[])
+    @test isempty(p.starts) && p.blocked == [1]
     # Cores run out before memory here: 8 one-core workers, not 24.
     p = plan_spawns(
         fill(small, 24), zeros(24), nodes, free_c, free_m, KeyReq[]; max_threads=1
@@ -233,5 +241,303 @@ end
             # The second worker was started with the larger request.
             @test any(e -> e.kind == "pool_spawn" && e.mem_gb == 2.0, _pl_events(outdir))
         end
+    end
+end
+
+# ── the paths a reviewer found untested (#99, #101, #102, #103, #115) ────────────────────────────
+
+# A spawner that offers one node and starts workers the way `starter` says.
+struct _PlSpawner <: SweepRunner.Spawner
+    node::PoolNode
+    starter::Any
+end
+SweepRunner.pool_nodes(s::_PlSpawner) = [s.node]
+function SweepRunner.start_workers(s::_PlSpawner, node, size, n; exeflags)
+    return s.starter(node, size, n, exeflags)
+end
+
+function _pl_local(node, size, n, exeflags)
+    return SweepRunner.start_workers(
+        LocalSpawner(; cores=4, mem_gb=8.0), node, size, n; exeflags=exeflags
+    )
+end
+
+function _pl_custom(f, starter; cores=4, mem_gb=8.0, kw...)
+    nprocs() > 1 && rmprocs(workers())
+    pool = SizedPool(
+        _PlSpawner(PoolNode(gethostname(), cores, mem_gb), starter);
+        key_req=k -> KeyReq(1, 1.0),
+        poll=0.05,
+        keep=true,
+        kw...,
+    )
+    try
+        f(pool)
+    finally
+        shutdown!(pool)
+        nprocs() > 1 && rmprocs(workers())
+        note_workers!(; planned=0, launched=0)
+    end
+end
+
+@testset "KeyReq, PoolNode and SizedPool refuse values that would break the planner" begin
+    @test_throws ArgumentError KeyReq(0, 1.0)
+    @test_throws ArgumentError KeyReq(-1, 1.0)
+    @test_throws ArgumentError KeyReq(1, 0.0)
+    @test_throws ArgumentError KeyReq(1, NaN)
+    @test_throws ArgumentError KeyReq(1, -2.0)
+    @test_throws ArgumentError PoolNode("n", -1, 1.0)
+    @test_throws ArgumentError PoolNode("n", 1, NaN)
+    @test PoolNode("n", 0, 0.0).cores == 0                    # a node with nothing left is fine
+    mk(; kw...) = SizedPool(LocalSpawner(); key_req=k -> KeyReq(1, 1.0), kw...)
+    @test_throws ArgumentError mk(; max_workers=0)
+    @test_throws ArgumentError mk(; max_threads=0)
+    @test_throws ArgumentError mk(; mem_growth=1.0)
+    @test_throws ArgumentError mk(; poll=0)
+    @test_throws ArgumentError mk(; retire_after=-1)
+end
+
+@testset "the per-master limit applies to the pool, and an unreadable one is a default (#99)" begin
+    lim = SweepRunner._pool_limit
+    slurm = SlurmStepSpawner([PoolNode("c01", 8, 16.0)])
+    withenv("SWEEPRUNNER_MAX_WORKERS" => nothing) do
+        @test lim(LocalSpawner(), nothing) == (typemax(Int), "none")
+        @test lim(LocalSpawner(), 7) == (7, "max_workers")
+        @test lim(slurm, nothing; limit=() -> 1607) == (1607, "SrunPortRange")
+        # Under Slurm, "could not read the limit" is a cap, not no cap.
+        n, why = lim(slurm, nothing; limit=() -> nothing)
+        @test n == 1500 && occursin("could not be read", why)
+        @test lim(slurm, 40; limit=() -> 1607) == (40, "max_workers")
+    end
+    withenv("SWEEPRUNNER_MAX_WORKERS" => "250") do
+        @test lim(slurm, nothing; limit=() -> 1607) == (250, "SWEEPRUNNER_MAX_WORKERS")
+    end
+end
+
+@testset "SlurmStepSpawner: a master's slice, the allocation's memory, the srun reservation (#115)" begin
+    env = Dict(
+        "SLURM_JOB_NODELIST" => "c[01-04]",
+        "SLURM_JOB_CPUS_PER_NODE" => "128(x4)",
+        "SLURM_MEM_PER_NODE" => "8000",                       # the STEP's --mem, not the node's
+    )
+    ns = SweepRunner._slurm_pool_nodes(
+        env,
+        "c03";
+        only=Set(["c03", "c04"]),
+        master_gb=3.0,
+        headroom_gb=4.0,
+        srun_gb=0.008,
+        mem_per_node_mb=230000,
+    )
+    @test [n.name for n in ns] == ["c03", "c04"]
+    @test ns[2].mem_gb ≈ 230000 / 1024 - 4.0                   # the allocation's figure
+    # The master's node also keeps room for the srun clients of its slice's workers.
+    @test ns[1].mem_gb ≈ 230000 / 1024 - 4.0 - (3.0 + 0.008 * 256)
+    @test ns[1].cores == 127
+    @test_throws ErrorException SweepRunner._slurm_pool_nodes(
+        env, "c01"; only=Set(["zz"]), master_gb=3.0, headroom_gb=4.0
+    )
+end
+
+@testset "a worker is not handed work before the pool knows its size (#101)" begin
+    pool = SizedPool(LocalSpawner(; cores=4, mem_gb=8.0); key_req=k -> KeyReq(4, 6.0))
+    row = TaskTable([ParamIO.DataKey(Dict{String,Any}("N" => 1), 1)]).rows[1]
+    # Visible in workers() but not registered: neither adopted nor accepted.
+    @test !SweepRunner._pool_adoptable(pool, 99)
+    @test !SweepRunner._pool_accepts(pool, 99, row, nothing, nothing)
+    # A worker that was there before the pool is not the pool's, and takes anything.
+    push!(pool.foreign, 99)
+    @test SweepRunner._pool_adoptable(pool, 99)
+    @test SweepRunner._pool_accepts(pool, 99, row, nothing, nothing)
+    # One the pool registered takes what its size holds, and nothing once it is retiring.
+    pool.workers[7] = SweepRunner.PoolWorker("n", KeyReq(1, 1.0), time(), false)
+    @test !SweepRunner._pool_accepts(pool, 7, row, nothing, nothing)
+    pool.workers[8] = SweepRunner.PoolWorker("n", KeyReq(4, 6.0), time(), false)
+    @test SweepRunner._pool_accepts(pool, 8, row, nothing, nothing)
+    pool.workers[8].retiring = true
+    @test !SweepRunner._pool_accepts(pool, 8, row, nothing, nothing)
+    @test SweepRunner._pool_retiring(pool, 8)
+end
+
+@testset "memory after a second death grows from what the key last had (#101)" begin
+    pool = SizedPool(LocalSpawner(; cores=4, mem_gb=64.0); key_req=k -> KeyReq(1, 2.0))
+    row = TaskTable([ParamIO.DataKey(Dict{String,Any}("N" => 1), 1)]).rows[1]
+    log = SweepRunner.EventLog(joinpath(mktempdir(), "e.jsonl"))
+    # The worker is already forgotten by the pool both times (the tick freed it first).
+    SweepRunner._pool_death!(pool, row, 5, log, :s)
+    @test pool.memreq[row.kstr] == 3.0
+    SweepRunner._pool_death!(pool, row, 6, log, :s)
+    @test pool.memreq[row.kstr] == 4.5                         # from 3.0, not from 2.0 again
+    for _ in 1:20
+        SweepRunner._pool_death!(pool, row, 6, log, :s)
+    end
+    @test pool.memreq[row.kstr] == 64.0                        # never past what a node has
+end
+
+@testset "a worker that cannot be readied is removed, and fails alone (#101, #115)" begin
+    nprocs() > 1 && rmprocs(workers())
+    ids = addprocs(2; exeflags="--project=$(dirname(Base.active_project()))")
+    try
+        bad = ids[1]
+        ready = (w, size) -> w == bad ? error("cannot load") : nothing
+        good = SweepRunner._ready_workers!(ids, KeyReq(1, 1.0); ready=ready)
+        @test good == [ids[2]]
+        @test !(bad in procs())                                # not left running
+        @test ids[2] in procs()
+    finally
+        nprocs() > 1 && rmprocs(workers())
+    end
+end
+
+@testset "starts that fail are logged, and ten in a row is an error, not a quiet end (#101)" begin
+    _pl_custom((node, size, n, flags) -> error("no such partition")) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            err = try
+                run!(k -> Dict{String,Any}("x" => 1), v, ks; pool=pool)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException
+            @test occursin("worker starts failed in a row", err.msg)
+            ev = _pl_events(outdir)
+            failed = [e for e in ev if e.kind == "pool_spawn_failed"]
+            @test length(failed) >= 10
+            @test occursin("no such partition", failed[1].err)
+            @test count(e -> e.kind == "pool_gave_up", ev) == 1
+            # Nothing is left starting, and the room is all back.
+            @test isempty(pool.starting)
+            @test pool.free_c[gethostname()] == 4
+            @test all(k -> !DataVault.is_done(v, k), ks)
+        end
+    end
+end
+
+@testset "a start that brings fewer workers than asked is said, and the round goes on (#101)" begin
+    short = (node, size, n, flags) -> _pl_local(node, size, 1, flags)    # one, whatever was asked
+    _pl_custom(short) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            r = run!(k -> (sleep(0.2); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
+            @test r.done == length(ks)
+            ev = [e for e in _pl_events(outdir) if e.kind == "pool_spawn_short"]
+            @test !isempty(ev)
+            @test all(e -> e.started == 1 && e.asked > 1, ev)
+            # The room of the workers that did not come is back: used == what the workers hold.
+            used = sum(w.size.cores for w in values(pool.workers); init=0)
+            @test pool.free_c[gethostname()] == 4 - used
+        end
+    end
+end
+
+@testset "max_workers is never exceeded, and reaching it is said once (#99)" begin
+    _pl_custom(_pl_local; max_workers=2) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            most = Ref(0)
+            watching = Ref(true)
+            watcher = @async while watching[]
+                held = length(pool.workers) + sum(x -> x[3], values(pool.starting); init=0)
+                most[] = max(most[], held)
+                sleep(0.02)
+            end
+            r = run!(k -> (sleep(0.3); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
+            watching[] = false
+            wait(watcher)
+            @test r.done == length(ks)
+            @test most[] == 2
+            ev = _pl_events(outdir)
+            @test count(e -> e.kind == "pool_at_limit", ev) == 1
+            lim = only([e for e in ev if e.kind == "pool_limit"])
+            @test lim.max_workers == 2 && lim.source == "max_workers"
+        end
+    end
+end
+
+@testset "the pool follows the master: paused, stopping, a drained node, a resize target (#102)" begin
+    never = (node, size, n, flags) -> Int[]
+    function tick(setup; fits=Returns(true), deadline=nothing)
+        started = Ref(-1)
+        _pl_custom(never) do pool
+            _pl_vault() do v, outdir
+                table = TaskTable(DataVault.keys(v))
+                m = SweepRunner.Master()
+                m.multi = true
+                setup(m)
+                log = SweepRunner.EventLog(joinpath(outdir, "e.jsonl"))
+                opts = RunOpts(; deadline=deadline, stop_flag=nothing)
+                SweepRunner._pool_tick!(pool, table, m, log, :s, opts, nothing; fits=fits)
+                # Counted before the start tasks run: this is what the tick decided.
+                started[] = sum(x -> x[3], values(pool.starting); init=0)
+            end
+        end
+        return started[]
+    end
+    @test tick(m -> nothing) == 4                              # four keys, four cores: four starts
+    @test tick(m -> (m.ctl.paused = true)) == 0
+    @test tick(m -> (m.ctl.stop_all = true)) == 0
+    @test tick(m -> push!(m.ctl.drained, gethostname())) == 0
+    @test tick(m -> (m.ctl.target = 1)) == 1
+    @test tick(m -> (m.ctl.target = 0)) == 0
+    # Keys the deadline will hold back are not started for.
+    @test tick(m -> nothing; fits=k -> k.params["N"] == 4) == 2
+    @test tick(m -> nothing; fits=Returns(false)) == 0
+end
+
+@testset "a key :finish_by gave more cores to is run, not held back for its one-core time (#103)" begin
+    nprocs() > 1 && rmprocs(workers())
+    pool = SizedPool(
+        LocalSpawner(; cores=4, mem_gb=8.0);
+        key_req=k -> KeyReq(1, 1.0),
+        threads=:finish_by,
+        speedup=(k, c) -> Float64(c),
+        max_threads=4,
+        poll=0.2,
+    )
+    try
+        _pl_vault() do v, _
+            k = DataVault.keys(v)[1]
+            # 150 s at one core, 120 s left: it only fits at two cores or more.
+            need = key -> 150.0
+            work =
+                key -> Dict{String,Any}("threads" => LinearAlgebra.BLAS.get_num_threads())
+            r = run!(
+                work,
+                v,
+                [k];
+                pool=pool,
+                load=:LinearAlgebra,
+                min_time=need,
+                opts=RunOpts(; deadline=time() + 120),
+            )
+            @test (r.done, r.held_back) == (1, 0)
+            @test DataVault.load(v, k)["threads"] >= 2
+            @test SweepRunner._pool_min_time(pool, k, time() + 120, need) <= 75.0
+        end
+    finally
+        shutdown!(pool)
+        nprocs() > 1 && rmprocs(workers())
+        note_workers!(; planned=0, launched=0)
+    end
+end
+
+@testset "a pool's workers go when the call that was given the pool returns (#101)" begin
+    nprocs() > 1 && rmprocs(workers())
+    pool = SizedPool(
+        LocalSpawner(; cores=2, mem_gb=4.0); key_req=k -> KeyReq(1, 1.0), poll=0.2
+    )
+    try
+        _pl_vault() do v, _
+            ks = DataVault.keys(v)
+            r = run_loop!(k -> Dict{String,Any}("x" => 1), v, ks; pool=pool)
+            @test r.done == length(ks)
+            @test isempty(pool.workers)
+            @test nprocs() == 1
+            @test pool.free_c[gethostname()] == 2
+        end
+    finally
+        shutdown!(pool)
+        nprocs() > 1 && rmprocs(workers())
     end
 end

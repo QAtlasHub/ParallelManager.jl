@@ -524,7 +524,14 @@ function run!(
     todo = _ordered(todo, opts, cost)
     t_scan = time()
     # Whether a key can still get somewhere before the deadline; asked at each hand-out.
-    fits = _fits(opts, something(min_time, cost, Returns(0.0)))
+    need_time = something(min_time, cost, Returns(0.0))
+    if pool !== nothing
+        # At the size the pool will run the key with: a key `:finish_by` gave more cores to is
+        # not then refused for the time it would have taken on fewer.
+        base_time = need_time
+        need_time = key -> _pool_min_time(pool, key, opts.deadline, base_time)
+    end
+    fits = _fits(opts, need_time)
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
     scan = _scan!(table, vault, stage, log, opts)
     scan_secs = time() - t_scan
@@ -615,6 +622,9 @@ function run!(
         master.interval > 0 && status_tick!(master, log)
         # A master of its own ends here; one handed in (`run_loop!`) reports when the loop ends.
         own && log_event(log, :job_account; stage=stage, account=account_snapshot(master))
+        # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
+        # when IT returns).
+        (own && pool !== nothing && !pool.keep) && shutdown!(pool)
     end
 
     # Aggregate outcomes into counters + manifest updates.
@@ -1201,6 +1211,7 @@ function _drive_workers!(
     idle = Condition()
     stopped = Ref(false)
     rid = rand(UInt64)
+    unidentified = Set{Int}()
     # With a pool: whether anything is queued, kept by the ticker, so a dispatch task whose size
     # fits nothing right now waits for a key that will come back rather than leaving.
     queued_now = Ref(pool !== nothing)
@@ -1244,6 +1255,8 @@ function _drive_workers!(
                 break
             end
             host in c.drained && break
+            # The pool retires its own workers; the task only has to leave.
+            (pool !== nothing && _pool_retiring(pool, pid)) && break
             accept = if pool === nothing
                 nothing
             else
@@ -1366,17 +1379,41 @@ function _drive_workers!(
     function _adopt!()
         # `workers()` is `[1]` when there are none: the master is not one of its own workers.
         fresh = [p for p in workers() if !(p in started) && p != myid()]
+        # A worker the pool is still starting is visible here before the pool knows its size;
+        # it gets a dispatch task once it is registered, not before.
+        pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)
         isempty(fresh) && return nothing
         late = !isempty(started)
-        union!(started, fresh)
-        # A pool's workers were started after `run!` readied the ones it found, the first ones too.
-        ready = ((late || pool !== nothing) && prepare !== nothing) ? prepare(fresh) : fresh
+        # Workers `run!` found were readied by it; a pool's own, and any that join later, here.
+        mine = pool === nothing ? Int[] : [p for p in fresh if !(p in pool.foreign)]
+        ready = if prepare === nothing
+            fresh
+        elseif late
+            prepare(fresh)
+        else
+            vcat(setdiff(fresh, mine), isempty(mine) ? Int[] : prepare(mine))
+        end
         _identify_workers!(master, ready)
         who = lock(() -> copy(master.who), master.lock)
         n = 0
         for pid in ready
             w = get(who, pid, nothing)
-            w === nothing && continue
+            if w === nothing
+                # Could not say who it is: asked again next tick, and said once.
+                if !(pid in unidentified)
+                    push!(unidentified, pid)
+                    log_event(
+                        log,
+                        :workers_rejected;
+                        level=:warn,
+                        stage=stage,
+                        n=1,
+                        err="worker $pid did not answer who it is; it gets no work until it does",
+                    )
+                end
+                continue
+            end
+            push!(started, pid)
             n += 1
             push!(tasks, @async try
                 _loop(pid, w.host, w.pid)
@@ -1389,7 +1426,8 @@ function _drive_workers!(
         return nothing
     end
 
-    pool === nothing || _pool_tick!(pool, table, master, log, stage, opts, min_time)
+    pool === nothing ||
+        _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
     _adopt!()
     done = Ref(false)
     idle_since = Ref(0.0)
@@ -1405,7 +1443,7 @@ function _drive_workers!(
                 master, table, log, opts; affinity=affinity, force=pool === nothing
             )
             if pool !== nothing
-                _pool_tick!(pool, table, master, log, stage, opts, min_time)
+                _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
                 queued_now[] = _pool_wants(pool, table)
             end
             _adopt!()
@@ -1449,6 +1487,22 @@ function _drive_workers!(
         end
     end
     failure === nothing || throw(failure)
+    # A pool that cannot start workers is not a round that ended: said, and an error.
+    if pool !== nothing && _pool_gave_up(pool) && _has_queued(table)
+        log_event(
+            log,
+            :pool_gave_up;
+            level=:error,
+            stage=stage,
+            fails=pool.fails,
+            queued=count(r -> r.state === :todo, table.rows),
+        )
+        error(
+            "SizedPool: $(pool.fails) worker starts failed in a row with keys still queued. " *
+            "The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
+            "\"pool_spawn_short\").",
+        )
+    end
 
     # Keys still queued with nobody left to take them. Under a stop they are attributed to it;
     # otherwise every worker died (or was drained or retired) while they were pending: they were
@@ -1714,6 +1768,17 @@ round found held by a sibling, so a caller can tell "everything is done" from "s
 has work out". `ran` is `false` exactly when a prerequisite blocked the stage.
 """
 function run_loop!(
+    work_fn::Function, vault::Vault, keys::AbstractVector{DataKey}; pool=nothing, kwargs...
+)
+    try
+        return _run_loop!(work_fn, vault, keys; pool=pool, kwargs...)
+    finally
+        # Whatever way the loop ended, the pool's workers do not outlive it.
+        (pool !== nothing && !pool.keep) && shutdown!(pool)
+    end
+end
+
+function _run_loop!(
     work_fn::Function,
     vault::Vault,
     keys::AbstractVector{DataKey};
