@@ -266,3 +266,27 @@ end
         @test isempty(SweepRunner._out_tokens())
     end
 end
+
+@testset "one reading of the allocation's cores, and of a key's lock (#116)" begin
+    @test SweepRunner._slurm_cpus_per_node("128(x2),64") == [128, 128, 64]
+    @test SweepRunner._slurm_cpus_per_node("") == Int[]
+    @test SweepRunner._slurm_cpus_per_node("many") === nothing
+    # The status takes what cannot be read as "not known"; the pool, which places by it, refuses.
+    withenv("SLURM_JOB_CPUS_PER_NODE" => "128(x2),64") do
+        @test SweepRunner._slurm_alloc_cores() == 320
+    end
+    withenv("SLURM_JOB_CPUS_PER_NODE" => "many") do
+        @test SweepRunner._slurm_alloc_cores() == 0
+    end
+    @test_throws ErrorException SweepRunner._expand_slurm_counts("many", 1)
+    _lk_vault() do v, _
+        k = DataVault.keys(v)[1]
+        @test SweepRunner._lock_now(v, k) === nothing
+        tok = owner_token()
+        @test DataVault.acquire_running!(v, k, tok) === :ok
+        lk = SweepRunner._lock_now(v, k)
+        @test lk.owner == tok && 0 <= lk.age < 60
+        DataVault.clear_running!(v, k, tok)
+        @test SweepRunner._lock_now(v, k) === nothing
+    end
+end

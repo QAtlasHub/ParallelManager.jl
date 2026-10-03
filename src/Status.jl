@@ -90,15 +90,10 @@ end
 
 # `128(x72)`, `64(x2),32` → total cores of the allocation, or 0 when it cannot be read.
 function _slurm_alloc_cores()::Int
-    s = get(ENV, "SLURM_JOB_CPUS_PER_NODE", "")
-    isempty(s) && return 0
-    total = 0
-    for part in split(s, ',')
-        m = match(r"^(\d+)(?:\(x(\d+)\))?$", strip(part))
-        m === nothing && return 0
-        total += parse(Int, m[1]) * (m[2] === nothing ? 1 : parse(Int, m[2]))
-    end
-    return total
+    # A view of the job, so a value it cannot read is "not known" (0), where the pool, which
+    # has to place workers by it, refuses.
+    counts = _slurm_cpus_per_node(get(ENV, "SLURM_JOB_CPUS_PER_NODE", ""))
+    return counts === nothing ? 0 : sum(counts; init=0)
 end
 
 """
