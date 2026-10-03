@@ -379,6 +379,61 @@ function reap_dead_locks!(
     return (; lock_summary(infos)..., reaped=reaped)
 end
 
+"""
+    reap_dead_locks!(vault; stale_after=600.0, log=nothing) -> NamedTuple
+    reap_dead_locks!(outdir::AbstractString; stale_after=600.0, log=nothing) -> NamedTuple
+
+The same for EVERY `.running` under the vault's status directory (or under a whole `outdir`),
+found by path: locks on keys no current run lists are reached too, which the form that takes
+`keys` cannot do. Only a lock judged `:dead` — its holder shown to be gone — is removed; `:stale`
+and `:unknown` are left for `stale_after` and the next `run!`.
+
+Returns the [`lock_summary`](@ref) of what it found, with `reaped` and `failed`. The removal is
+DataVault's owner-checked release (the file is moved aside, checked to be that owner's, then
+removed), so a lock someone reclaimed in between is put back.
+"""
+function reap_dead_locks!(
+    vault::Vault; stale_after::Real=600.0, log::Union{EventLog,Nothing}=nothing
+)
+    dir = joinpath(vault.outdir, "status", vault.spec.study.project_name, vault.run)
+    return _reap_under!(dir, read_status(vault), stale_after, log)
+end
+
+function reap_dead_locks!(
+    outdir::AbstractString; stale_after::Real=600.0, log::Union{EventLog,Nothing}=nothing
+)
+    return _reap_under!(joinpath(outdir, "status"), read_status(outdir), stale_after, log)
+end
+
+function _reap_under!(dir::AbstractString, masters, stale_after, log)
+    infos = _locks_under(dir, masters, stale_after)
+    reaped = failed = 0
+    for info in infos
+        (info.verdict === :dead && info.owner !== nothing) || continue
+        path = joinpath(dir, info.key)                # `_locks_under` names a lock by its path
+        ok = try
+            DataVault._release_lock_at!(path, info.owner)
+        catch e
+            e isa InterruptException && rethrow()
+            log === nothing ||
+                log_event(log, :reap_failed; lock=info.key, err=_short_err(e))
+            failed += 1
+            continue
+        end
+        ok || continue                                # released or reclaimed meanwhile
+        reaped += 1
+        log === nothing || log_event(
+            log,
+            :lock_reaped;
+            lock=info.key,
+            owner=info.owner,
+            why=info.why,
+            age=round(Int, info.age),
+        )
+    end
+    return (; lock_summary(infos)..., reaped=reaped, failed=failed)
+end
+
 # Remove one lock judged `:dead`. Nothing here may be fatal: reaping is an optimisation over
 # `stale_after`, and an unlink that fails must not take the round with it.
 function _reap!(vault::Vault, key::DataKey, info::LockInfo, stage::Symbol, log)::Bool

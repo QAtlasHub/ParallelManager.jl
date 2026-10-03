@@ -252,6 +252,18 @@ From Julia: `SweepRunner.locks(vault, keys)` (or `SweepRunner.locks(vault)`,
 `SweepRunner.locks(outdir)`; the name is not exported) returns
 [`LockInfo`](@ref SweepRunner.LockInfo) records and removes nothing;
 `reap_dead_locks!(vault, keys)` removes the dead ones without running anything.
+Without `keys` — `reap_dead_locks!(vault)`, `reap_dead_locks!(outdir)`, or from a
+shell `sweeprunner locks <outdir> --reap` — it does so for every lock under the
+vault, also on keys no current run lists. Only locks judged **dead** are
+removed; stale and unknown ones are left to `stale_after`.
+
+**Alive but not advancing.** `RunOpts(stuck_after = 1800)` turns an old progress
+stamp into a verdict: a running key that has reported nothing for that long gets
+a `key_stuck` warning in the event log (once), a `stuck` mark on its worker's
+row in `sweeprunner status --workers`, and a line in the warnings. Nothing is
+cut; `control!(…, :stop; keys = …, grace = …)` is how you act on it. It needs a
+`work_fn` that reports (`report_progress` or `save_checkpoint!`); set it above
+the longest step between two reports. Off by default.
 
 **When a master leaves** it releases the locks it still has out — at the end
 of a round there are none, on an exception or the scheduler's SIGTERM there

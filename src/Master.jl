@@ -184,6 +184,12 @@ mutable struct Master
     collisions::Int
     short_since::Float64
     short_logged::Tuple{Int,Int,Int}
+    # `RunOpts.stuck_after`, and the keys already reported as stuck (said once each).
+    stuck_after::Float64
+    stuck_said::Set{String}
+    # key => when it was last seen to advance in this attempt. Kept here because the stamp it
+    # comes from is removed as the key finishes, a moment before its row is settled.
+    advanced::Dict{String,Float64}
 end
 
 function Master()
@@ -213,6 +219,9 @@ function Master()
         0,
         0.0,
         (-1, -1, -1),
+        0.0,
+        Set{String}(),
+        Dict{String,Float64}(),
     )
 end
 

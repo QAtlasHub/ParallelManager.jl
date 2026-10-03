@@ -22,7 +22,8 @@ using ParamIO: DataKey, canonical
              stop_flag=ENV["SWEEPRUNNER_STOP_FLAG"], log_level=:info, deadline=nothing,
              defer_poll=30.0, status_interval=60.0, control_interval=10.0,
              min_busy_fraction=0.0, idle_grace=600.0, checkpoint_every=600.0,
-             stop_grace=Inf, shard=<env>, order=:given, manifest_interval=300.0)
+             stop_grace=Inf, shard=<env>, order=:given, manifest_interval=300.0,
+             stuck_after=0.0)
 
 Execution options for [`run!`](@ref).
 
@@ -123,6 +124,13 @@ The numbers are checked when the options are built: `max_attempts >= 1`; `stale_
   manifest WHILE the round runs. The manifest used to be written only when a round ended, so a
   job killed at its wall clock left none of its completions there and the next job found them
   again one marker at a time. `0` writes it at the end only.
+- `stuck_after::Float64 = 0.0` — a running key that has reported no progress for this many
+  seconds (since it started, or since its last [`report_progress`](@ref) /
+  [`save_checkpoint!`](@ref)) is said to be stuck: a `key_stuck` warning in the event log, once
+  per key, and `stuck` on its worker's row in the status, with a line in the warnings. Nothing
+  is cut — a heartbeat only shows the process is alive, and this is the missing half, "alive
+  and not advancing", left for a person or a [`control!`](@ref) request to act on. Set it above
+  the longest step your `work_fn` takes between two reports. `0` (the default) never says it.
 
 # Example
 
@@ -150,6 +158,7 @@ struct RunOpts
     shard::Union{Tuple{Int,Int},Nothing}
     order::Symbol
     manifest_interval::Float64
+    stuck_after::Float64
 end
 
 # `time()` was past this in 2001: an absolute deadline below it was meant as a duration.
@@ -174,6 +183,7 @@ function RunOpts(;
     shard::Union{Tuple{<:Integer,<:Integer},Nothing}=_shard_from_env(),
     order::Symbol=:given,
     manifest_interval::Real=300.0,
+    stuck_after::Real=0.0,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -214,6 +224,7 @@ function RunOpts(;
         ("checkpoint_every", checkpoint_every),
         ("idle_grace", idle_grace),
         ("stop_grace", stop_grace),
+        ("stuck_after", stuck_after),
     )
         x >= 0 ||
             throw(ArgumentError("RunOpts: $name must be >= 0 seconds (0: off), got $x"))
@@ -269,6 +280,7 @@ function RunOpts(;
         shard === nothing ? nothing : (Int(shard[1]), Int(shard[2])),
         order,
         Float64(manifest_interval),
+        Float64(stuck_after),
     )
 end
 
@@ -532,6 +544,7 @@ function run!(
     master.stage = String(stage)
     master.multi = multi
     master.interval = opts.status_interval
+    master.stuck_after = opts.stuck_after
     spawn === nothing || (master.ctl.spawn = spawn)
     after = own ? :ended : :waiting
     # Requests made while no round was running (between rounds, or just before this call), and

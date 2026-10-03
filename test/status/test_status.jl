@@ -164,6 +164,57 @@ end
     end
 end
 
+@testset "status: a running key with no progress for stuck_after is said, once (#112)" begin
+    @test_throws ArgumentError RunOpts(; stuck_after=-1)
+    _st_workers(2) do
+        _st_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            advancing = ParamIO.canonical(ks[1])
+            work =
+                k -> begin
+                    for step in 1:10
+                        # One key keeps reporting; the other is alive and says nothing.
+                        ParamIO.canonical(k) == advancing &&
+                            SweepRunner.report_progress(step; of=10)
+                        sleep(0.3)
+                    end
+                    return Dict{String,Any}("x" => 1)
+                end
+            # Once through on other keys first: a worker's first key spends seconds compiling,
+            # which is no progress either, and not what this is about.
+            run!(work, v, DataVault.keys(v)[3:4])
+            opts = RunOpts(; status_interval=0.2, stuck_after=1.5)
+            t = @async run!(work, v, ks; opts=opts)
+            flagged = nothing
+            t0 = time()
+            while !istaskdone(t) && time() - t0 < 120
+                st = read_status(v)
+                if !isempty(st)
+                    rows = [r for r in st[1]["worker_table"] if haskey(r, "stuck")]
+                    if !isempty(rows)
+                        flagged = (rows, st[1]["warnings"])
+                        break
+                    end
+                end
+                sleep(0.1)
+            end
+            r = fetch(t)
+            @test r.done == 2                                 # said, not cut
+            @test flagged !== nothing
+            if flagged !== nothing
+                @test only(flagged[1])["key"] == ParamIO.canonical(ks[2])
+                @test any(w -> startswith(w, "stuck: 1 running key"), flagged[2])
+            end
+            ev = [e for e in _st_events(outdir) if e.kind == "key_stuck"]
+            @test [e.key for e in ev] == [ParamIO.canonical(ks[2])]   # once, and not ks[1]
+            @test only(ev).secs >= 1
+            @test only(ev).stuck_after == 1.5
+            # When it ended, nothing is stuck any more.
+            @test !any(w -> startswith(w, "stuck"), only(read_status(v))["warnings"])
+        end
+    end
+end
+
 @testset "status: fewer workers joined than planned is said out loud, once" begin
     _st_workers(2) do
         _st_vault() do v, outdir
