@@ -359,7 +359,8 @@ function run!(
     # The master's view of the round: one pass over the markers, then the queue the dispatcher
     # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
-    _scan!(table, vault, stage, log, opts)
+    scan = _scan!(table, vault, stage, log, opts)
+    master.locks = Dict{String,Any}(String(k) => v for (k, v) in pairs(scan))
     master.table = table
     master.state = :running
     _identify_workers!(master, multi ? workers() : [myid()])
@@ -373,8 +374,13 @@ function run!(
             return _dispatch!(drive, table, vault, stage, log, opts)
         end
     finally
-        # Also on the way out through an exception: a status that still says `running` after the
-        # master has left is the one thing it must not say.
+        # A master that is leaving says so. On the way out through an exception (an interrupt, a
+        # failed worker bootstrap) there can be keys still out: the locks this master named for
+        # them are released now, and each key that was cut is logged, rather than left on disk
+        # for whoever trips over them.
+        _release_running!(table, vault, stage, log)
+        # A status that still says `running` after the master has left is the one thing it must
+        # not say.
         master.state = after
         master.interval > 0 && status_tick!(master, log)
     end
@@ -564,9 +570,12 @@ end
 # What `_scan_row!` found for one key.
 #   :done   — finished already (by a sibling, since the manifest was written)
 #   :free   — no lock; queue it
-#   :reaped — a lock whose holder is provably gone was removed; queue it
-#   :stale  — a lock past `stale_after`; queue it, `acquire_running!` reclaims
-#   :held   — a live or not-yet-stale lock; do not queue it this pass
+#   :reaped — a lock whose holder is positively gone was removed; queue it
+#   :stale  — nobody answered for it and it is past `stale_after`; queue it, `acquire_running!`
+#             reclaims
+#   :held   — held, or not decidable yet; do not queue it this pass
+#
+# `masters` is a thunk: the masters' status files are read only if a lock turns up, and once.
 function _scan_row!(
     table::TaskTable,
     i::Int,
@@ -575,6 +584,8 @@ function _scan_row!(
     log::EventLog,
     opts::RunOpts,
     progress::Dict{String,Progress},
+    masters,
+    infos::Vector{LockInfo},
 )::Symbol
     r = table.rows[i]
     if DataVault.is_done(vault, r.key)
@@ -583,35 +594,71 @@ function _scan_row!(
     end
     r.progress = get(progress, r.kstr, nothing)
     DataVault.is_running(vault, r.key) || return :free
-    _reap_if_dead!(vault, r.key, stage, log) && return :reaped
-    DataVault.running_age_secs(vault, r.key) > opts.stale_after && return :stale
-    hold!(table, i, DataVault.running_owner(vault, r.key))
+    owner = DataVault.running_owner(vault, r.key)
+    age = DataVault.running_age_secs(vault, r.key)
+    isfinite(age) || return :free                     # released between the two reads
+    info = _lock_info(r.kstr, owner, age, masters(), _NO_PAGES, opts.stale_after)
+    push!(infos, info)
+    if info.verdict === :dead
+        # Owner-checked: `false` means the lock changed hands since it was judged, and whoever
+        # has it now is asked about on the next pass.
+        _reap!(vault, r.key, info, stage, log) && return :reaped
+    elseif info.verdict === :stale
+        return :stale
+    end
+    hold!(table, i, owner)
     log_event(log, :lock_busy; level=:debug, stage=stage, key=r.kstr)
     return :held
+end
+
+const _NO_PAGES = Dict{String,Float64}()
+
+# The masters' statuses, read at most once per scan and only if a lock is found.
+function _lazy_masters(vault::Vault)
+    cache = Ref{Any}(nothing)
+    return () -> begin
+        cache[] === nothing && (cache[] = read_status(vault))
+        return cache[]
+    end
 end
 
 """
     _scan!(table, vault, stage, log, opts) -> NamedTuple
 
-The master's one pass over the markers: every queued row is checked for a `.done` written since
-the manifest and for a `.running` lock, and the recorded progress is attached. Returns
-`(; done, held, reaped, stale)`.
+The master's one pass over the markers, before the queue is drawn: every queued row is checked for
+a `.done` written since the manifest and for a `.running` lock, and the recorded progress is
+attached. Each lock found is judged ([`judge_lock`](@ref)): one that is positively dead is removed
+and its key queued, one that is held is kept out of the queue. Returns
+`(; done, locks, held, held_jobs, reaped, dead_jobs, stale, unknown)`, and logs it as
+`locks_reconciled` when there was any lock.
 
-This is the read the workers used to do one key at a time. A key that turns out to be locked by a
-live sibling is not dispatched at all.
+This is the read the workers used to do one key at a time, and the reconciliation a job that
+starts used to skip: it joined a vault without knowing whose locks were in it.
 """
 function _scan!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts)
     progress = read_progress(vault)
-    done = held = reaped = stale = 0
+    masters = _lazy_masters(vault)
+    infos = LockInfo[]
+    done = reaped = 0
     for i in eachindex(table.rows)
         table.rows[i].state === :todo || continue
-        s = _scan_row!(table, i, vault, stage, log, opts, progress)
+        s = _scan_row!(table, i, vault, stage, log, opts, progress, masters, infos)
         s === :done && (done += 1)
-        s === :held && (held += 1)
         s === :reaped && (reaped += 1)
-        s === :stale && (stale += 1)
     end
-    return (; done, held, reaped, stale)
+    sm = lock_summary(infos)
+    out = (;
+        done=done,
+        locks=length(infos),
+        held=sm.held,
+        held_jobs=sm.held_jobs,
+        reaped=reaped,
+        dead_jobs=sm.dead_jobs,
+        stale=sm.stale,
+        unknown=sm.unknown,
+    )
+    isempty(infos) || log_event(log, :locks_reconciled; stage=stage, out...)
+    return out
 end
 
 # How many times a drained queue looks again at the keys it could not get. Their holder may have
@@ -626,9 +673,11 @@ function _rescan_busy!(
     busy = [i for (i, r) in enumerate(table.rows) if r.outcome === :lock_busy]
     isempty(busy) && return 0
     progress = read_progress(vault)
+    masters = _lazy_masters(vault)
+    infos = LockInfo[]
     n = 0
     for i in busy
-        s = _scan_row!(table, i, vault, stage, log, opts, progress)
+        s = _scan_row!(table, i, vault, stage, log, opts, progress, masters, infos)
         (s === :free || s === :reaped || s === :stale) || continue
         requeue!(table, i)
         n += 1
@@ -705,17 +754,24 @@ function _drive_sequential!(
         row = table.rows[i]
         tok = owner_token()
         start_task!(table, i, tok, myid())
-        (_, outcome) = _run_one_with_lock!(
-            work_fn,
-            vault,
-            row.key,
-            stage,
-            log,
-            opts;
-            tok=tok,
-            resume=row.progress,
-            reap=false,
-        )
+        _out_add!(tok, vault, row.key)
+        outcome = try
+            last(
+                _run_one_with_lock!(
+                    work_fn,
+                    vault,
+                    row.key,
+                    stage,
+                    log,
+                    opts;
+                    tok=tok,
+                    resume=row.progress,
+                    reap=false,
+                ),
+            )
+        finally
+            _out_remove!(tok)
+        end
         settle!(table, i, outcome)
     end
     return nothing
@@ -743,6 +799,27 @@ function _release_dead!(
         log_event(log, :reap_failed; stage=stage, key=row.kstr, err=_short_err(e))
     end
     return nothing
+end
+
+# Release the lock of every row that is still out, and say which keys were cut. A normal round
+# has none: this is for a master leaving through an exception.
+function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog)
+    cut = [(i, r) for (i, r) in enumerate(table.rows) if r.state === :running]
+    for (i, r) in cut
+        tok = r.owner
+        tok === nothing && continue
+        try
+            DataVault.clear_running!(vault, r.key, tok)
+            log_event(
+                log, :lock_released; stage=stage, key=r.kstr, owner=tok, why="master_exit"
+            )
+        catch e
+            e isa InterruptException && rethrow()
+        end
+        _out_remove!(tok)
+        settle!(table, i, :lock_busy)
+    end
+    return length(cut)
 end
 
 """
@@ -800,6 +877,7 @@ function _drive_workers!(
             row = table.rows[i]
             tok = owner_token(host, ospid)
             start_task!(table, i, tok, pid)
+            _out_add!(tok, vault, row.key)
             out[] += 1
             died = false
             outcome = try
@@ -849,6 +927,7 @@ function _drive_workers!(
                 end
             finally
                 out[] -= 1
+                _out_remove!(tok)
             end
             if outcome === nothing
                 # What it had reported before it died is where the next worker starts.

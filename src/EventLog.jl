@@ -46,9 +46,13 @@ stay within that guarantee.
 |                 | scan before dispatch, or by a worker's acquire (= `:busy`)         |
 | `lock_lost`     | our lock was reclaimed mid-work; result discarded (no double-run) |
 | `lock_reaped`   | a lock whose holder was shown dead was cleared without waiting     |
+|                 | (includes `owner`, and `why`: the evidence)                        |
+| `locks_reconciled` | the master's pass over the locks before it built its queue, when |
+|                 | there was any (includes `locks`, `held`, `held_jobs`, `reaped`,    |
+|                 | `dead_jobs`, `stale`, `unknown`)                                   |
 | `reap_failed`   | reaping threw; the key falls back to the `stale_after` timeout     |
-| `lock_released` | the master took back a lock it had named (includes `why`, e.g.     |
-|                 | `worker_exited`)                                                   |
+| `lock_released` | the master took back a lock it had named (includes `why`:          |
+|                 | `worker_exited`, or `master_exit` for a key cut when it left)      |
 | `lock_reclaimed`| (reserved, not currently emitted)                                 |
 | `error`         | `work_fn` threw on this attempt                                   |
 | `retry`         | another attempt will follow                                       |

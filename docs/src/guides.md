@@ -200,3 +200,53 @@ the ramp-up that stops at half its workers no longer does so silently.
 A master whose file has not been rewritten for three intervals, and which did
 not write `ended`, is shown as `GONE`: killed at the wall clock, or its node
 was lost.
+
+## 10. Whose locks are these?
+
+A `.running` file says a key is being computed. Whether that is still true
+used to be guessed from the heartbeat's age and from `squeue`. It is now asked
+of the holder's master: a master names every lock before its worker takes it
+and lists the ones it has out in its status file, so
+
+- a master that is reporting and lists the token → **held**;
+- a master that knows the holder process, reported after the lock's last
+  heartbeat, and does not list it → **dead**, at once (a worker killed inside a
+  job that is otherwise alive, or a master that ended);
+- nobody to ask → the scheduler and the pid, as before, and after them the
+  heartbeat's age: **stale** past `stale_after`, **unknown** before.
+
+A lock is removed only on a positive answer that its holder is gone.
+
+**When a job starts** it makes one pass over the locks before it builds its
+queue: dead ones are removed and their keys queued, held ones are kept out of
+the queue. The totals go to the event log (`locks_reconciled`) and the status:
+
+```
+  locks    260 held by 3 job(s), 17 reaped (4 dead job(s)), 0 stale, 0 unknown
+```
+
+**At any time**, from a login node:
+
+```sh
+bin/sweeprunner locks out/campaign
+```
+
+```
+locks: 260 held by 3 job(s), 17 dead (4 dead job(s)), 0 stale, 0 unknown
+  dead    pm/phase1/N=8_J=1.0/sample_001.running  c014:5512 job 3087801  heartbeat 28911 s ago  (holder is gone (scheduler / pid))
+  held    pm/phase1/N=8_J=0.5/sample_001.running  c031:7120 job 3087883  heartbeat 41 s ago  progress 2630 s ago  (master c001_41233 has it out)
+```
+
+`heartbeat` fresh with `progress` old is a computation that is alive and not
+advancing (the heartbeat is written by a child process; progress is written by
+the computation, see [`report_progress`](@ref SweepRunner.report_progress)).
+
+From Julia: `locks(vault, keys)` (or `locks(vault)`, `locks(outdir)`) returns
+[`LockInfo`](@ref SweepRunner.LockInfo) records and removes nothing;
+`reap_dead_locks!(vault, keys)` removes the dead ones without running anything.
+
+**When a master leaves** it releases the locks it still has out — at the end
+of a round there are none, on an exception or the scheduler's SIGTERM there
+can be — and logs each key that was cut (`lock_released`, `why=master_exit`).
+Orphans are then what a `kill -9` or a lost node leaves, not what every wall
+clock leaves.
