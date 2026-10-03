@@ -412,6 +412,100 @@ end
     end
 end
 
+@testset "a unit sees a stop for its node, and a cancel that covers running units" begin
+    _ct_vault() do v, _
+        ks = DataVault.keys(v)
+        # A stop scoped to this node: the unit on it leaves, and the node is drained.
+        work = k -> begin
+            control!(v, :stop; node=gethostname())
+            stop_point(; poll=0)
+            return _ct_ok(k)
+        end
+        r = run!(work, v, ks[1:1]; opts=_ct_opts())
+        @test (r.done, r.stop) == (0, 1)
+        @test gethostname() in only(read_status(v))["control"]["drained"]
+        # A stop for some other node is not for this unit.
+        r = run!(
+            k -> (control!(v, :stop; node="elsewhere"); stop_point(; poll=0); _ct_ok(k)),
+            v,
+            ks[1:1];
+            opts=_ct_opts(),
+        )
+        @test r.done == 1
+    end
+    _ct_vault() do v, _
+        ks = DataVault.keys(v)
+        sel = Dict(String(n) => val for (n, val) in ks[1].params)
+        # cancel with running=true reaches the unit that is running; without it, it does not.
+        r = run!(
+            k -> (control!(v, :cancel; select=sel); stop_point(; poll=0); _ct_ok(k)),
+            v,
+            ks[1:1];
+            opts=_ct_opts(),
+        )
+        @test r.done == 1
+    end
+    _ct_vault() do v, _
+        ks = DataVault.keys(v)
+        sel = Dict(String(n) => val for (n, val) in ks[1].params)
+        work = k -> begin
+            control!(v, :cancel; select=sel, running=true)
+            stop_point(; poll=0)
+            return _ct_ok(k)
+        end
+        r = run!(work, v, ks[1:1]; opts=_ct_opts())
+        @test (r.done, r.stop) == (0, 1)
+    end
+end
+
+@testset "a request that cannot be applied is acknowledged with why, and the run goes on" begin
+    _ct_vault() do v, outdir
+        ks = DataVault.keys(v)
+        bad = joinpath(outdir, "not_a_config.toml")
+        write(bad, "this is = not [toml")
+        ids = String[]
+        work = _ct_once() do
+            push!(ids, control!(v, :enqueue; config=bad))
+            push!(ids, control!(v, :resize; n=8))           # there is no worker pool to resize
+            push!(ids, control!(v, :drain; node="c099"))
+            return nothing
+        end
+        r = run!(work, v, ks; opts=_ct_opts())
+        @test r.done == length(ks)
+        @test haskey(only(read_acks(v, ids[1]))["detail"], "error")
+        @test only(read_acks(v, ids[2]))["detail"]["unsupported"] == "no worker pool"
+        @test isempty(only(read_acks(v, ids[3]))["detail"])
+        st = only(read_status(v))
+        @test st["control"]["drained"] == ["c099"]
+        @test st["control"]["target_workers"] == 8
+        text = sprint(io -> print_status(io, v))
+        @test occursin("control  ", text) && occursin("drained: c099", text)
+    end
+end
+
+@testset "workers: a spawn hook that fails is logged, and the round is not disturbed" begin
+    _ct_workers(1) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)
+            work = k -> (sleep(0.5); Dict{String,Any}("x" => 1))
+            t = @async run!(
+                work,
+                v,
+                ks;
+                opts=RunOpts(; control_interval=0.2),
+                spawn=n -> error("no more nodes"),
+            )
+            sleep(0.4)
+            control!(v, :resize; n=3)
+            r = fetch(t)
+            @test r.done == length(ks)
+            failed = only([e for e in _ct_events(outdir) if e.kind == "spawn_failed"])
+            @test failed.n == 2
+            @test occursin("no more nodes", failed.err)
+        end
+    end
+end
+
 @testset "cli: requests from a shell" begin
     _ct_vault() do v, outdir
         io = IOBuffer()
