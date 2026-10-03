@@ -54,4 +54,7 @@ rather than maintaining its own `locks/` tree.
 
 - The `Manifest` is **monotonic** (keys only added); multi-master coordination
   uses `mkdir` / atomic `rename` only (NFS-safe) — no `flock`, no central service.
-- Run the suite locally before pushing.
+- Run the test FILE you touched locally (`julia --project=<throwaway env> test/run/test_x.jl`),
+  then push: the full suite is CI's, sharded, on every PR and on pushes to `main` and `next`.
+- A release is collected on `next`: feature PRs target `next`, and one PR `next → main` carries
+  the version bump.
