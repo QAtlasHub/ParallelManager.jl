@@ -251,6 +251,87 @@ end
     end
 end
 
+@testset "a key that has shown it checkpoints needs only the time to its next one (#114)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:4]
+        whole = k -> 1000.0                                  # every key is longer than the job
+        # The first key keeps a checkpoint and is cut; the second never ran.
+        work1 = k -> begin
+            save_checkpoint!(SweepRunner.checkpoint(), 1; step=1, of=3)
+            error("cut")
+        end
+        run!(work1, v, ks[1:1]; opts=_dp_quiet(; max_attempts=1))
+        ran = String[]
+        r = run!(
+            _dp_rec(ran),
+            v,
+            ks;
+            opts=_dp_quiet(; deadline=time() + 120, checkpoint_every=30.0),
+            cost=whole,
+        )
+        # 30 s to its next checkpoint fits in 120 s; 1000 s for a key with no record does not.
+        @test ran == [ParamIO.canonical(ks[1])]
+        @test (r.done, r.held_back) == (1, 3)
+        # With an explicit min_time the caller's answer stands.
+        ran2 = String[]
+        r = run!(
+            _dp_rec(ran2),
+            v,
+            ks;
+            opts=_dp_quiet(; deadline=time() + 120, checkpoint_every=30.0),
+            cost=whole,
+            min_time=k -> 1.0,
+        )
+        @test r.done == 3
+    end
+end
+
+@testset "options the round does not act on are said (#114)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:2]
+        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(; order=:longest_first))
+        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
+        @test [e.option for e in ev] == ["order=:longest_first"]
+    end
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:2]
+        run!(
+            _dp_rec(String[]),
+            v,
+            ks;
+            opts=_dp_quiet(; workers=:sequential),
+            affinity=k -> 1,
+            spawn=n -> nothing,
+        )
+        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
+        @test Set(e.option for e in ev) == Set(["affinity", "spawn"])
+    end
+    _dp_vault() do v, outdir
+        # Nothing asked for, nothing said; and a cost makes the order real.
+        ks = DataVault.keys(v)[1:2]
+        run!(
+            _dp_rec(String[]), v, ks; opts=_dp_quiet(; order=:longest_first), cost=k -> 1.0
+        )
+        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(), affinity=k -> 1)
+        @test !any(e -> e.kind == "option_ignored", _dp_events(outdir))
+    end
+end
+
+@testset "run_loop! returns the collisions of all its rounds (#114)" begin
+    _dp_vault() do v, _
+        ks = DataVault.keys(v)[1:3]
+        sib = owner_token()
+        work = k -> begin
+            k == ks[1] && DataVault.acquire_running!(v, ks[2], sib)
+            k == ks[3] && DataVault.clear_running!(v, ks[2], sib)
+            return Dict{String,Any}("x" => 1)
+        end
+        r = run_loop!(work, v, ks; opts=_dp_quiet(), idle_sleep=0.05)
+        @test r.collisions == 1
+        @test (r.done, r.remaining) == (3, 0)
+    end
+end
+
 @testset "run_loop! does not sit out idle rounds over keys that cannot fit" begin
     _dp_vault() do v, _
         ks = DataVault.keys(v)

@@ -397,7 +397,8 @@ A preference, not a partition: a worker is never idle while a key it may take is
 does not serialise onto the worker that opened it. When a worker has nothing from its own groups
 left it takes from the group with the most work outstanding, which spreads workers over groups.
 
-Only affects the fan-out; the sequential path visits keys in order.
+Only affects the fan-out; the sequential path visits keys in order. Keys are drawn by group, so
+`order=:longest_first` and a shard's order hold inside a group, not across groups.
 
 # The task table
 
@@ -429,6 +430,11 @@ from the same point by the next job occupies a worker for nothing. Such keys are
 `held_back`, logged once (`held_back`), and left for a job with more time. The check is made each
 time a key is handed out, so as the job runs down the long keys are passed over and the short ones
 still fill it.
+
+Without a `min_time` it is `cost`, the whole key — except for a key with a progress record
+(an earlier attempt called `save_checkpoint!` or `report_progress`): that one needs only
+`opts.checkpoint_every` to get somewhere, so a checkpointing key longer than the job is still
+advanced by it. A key with no record yet is held to its whole time.
 
 # Workers sized to their keys
 
@@ -606,10 +612,18 @@ function run!(
     # to run once to be seen.
     strict_cost = cost !== nothing || min_time !== nothing
     cost = _default_cost(vault, cost, key_class, todo, log, stage)
+    _say_ignored(log, stage, opts, cost; pool=pool, affinity=affinity, spawn=spawn)
     todo = _ordered(todo, opts, cost)
     t_scan = time()
     # Whether a key can still get somewhere before the deadline; asked at each hand-out.
-    need_time = something(min_time, cost, Returns(0.0))
+    # Without a `min_time`, the whole key (`cost`) — except for a key that has shown it keeps
+    # progress: that one needs only the time to its next checkpoint to get somewhere.
+    table_ref = Ref{Union{TaskTable,Nothing}}(nothing)
+    need_time = if min_time !== nothing
+        min_time
+    else
+        _checkpoint_aware(something(cost, Returns(0.0)), opts, table_ref)
+    end
     if pool !== nothing
         # At the size the pool will run the key with: a key `:finish_by` gave more cores to is
         # not then refused for the time it would have taken on fewer.
@@ -619,6 +633,7 @@ function run!(
     unknown = Ref(0)
     fits = _fits(opts, need_time; strict=strict_cost, unknown=unknown)
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
+    table_ref[] = table
     scan = _scan!(table, vault, stage, log, opts)
     scan_secs = time() - t_scan
     master.locks = Dict{String,Any}(String(k) => v for (k, v) in pairs(scan))
@@ -1941,7 +1956,9 @@ dependents", not a DAG.
 filter, enqueued keys, a pause — holds from round to round, and a `:stop` with no scope ends the
 loop (`stopped_by = :request`).
 
-Returns `(; ran, rounds, done, busy, err, gave_up, remaining, stopped_by, prerequisite)`. `busy`
+Returns `(; ran, rounds, done, busy, err, gave_up, remaining, collisions, stopped_by,
+prerequisite)`. `collisions` is the total over the rounds (keys handed out that another master
+had taken: what sharding is there to lower). `busy`
 is how many keys the last round found held by a sibling, so a caller can tell "everything is
 done" from "someone else still has work out". `err`, `gave_up` and `remaining` are the last
 round's: a stage whose remaining keys all fail is `done = 0, busy = 0` like a clean finish, and
@@ -1987,6 +2004,7 @@ function _run_loop!(
             err=0,
             gave_up=0,
             remaining=length(keys),
+            collisions=0,
             stopped_by=pre.stopped_by,
             prerequisite=pre,
         )
@@ -2001,6 +2019,7 @@ function _run_loop!(
     n_err = 0
     n_gave_up = 0
     n_remaining = length(keys)
+    n_collisions = 0
     busy_waited = 0.0
     # A lock is reclaimable once its heartbeat is `stale_after` old, so waiting that long is what
     # separates "a sibling is working on it" from "the holder is gone". The margin covers the round
@@ -2030,6 +2049,7 @@ function _run_loop!(
             pool=pool,
         )
         n_done += result.done
+        n_collisions += result.collisions
         n_busy = result.busy
         n_err, n_gave_up, n_remaining = result.err, result.gave_up, result.remaining
         # Every key is done. No later round can find anything, and sitting out
@@ -2100,6 +2120,7 @@ function _run_loop!(
         err=n_err,
         gave_up=n_gave_up,
         remaining=n_remaining,
+        collisions=n_collisions,
         stopped_by=stopped,
         prerequisite=pre,
     )
@@ -2149,6 +2170,53 @@ function key_seconds(f, key::DataKey)::Union{Float64,Nothing}
         e isa InterruptException && rethrow()
         return nothing
     end
+end
+
+# The default `min_time`: `whole(key)`, or `checkpoint_every` when that is shorter AND the key has
+# a progress record — written by `save_checkpoint!` / `report_progress` in an earlier attempt, so
+# the key is known to keep what it has done. A key with no record is not assumed to checkpoint:
+# started with less than its whole time left, it would lose all of it.
+function _checkpoint_aware(whole, opts::RunOpts, table_ref::Ref)
+    every = opts.checkpoint_every
+    every > 0 || return whole
+    return key -> begin
+        t = whole(key)
+        table = table_ref[]
+        table === nothing && return t
+        i = get(table.index, canonical(key), 0)
+        (i == 0 || table.rows[i].progress === nothing) && return t
+        return (t isa Real && !isnan(t)) ? min(t, every) : every
+    end
+end
+
+# Options that have no effect on the path this round takes are said, once per round: asked for
+# and silently dropped is how a sweep runs for hours in an order nobody chose.
+function _say_ignored(
+    log::EventLog,
+    stage::Symbol,
+    opts::RunOpts,
+    cost;
+    pool=nothing,
+    affinity=nothing,
+    spawn=nothing,
+)
+    said =
+        (option, why) -> log_event(
+            log, :option_ignored; level=:warn, stage=stage, option=option, why=why
+        )
+    if opts.order === :longest_first && cost === nothing
+        said(
+            "order=:longest_first",
+            "no cost to order by: pass `cost`, or `key_class` once the stage has a cost table",
+        )
+    end
+    if opts.workers === :sequential
+        why = "workers=:sequential runs the keys on the master, in order"
+        pool === nothing || said("pool", why)
+        affinity === nothing || said("affinity", why)
+        spawn === nothing || said("spawn", why)
+    end
+    return nothing
 end
 
 # `key -> Bool`: can this key still get somewhere before the deadline? Always, without one.
