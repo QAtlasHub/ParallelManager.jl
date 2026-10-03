@@ -33,9 +33,10 @@ One unit of a sweep in a [`TaskTable`](@ref).
 
 - `state` — `:todo` (queued), `:running` (handed to `worker`), `:held` (locked by another master,
   not queued), `:settled` (this round is finished with it; see `outcome`).
-- `outcome` — set when settled: `:ok`, `:already_done`, `:lock_busy`, `:deferred`, `:error`,
-  `:gave_up`, `:stop_flag`, `:stop_deadline`, `:cancelled`, `:no_fit` (not started: it could not
-  get anywhere before the deadline).
+- `outcome` — set when settled, one of `SweepRunner.OUTCOMES`: `:ok`, `:already_done`,
+  `:lock_busy`, `:deferred`, `:worker_lost`, `:error`, `:gave_up`, `:stop_flag`, `:stop_deadline`,
+  `:stop_request`, `:stopped`, `:cancelled`, `:no_fit` (not started: it could not get anywhere
+  before the deadline).
 - `owner` — the lock token: ours while `:running`, the holder's while `:held`.
 - `worker` — the Distributed id it was handed to (`0` when none).
 - `since` — `time()` at which it entered its current state.
@@ -255,12 +256,41 @@ function start_task!(t::TaskTable, i::Int, owner::AbstractString, worker::Int)
     return nothing
 end
 
+# What a row can be settled with. A closed set: `run!` counts its result by these names, and one
+# it does not know would be counted as "busy, retriable" without a word.
+const OUTCOMES = (
+    :ok,
+    :already_done,
+    :lock_busy,
+    :deferred,
+    :worker_lost,
+    :error,
+    :gave_up,
+    :stop_flag,
+    :stop_deadline,
+    :stop_request,
+    :stopped,
+    :cancelled,
+    :no_fit,
+)
+
+function _check_outcome(outcome::Symbol)
+    outcome in OUTCOMES || throw(
+        ArgumentError(
+            "TaskTable: $(repr(outcome)) is not an outcome; one of $(join(repr.(OUTCOMES), ", "))",
+        ),
+    )
+    return nothing
+end
+
 """
     settle!(table, i, outcome)
 
-This round is finished with row `i`.
+This round is finished with row `i`. `outcome` is one of `SweepRunner.OUTCOMES`; anything else is
+an `ArgumentError`.
 """
 function settle!(t::TaskTable, i::Int, outcome::Symbol)
+    _check_outcome(outcome)
     lock(t.lock) do
         r = t.rows[i]
         r.state = :settled
@@ -323,6 +353,7 @@ Settle every row still queued with `outcome` (a stop: the keys it drops are attr
 silently absent). Returns how many.
 """
 function settle_queued!(t::TaskTable, outcome::Symbol)
+    _check_outcome(outcome)
     return lock(t.lock) do
         n = 0
         for r in t.rows
@@ -352,7 +383,8 @@ function task_counts(t::TaskTable)
                 todo += 1
             elseif r.state === :running
                 running += 1
-            elseif r.state === :held
+            elseif r.state === :held || r.outcome === :lock_busy
+                # Held by a sibling, whether the scan saw the lock or a worker ran into it.
                 held += 1
             elseif r.outcome === :ok || r.outcome === :already_done
                 done += 1

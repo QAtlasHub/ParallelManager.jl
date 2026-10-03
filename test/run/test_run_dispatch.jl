@@ -51,6 +51,44 @@ _dp_rec(order) = k -> (push!(order, ParamIO.canonical(k)); Dict{String,Any}("x" 
     end
 end
 
+@testset "RunOpts: the numbers are checked when the options are built (#110)" begin
+    @test_throws ArgumentError RunOpts(; max_attempts=0)
+    @test_throws ArgumentError RunOpts(; heartbeat_interval=0)
+    @test_throws ArgumentError RunOpts(; stale_after=-1)
+    @test_throws ArgumentError RunOpts(; defer_poll=0)
+    @test_throws ArgumentError RunOpts(; defer_poll=NaN)
+    for f in (
+        :status_interval,
+        :control_interval,
+        :manifest_interval,
+        :checkpoint_every,
+        :idle_grace,
+        :stop_grace,
+    )
+        @test_throws ArgumentError RunOpts(; f => -1.0)
+        @test_throws ArgumentError RunOpts(; f => NaN)
+        @test getfield(RunOpts(; f => 0), f) == 0.0              # 0 is "off", and allowed
+    end
+    @test_throws ArgumentError RunOpts(; min_busy_fraction=1.5)
+    @test_throws ArgumentError RunOpts(; min_busy_fraction=-0.1)
+    @test RunOpts(; min_busy_fraction=1).min_busy_fraction == 1.0
+    @test_throws ArgumentError RunOpts(; workers=:threads)
+    @test_throws ArgumentError RunOpts(; log_level=:loud)
+end
+
+@testset "RunOpts: deadline is a point in time, deadline_in the seconds until it (#110)" begin
+    t0 = time()
+    o = RunOpts(; deadline_in=3600)
+    @test t0 + 3600 <= o.deadline <= time() + 3600
+    @test_throws ArgumentError RunOpts(; deadline=time() + 10, deadline_in=10)
+    @test_throws ArgumentError RunOpts(; deadline_in=-1)
+    @test_throws ArgumentError RunOpts(; deadline=NaN)
+    # A duration written where the point in time goes is accepted, as before, and said.
+    o = @test_logs (:warn, r"deadline_in = 3600") RunOpts(; deadline=3600)
+    @test o.deadline == 3600.0
+    @test_logs RunOpts(; deadline=time() - 1)                   # past, but a time: not a slip
+end
+
 @testset "_shard_of: every master agrees, and the shares are of similar size" begin
     ks = ["N=$(i);J=0.$(i);#sample=1" for i in 1:400]
     for m in (1, 2, 3, 7)
