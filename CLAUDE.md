@@ -56,6 +56,8 @@ for how the three layers fit together.
 - `SweepRunner.locks(vault[, keys] | outdir)` (not exported) / `bin/sweeprunner locks <outdir>` — every `.running`, who holds
   it and whether its holder's MASTER says it is held or dead (`judge_lock`). `run!` reconciles
   the locks before it builds its queue; `reap_dead_locks!` does it without running anything.
+  `reap_dead_locks!(vault | outdir)` / `sweeprunner locks <outdir> --reap` reach every lock under
+  the vault. `RunOpts(stuck_after=…)` says (never cuts) a running key with no progress that long.
 
 ## The `work_fn` contract — read this
 

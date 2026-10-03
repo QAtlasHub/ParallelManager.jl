@@ -176,8 +176,8 @@ function status_snapshot(m::Master)
             end
         end
     end
-    who, samples, progress = lock(m.lock) do
-        return copy(m.who), copy(m.samples), copy(m.progress)
+    who, samples, progress, advanced = lock(m.lock) do
+        return copy(m.who), copy(m.samples), copy(m.progress), copy(m.advanced)
     end
     joined = filter(p -> haskey(who, p), m.multi ? workers() : [myid()])
 
@@ -205,6 +205,10 @@ function status_snapshot(m::Master)
                 d["progress_step"] = pr.step
                 d["progress_of"] = pr.of
                 d["progress_at"] = pr.at
+            end
+            if m.stuck_after > 0
+                quiet = now - max(row.since, get(advanced, row.kstr, 0.0))
+                quiet >= m.stuck_after && (d["stuck"] = round(Int, quiet))
             end
         end
         if s !== nothing
@@ -397,6 +401,58 @@ function _check_short!(m::Master, log::EventLog)
     return nothing
 end
 
+# A key that is running and has not advanced for `stuck_after` is said, once per key: the event,
+# and a line in the status warnings for as long as it lasts. Nothing is cut.
+function _check_stuck!(m::Master, log::EventLog)
+    filter!(w -> !startswith(w, "stuck"), m.warnings)
+    (m.stuck_after > 0 && m.table !== nothing) || return nothing
+    table = m.table
+    now = time()
+    running = lock(table.lock) do
+        return [(r.kstr, r.worker, r.since) for r in table.rows if r.state === :running]
+    end
+    # How long each has gone without advancing: since it was handed out, or since the last
+    # progress it reported in this attempt (a stamp older than the hand-out is an earlier
+    # attempt's). The last advance is remembered: the stamp is removed as a key finishes, a
+    # moment before its row is settled. The two clocks are the master's and the worker's; a skew
+    # between them shows here, which is one reason `stuck_after` is minutes and not seconds.
+    stuck = lock(m.lock) do
+        filter!(kv -> any(x -> x[1] == kv[1], running), m.advanced)
+        return map(running) do (kstr, worker, since)
+            pr = get(m.progress, kstr, nothing)
+            (pr !== nothing && pr.at >= since) &&
+                (m.advanced[kstr] = max(pr.at, get(m.advanced, kstr, 0.0)))
+            return (kstr, worker, now - max(since, get(m.advanced, kstr, 0.0)))
+        end
+    end
+    filter!(x -> x[3] >= m.stuck_after, stuck)
+    now_stuck = Set(x[1] for x in stuck)
+    filter!(k -> k in now_stuck, m.stuck_said)          # one that advanced can be said again
+    isempty(stuck) && return nothing
+    push!(
+        m.warnings,
+        "stuck: $(length(stuck)) running key(s) with no progress for more than " *
+        "$(round(Int, m.stuck_after)) s",
+    )
+    for (kstr, worker, quiet) in stuck
+        kstr in m.stuck_said && continue
+        push!(m.stuck_said, kstr)
+        who = lock(() -> get(m.who, worker, nothing), m.lock)
+        log_event(
+            log,
+            :key_stuck;
+            level=:warn,
+            stage=m.stage,
+            key=kstr,
+            worker=worker,
+            host=who === nothing ? "" : who.host,
+            secs=round(Int, quiet),
+            stuck_after=m.stuck_after,
+        )
+    end
+    return nothing
+end
+
 """
     status_tick!(master, log)
 
@@ -415,6 +471,7 @@ function status_tick!(m::Master, log::EventLog)
             p = read_progress(v)
             return lock(() -> (empty!(m.progress); merge!(m.progress, p)), m.lock)
         end,
+        () -> _check_stuck!(m, log),
         () -> _check_short!(m, log),
     )
     for step in steps
@@ -618,6 +675,7 @@ function print_status(io::IO, x; workers::Bool=false)
                     lpad(secs, 11),
                     "   ",
                     key === nothing ? "(idle)" : key,
+                    haskey(r, "stuck") ? "   STUCK: no progress for $(r["stuck"]) s" : "",
                 )
             end
         end

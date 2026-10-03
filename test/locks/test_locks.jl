@@ -211,6 +211,33 @@ end
     end
 end
 
+@testset "reaping a whole outdir: dead locks on any key, found by path, and only those (#112)" begin
+    _lk_vault() do v, outdir
+        ks = DataVault.keys(v)
+        live = owner_token()
+        @test DataVault.acquire_running!(v, ks[1], live) === :ok
+        gone = map(2:3) do i
+            p = run(`sleep 0.01`; wait=false)
+            tok = string(gethostname(), ":", getpid(p), ":0000abc", i)
+            wait(p)
+            @test DataVault.acquire_running!(v, ks[i], tok) === :ok
+            tok
+        end
+        # No key is named: the form a shell uses on a vault whose runs it does not know.
+        io = IOBuffer()
+        @test SweepRunner.cli(["locks", outdir]; io=io) == 0
+        @test all(i -> DataVault.is_running(v, ks[i]), 1:3)      # without --reap: nothing
+        io = IOBuffer()
+        @test SweepRunner.cli(["locks", outdir, "--reap"]; io=io) == 0
+        @test occursin("reaped 2 of 2 dead lock(s)", String(take!(io)))
+        @test !DataVault.is_running(v, ks[2]) && !DataVault.is_running(v, ks[3])
+        @test DataVault.running_owner(v, ks[1]) == live           # held: untouched
+        r = reap_dead_locks!(v)
+        @test (r.reaped, r.dead, r.held, r.failed) == (0, 0, 1, 0)
+        DataVault.clear_running!(v, ks[1], live)
+    end
+end
+
 @testset "a master that leaves releases the locks it still has out, and says which" begin
     _lk_vault() do v, outdir
         ks = DataVault.keys(v)
