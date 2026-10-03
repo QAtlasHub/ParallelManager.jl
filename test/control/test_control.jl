@@ -512,6 +512,46 @@ end
     end
 end
 
+@testset "workers: a key cancelled while it ran is not handed out again when its worker dies (#105)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)
+            target = ks[1]
+            sel = Dict(String(n) => val for (n, val) in target.params)
+            runs = joinpath(outdir, "runs")
+            go = joinpath(outdir, "go")
+            mkpath(runs)
+            tname = ParamIO.canonical(target)
+            work = k -> begin
+                if ParamIO.canonical(k) == tname
+                    touch(joinpath(runs, string(time_ns())))
+                    while !isfile(go)
+                        sleep(0.05)
+                    end
+                    ccall(:_exit, Cvoid, (Cint,), 1)          # the worker dies under it
+                end
+                return Dict{String,Any}("x" => 1)
+            end
+            t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
+            t0 = time()
+            while isempty(readdir(runs)) && time() - t0 < 60
+                sleep(0.05)
+            end
+            id = control!(v, :cancel; select=sel)
+            while isempty(read_acks(v, id)) && time() - t0 < 60
+                sleep(0.05)
+            end
+            touch(go)
+            r = fetch(t)
+            @test length(readdir(runs)) == 1                  # it ran once, and not again
+            @test r.cancelled == 1
+            @test r.done == length(ks) - 1
+            @test !DataVault.is_done(v, target)
+            @test r.err == 0
+        end
+    end
+end
+
 @testset "cli: requests from a shell" begin
     _ct_vault() do v, outdir
         io = IOBuffer()
