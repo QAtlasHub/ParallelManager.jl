@@ -677,3 +677,54 @@ r = SweepRunner.check_checkpoints(work_fn, scratch_vault, key)
 `check_checkpoints` runs the key once straight through and once cut
 immediately after **every** `save_checkpoint!` and restarted from it, and
 compares the two results.
+
+## 17. Several masters on one sweep, and keys of very different length
+
+### Sharding the queue
+
+Several jobs running one sweep each build the same queue in the same order
+and start from its head, so they spend their first passes on each other's
+locks. Tell each which share to start on:
+
+```julia
+RunOpts(shard = (i, m))        # master i of m, 0 <= i < m
+```
+
+or set `SWEEPRUNNER_SHARD=i/m` in the batch script; a Slurm array task gets
+its share from the array on its own. A master draws the keys whose hash falls
+in its share first and the others' after, so **every master still covers every
+key** — a share is where it starts. Two masters on 24 keys, measured in the
+test suite: 23 collisions unsharded, 5 sharded.
+
+`run!` returns `collisions` (keys handed to a worker that came back because
+another master had taken them), and `stage_done` logs it, so the cost is
+visible per job.
+
+### Cost and the wall clock
+
+```julia
+run_loop!(work_fn, vault, keys;
+    opts     = RunOpts(deadline = job_end - 120, order = :longest_first),
+    cost     = SweepRunner.measured_cost(table, class; fallback = formula),  # key -> seconds
+    min_time = key -> seconds_to_next_checkpoint(key),
+)
+```
+
+- **`order = :longest_first`** draws the keys with the largest `cost` first:
+  the long keys start while there is time for them, and the short ones fill
+  what is left.
+- **A key that cannot get anywhere is not started.** With a `deadline`, a key
+  whose `min_time` (how long it needs to reach its next checkpoint; `cost`
+  when not given) exceeds the time left is passed over, counted in
+  `held_back` and logged once. The check is made at each hand-out, so as the
+  job runs down the long keys drop out and the short ones still run. This
+  replaces per-partition filters by hand: the keys that occupied half the
+  workers of every short job without advancing are the ones held back.
+- `run_loop!` returns at once (`stopped_by = :deadline`) when all that is left
+  was held back, rather than sitting out idle rounds.
+- With `RunOpts(min_busy_fraction = …)` (guide 13) the master then leaves when
+  what is running is too little to hold the allocation for.
+
+A `work_fn` that keeps a checkpoint (guide 16) needs only `checkpoint_every`
+seconds to get somewhere, so `min_time = _ -> opts.checkpoint_every` makes
+every key fit almost any job.

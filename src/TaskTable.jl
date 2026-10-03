@@ -34,7 +34,8 @@ One unit of a sweep in a [`TaskTable`](@ref).
 - `state` — `:todo` (queued), `:running` (handed to `worker`), `:held` (locked by another master,
   not queued), `:settled` (this round is finished with it; see `outcome`).
 - `outcome` — set when settled: `:ok`, `:already_done`, `:lock_busy`, `:deferred`, `:error`,
-  `:gave_up`, `:stop_flag`, `:stop_deadline`, `:cancelled`.
+  `:gave_up`, `:stop_flag`, `:stop_deadline`, `:cancelled`, `:no_fit` (not started: it could not
+  get anywhere before the deadline).
 - `owner` — the lock token: ours while `:running`, the holder's while `:held`.
 - `worker` — the Distributed id it was handed to (`0` when none).
 - `since` — `time()` at which it entered its current state.
