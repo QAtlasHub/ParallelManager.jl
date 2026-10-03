@@ -372,6 +372,94 @@ end
     end
 end
 
+@testset "_run_command: stdout of a command that succeeds, nothing for one that does not" begin
+    rc = SweepRunner._run_command
+    @test rc(`echo 4242`) == "4242\n"
+    @test rc(`false`) === nothing
+    @test rc(`sleep 5`; timeout=0.3) === nothing                 # killed, not waited for
+    @test rc(`definitely-not-a-command-xyz`) === nothing
+    # The default scheduler runs real commands: with no sbatch on PATH a submit is an error,
+    # not a silent nothing.
+    s = SlurmScheduler(; user="nobody")
+    if Sys.which("sbatch") === nothing
+        spec = JobSpec(; name="x", partition="p", nodes=1, time_limit=60.0, script="/x")
+        @test_throws ErrorException submit(s, spec)
+        @test_throws ErrorException job_states(s)
+        @test remaining_time(s, "1") === nothing
+    end
+    # A backend that does not say otherwise cannot shrink and knows no remaining time.
+    m = MockScheduler()
+    @test shrink(m, "1", 1) == false
+    @test remaining_time(m, "1") === nothing
+    id = submit(
+        m, JobSpec(; name="x", partition="p", nodes=1, time_limit=60.0, script="/x")
+    )
+    @test remaining_time(m, id) == 60.0
+    @test cancel(m, id) && !cancel(m, id)
+end
+
+@testset "manage!: a submission the scheduler refuses is logged and the round goes on" begin
+    outdir = mktempdir()
+    failing = SlurmScheduler(; user="me", run=cmd -> cmd.exec[1] == "squeue" ? "" : nothing)
+    ctl = JobController(
+        failing, _jb_policy([_jb_part(; max_jobs=2)]; dry_run=false), outdir
+    )
+    ds = manage!(ctl, _jb_work(100, 60000))
+    @test count(d -> d.action === :submit, ds) == 2
+    @test isempty(ctl.ledger.jobs)
+    @test count(e -> e.kind == "job_submit_failed", _jb_events(outdir)) == 2
+end
+
+@testset "cli jobs: usage errors, a file without [jobs], and --loop" begin
+    io = IOBuffer()
+    @test SweepRunner.cli(["jobs"]; io=io) == 2
+    @test SweepRunner.cli(["jobs", "/no/such.toml"]; io=io) == 2
+    @test SweepRunner.cli(["jobs", "a", "b"]; io=io) == 2
+    @test SweepRunner.cli(["jobs", "a", "--bogus"]; io=io) == 2
+    @test SweepRunner.cli(["jobs", "a", "--loop"]; io=io) == 2
+    @test SweepRunner.cli(["jobs", "a", "--loop", "soon"]; io=io) == 2
+    dir = mktempdir()
+    try
+        cp(_JB_CFG, joinpath(dir, "study.toml"))
+        meta = joinpath(dir, "campaign.toml")
+        head = "[campaign]\nname = \"l\"\noutdir = \"$(joinpath(dir, "out"))\"\n"
+        study = "[[study]]\nname = \"pm\"\nstages = { phase1 = \"study.toml\" }\n"
+        write(meta, head)                                           # not launchable: no study
+        @test SweepRunner.cli(["jobs", meta]; io=io) == 1
+        write(meta, head * study)                                   # no [jobs]
+        @test SweepRunner.cli(["jobs", meta]; io=io) == 2
+        write(meta, head * study * "[jobs]\nname = \"l\"\n")       # no budget
+        @test SweepRunner.cli(["jobs", meta]; io=io) == 2
+        jobs = "[jobs]\nname = \"l\"\nbudget_node_hours = 5\n"
+        write(meta, head * study * jobs)                            # no partition
+        @test SweepRunner.cli(["jobs", meta]; io=io) == 2
+        part =
+            "[[jobs.partition]]\nname = \"p\"\nnodes = 1\ntime_limit = \"1h\"\n" *
+            "script = \"/abs/run.sh\"\nkey_time = \"1min\"\n"
+        write(meta, head * study * jobs * part)
+        pol = load_job_policy(meta)
+        @test only(pol.partitions).script == "/abs/run.sh"
+        @test only(pol.partitions).key_time == 60.0
+        sched = MockScheduler()
+        saved = SweepRunner._CLI_SCHEDULER[]
+        SweepRunner._CLI_SCHEDULER[] = () -> sched
+        try
+            # A dry-run loop: it decides, submits nothing, and ends when a round changes nothing
+            # it could wait for.
+            text = sprint(
+                io2 ->
+                    (@test SweepRunner.cli(["jobs", meta, "--loop", "0.01"]; io=io2) == 0),
+            )
+            @test occursin("budget", text)
+            @test isempty(sched.submitted)
+        finally
+            SweepRunner._CLI_SCHEDULER[] = saved
+        end
+    finally
+        rm(dir; recursive=true, force=true)
+    end
+end
+
 @testset "a master that is holding nodes for a few long units leaves on purpose" begin
     nprocs() > 1 && rmprocs(workers())
     addprocs(3; exeflags="--project=$(dirname(Base.active_project()))")

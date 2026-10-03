@@ -685,7 +685,8 @@ end
     controller_loop!(controller, work; interval=300.0, stop=() -> false, max_rounds=nothing)
 
 [`manage!`](@ref) every `interval` seconds until `stop()` is true, `max_rounds` have run, or
-nothing is left: no runnable work on any partition and no job of ours pending or running. Returns
+nothing is left: no runnable work on any partition and no job of ours pending or running. A
+`dry_run` policy runs one round: nothing it decides changes what the next round would see. Returns
 the number of rounds.
 """
 function controller_loop!(
@@ -704,6 +705,8 @@ function controller_loop!(
             d -> d.action === :hold && startswith(d.reason, "nothing runnable"), decisions
         )
         (idle && !live) && break
+        # A dry run submits nothing, so a second round would decide the same thing forever.
+        ctl.policy.dry_run && break
         (max_rounds !== nothing && rounds >= max_rounds) && break
         sleep(interval)
     end
