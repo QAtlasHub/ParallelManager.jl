@@ -98,7 +98,7 @@ The numbers are checked when the options are built: `max_attempts >= 1`; `stale_
   requests (add work, cancel, stop, prioritise, resize, drain, pause) and for workers that joined
   since the round began. `0` takes no requests.
 - `min_busy_fraction::Float64 = 0.0`, `idle_grace::Float64 = 600.0` — leave on purpose. When
-  the queue is empty and fewer than this fraction of the workers have had a unit for
+  the queue is empty and less than this fraction of the workers' cores has had a unit for
   `idle_grace` seconds, the master stops: the job is holding its nodes for a few long units.
   The units still running are told to stop (they leave at their next [`stop_point`](@ref), with
   their progress recorded), and `run!` returns `stopped_by = :underused`, so the allocation is
@@ -1702,11 +1702,20 @@ function _leave_if_underused!(
 )
     (opts.min_busy_fraction > 0 && !m.ctl.stop_all) || return false
     who = lock(() -> copy(m.who), m.lock)
-    n = count(
-        p -> !(p in m.ctl.retired) && !(haskey(who, p) && who[p].host in m.ctl.drained),
-        workers(),
-    )
-    if n == 0 || _has_queued(table) || busy / n >= opts.min_busy_fraction
+    mine = [
+        p for p in workers() if
+        !(p in m.ctl.retired) && !(haskey(who, p) && who[p].host in m.ctl.drained)
+    ]
+    n = length(mine)
+    # In cores, not workers: with workers of different sizes (a pool), one busy 32-core worker
+    # among idle 1-core ones is a job that is mostly in use.
+    cores(p) = haskey(who, p) ? max(who[p].cores, 1) : 1
+    on = lock(table.lock) do
+        return Set(r.worker for r in table.rows if r.state === :running && r.worker != 0)
+    end
+    total = sum(cores, mine; init=0)
+    used = sum(cores, (p for p in mine if p in on); init=0)
+    if n == 0 || _has_queued(table) || used / total >= opts.min_busy_fraction
         since[] = 0.0
         return false
     end
@@ -1722,6 +1731,8 @@ function _leave_if_underused!(
         stage=m.stage,
         busy=busy,
         workers=n,
+        cores_busy=used,
+        cores=total,
         secs=round(Int, lasted),
     )
     try

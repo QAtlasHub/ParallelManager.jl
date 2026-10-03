@@ -417,6 +417,11 @@ min_nodes = 16
 ```
 
 - Config paths are relative to the meta file (or `[campaign] config_dir`).
+- A job the controller submitted runs the profile named in `SWEEPRUNNER_PROFILE`
+  (set for it at submission); `run_campaign!(…; profile = …)` overrides it, and
+  `campaign_start` records which and where it came from. `min_nodes` says what
+  size of job a profile is for: a smaller allocation running it is logged
+  (`profile_too_small`), not refused.
 - A stage needs the stage before it in its study (`chain = false` turns that
   off). `needs` on a study is what its first stage needs from other studies:
   `"study.stage"`, or `"study"` for all of that study's stages. Stages written

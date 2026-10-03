@@ -400,6 +400,24 @@ end
     @test length(sched.submitted) == 1
 end
 
+@testset "controller_loop!: a round that fails is said, and the loop asks again (#113)" begin
+    outdir = mktempdir()
+    sched = MockScheduler()
+    ctl = JobController(sched, _jb_policy(; dry_run=false), outdir)
+    calls = Ref(0)
+    work = profile -> begin
+        calls[] += 1
+        calls[] == 1 && error("the vault could not be read")
+        return (; units=0, cost=NaN, longest=0.0)
+    end
+    rounds = controller_loop!(ctl, work; interval=0.01, max_rounds=10)
+    @test rounds == 2                                          # failed, asked again, nothing left
+    @test isempty(sched.submitted)
+    failed = only([e for e in _jb_events(outdir) if e.kind == "controller_round_failed"])
+    @test failed.round == 1
+    @test occursin("could not be read", failed.err)
+end
+
 @testset "load_job_policy and `sweeprunner jobs`: from the campaign's own file" begin
     dir = mktempdir()
     out = joinpath(dir, "out")
@@ -612,6 +630,7 @@ end
         ev = [JSON3.read(l) for f in logs for l in readlines(joinpath(outdir, f))]
         u = only([e for e in ev if e.kind == "underused"])
         @test (u.busy, u.workers) == (1, 3)
+        @test u.cores_busy * 3 == u.cores                       # counted in cores (#113)
 
         # With the threshold off (the default) the same unit runs to its end.
         v2 = DataVault.Vault(_JB_CFG; run="busy", outdir=outdir)
