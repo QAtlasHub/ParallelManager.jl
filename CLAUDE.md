@@ -9,7 +9,10 @@ for how the three layers fit together.
 ## Role / public API
 
 - `init_workers!(mode=:auto)` — bootstrap the backend
-  (`:sequential`/`:threads`/`:distributed`/`:slurm`, chosen from env vars).
+  (`:sequential`/`:threads`/`:distributed`/`:slurm`, chosen from env vars). `sysimage=` /
+  `SWEEPRUNNER_SYSIMAGE` starts workers from an image; `max_workers=` refuses, with a message,
+  more workers than one master can start under Slurm; `worker_logs=dir` gives each worker its
+  own log file. `todo_count(vault, keys)` answers "anything to do?" before any worker starts.
 - `run!(work_fn, vault, keys; opts=RunOpts())` — execute; returns a counter
   NamedTuple `(stage, done, err, skipped, total, …)`.
 - `run_loop!(...)` — re-scan until the sweep is fully done; the production driver

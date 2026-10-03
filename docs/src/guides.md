@@ -728,3 +728,65 @@ run_loop!(work_fn, vault, keys;
 A `work_fn` that keeps a checkpoint (guide 16) needs only `checkpoint_every`
 seconds to get somewhere, so `min_time = _ -> opts.checkpoint_every` makes
 every key fit almost any job.
+
+## 18. Start-up, and what the master carries
+
+**Leave in seconds when there is nothing to do.** Ask before starting a worker:
+
+```julia
+SweepRunner.todo_count(vault, keys) == 0 && exit(0)
+SweepRunner.init_workers!()
+```
+
+**Start workers from a system image.** `init_workers!(sysimage = path)`, or
+`SWEEPRUNNER_SYSIMAGE`, starts every worker with `--sysimage`: a worker is up
+in seconds instead of loading and compiling the application, which matters
+most when workers are started all job long. Building the image
+(PackageCompiler, once per commit, on a login node) is the application's
+step, and the master should run from the same image.
+
+**A limit per master that is a message.** Under `:slurm` every worker is an
+`srun` client on the master's node and takes about seven ports of the
+cluster's `SrunPortRange`. Past the range, workers neither join nor fail: a
+72-node job planned 3735 workers, stopped at 1782 without an error, and ran at
+48% of its cores to the end. `init_workers!` now refuses to start more than
+`max_workers` — `SWEEPRUNNER_MAX_WORKERS`, else `srun_worker_limit()` read from
+`scontrol show config` (1607 on that cluster) — and says how many masters it
+would take.
+
+**Several masters in one allocation.** Above the limit, cut the allocation
+into node groups and run one master per group, each on its own share of the
+keys:
+
+```julia
+groups = SweepRunner.split_nodes(ENV["SLURM_JOB_NODELIST"], m)
+```
+
+```sh
+for i in $(seq 0 $((m-1))); do
+  srun -N ${n[$i]} -w ${group[$i]} --export=ALL,SWEEPRUNNER_SHARD=$i/$m \
+       julia run_campaign.jl &
+done; wait
+```
+
+Start-up rate and every per-master limit then scale with the allocation. The
+masters need no broker: sharding (guide 17) keeps them off each other's keys,
+the locks and the status files do the rest.
+
+**Workers keep their own logs.** `init_workers!(worker_logs = dir)` (or
+`worker_logs!(dir)` once workers exist) makes each worker write stdout and
+stderr to `<dir>/worker_<host>_<pid>.log`, instead of relaying every line
+through the master to be printed with a `From worker N:` prefix.
+
+**The round's context travels once.** The work function, the vault, the log
+and the options are installed on a worker when its dispatch loop starts; each
+key then carries only itself, its lock token and its resume point.
+
+**The manifest is kept while the round runs** (`RunOpts.manifest_interval`,
+300 s). It used to be written only when a round ended, so a job killed at its
+wall clock left none of its completions in it and the next job found them
+again one marker at a time.
+
+**Where the round's time went.** `stage_done` carries `prepare_secs` (loading
+modules on workers, source observation), `scan_secs` (the pass over markers
+and locks), `dispatch_secs`, `manifest_secs` and `total_secs`.
