@@ -1,7 +1,11 @@
 name: CI
 on:
   push:
-    branches: [main]
+    # `next` collects the PRs of one release before it goes to main. Without it here the only
+    # runs on that branch are the PRs INTO it, each against the base it was opened on, and the
+    # state that will actually be released — every one of them merged together — is never tested
+    # until the release PR.
+    branches: [main, next]
     tags: '*'
   pull_request:
   workflow_dispatch:
