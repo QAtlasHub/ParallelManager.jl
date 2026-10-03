@@ -76,6 +76,9 @@ Execution options for [`run!`](@ref).
 - `defer_poll::Float64 = 30.0` — seconds [`run!`](@ref) waits before re-dispatching keys whose
   `work_fn` threw `DataVault.ArtifactBusy` (an artifact being built by another worker or job),
   when the previous pass made no progress. A deferred key costs no attempt.
+- `status_interval::Float64 = 60.0` — how often the master rewrites its status file (see
+  [`read_status`](@ref)): task counts, the worker pool against what was planned, and per worker
+  the key it is on, CPU utilisation and RSS. `0` writes none.
 
 # Example
 
@@ -94,6 +97,7 @@ struct RunOpts
     log_level::Symbol
     deadline::Union{Float64,Nothing}
     defer_poll::Float64
+    status_interval::Float64
 end
 
 function RunOpts(;
@@ -105,6 +109,7 @@ function RunOpts(;
     log_level::Symbol=:info,
     deadline::Union{Real,Nothing}=nothing,
     defer_poll::Real=30.0,
+    status_interval::Real=60.0,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -132,6 +137,7 @@ function RunOpts(;
         log_level,
         deadline === nothing ? nothing : Float64(deadline),
         Float64(defer_poll),
+        Float64(status_interval),
     )
 end
 
@@ -188,7 +194,7 @@ load_manifest(vault::Vault) = load_manifest(manifest_root(vault), Symbol(vault.r
 
 """
     run!(work_fn, vault, keys; opts=RunOpts(), load=nothing, affinity=nothing, observe=true,
-         master=Master()) -> NamedTuple
+         master=nothing) -> NamedTuple
 
 Run `work_fn(key) -> Dict` for every `key` in `keys`, persisting through
 `vault`. Writes a structured JSONL event log at
@@ -243,9 +249,15 @@ Each key goes to a worker together with its lock token and the last progress rec
 When the queue drains, the keys that came back busy are asked about once more, since their holder
 may have finished or died while the pass ran.
 
-`master` is the [`Master`](@ref) this call runs as. A caller that makes several `run!` calls as
-one job (as [`run_loop!`](@ref) does) passes the same one to each, so they share an event log and
-the worker identities already collected.
+`master` is the [`Master`](@ref) this call runs as (a fresh one by default). A caller that makes
+several `run!` calls as one job (as [`run_loop!`](@ref) does) passes the same one to each, so they
+share an event log, a status file and the worker identities already collected.
+
+# Status
+
+While it runs, the master rewrites `<state_root>/masters/<id>/status.json` every
+`opts.status_interval` seconds; [`read_status`](@ref) / [`print_status`](@ref) read it from any
+process, during the job or after it.
 
 Returns `(; stage, done, err, busy, gave_up, stop, skipped, total, stopped_by)`. `stopped_by` is
 `:flag`, `:deadline`, or `nothing`: a stage that finished every key reports `nothing` even if the
@@ -290,11 +302,20 @@ function run!(
     load=nothing,
     affinity=nothing,
     observe::Bool=true,
-    master::Master=Master(),
+    master::Union{Master,Nothing}=nothing,
 )
     stage = Symbol(vault.run)
+    # A master handed in outlives this call (`run_loop!` between rounds); one made here does not.
+    own = master === nothing
+    master = own ? Master() : master
     log_name = "events_$(master.id).jsonl"
     log = EventLog(joinpath(vault.outdir, log_name); min_level=opts.log_level)
+    multi = opts.workers !== :sequential && nprocs() > 1
+    master.vault = vault
+    master.stage = String(stage)
+    master.multi = multi
+    master.interval = opts.status_interval
+    after = own ? :ended : :waiting
 
     # Early skip: load manifest, subtract completed keys
     m = load_manifest(vault)
@@ -302,6 +323,9 @@ function run!(
 
     if isempty(todo)
         log_event(log, :skip_complete; stage=stage, total=length(keys))
+        master.table = nothing
+        master.state = after
+        master.interval > 0 && write_status(master)
         return (
             stage=stage,
             done=0,
@@ -319,7 +343,6 @@ function run!(
 
     # Dispatch strategy: fan out when Distributed workers are present (unless the
     # caller forced `workers=:sequential`), otherwise draw the queue on this process.
-    multi = opts.workers !== :sequential && nprocs() > 1
     if multi
         # Ensure the seam packages (+ the user's work module(s) via `load=`) are loaded in `Main`
         # on every worker before fan-out. `init_workers!` spawns workers with `--project` but loads
@@ -337,12 +360,24 @@ function run!(
     # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
     _scan!(table, vault, stage, log, opts)
+    master.table = table
+    master.state = :running
+    _identify_workers!(master, multi ? workers() : [myid()])
     drive = if multi
         () -> _drive_workers!(work_fn, vault, table, stage, log, opts, master)
     else
-        () -> _drive_sequential!(work_fn, vault, table, stage, log, opts)
+        () -> _drive_sequential!(work_fn, vault, table, stage, log, opts, master)
     end
-    _dispatch!(drive, table, vault, stage, log, opts)
+    try
+        _with_status(master, log) do
+            return _dispatch!(drive, table, vault, stage, log, opts)
+        end
+    finally
+        # Also on the way out through an exception: a status that still says `running` after the
+        # master has left is the one thing it must not say.
+        master.state = after
+        master.interval > 0 && status_tick!(master, log)
+    end
 
     # Aggregate outcomes into counters + manifest updates.
     n_done = 0
@@ -641,7 +676,7 @@ function _dispatch!(
 end
 
 """
-    _drive_sequential!(work_fn, vault, table, stage, log, opts)
+    _drive_sequential!(work_fn, vault, table, stage, log, opts[, master])
 
 Draw the queue on this process, one key at a time.
 """
@@ -652,8 +687,12 @@ function _drive_sequential!(
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
+    master::Union{Master,Nothing}=nothing,
 )
     while true
+        # No timer fires while this process is inside `work_fn`, so the status is refreshed here,
+        # between keys.
+        master === nothing || _status_due!(master, log)
         # The keys a stop drops are ATTRIBUTED, not silently absent: every row ends the round
         # with an outcome.
         stop = _stop_reason(opts)
@@ -828,7 +867,7 @@ function _drive_workers!(
         w = get(who, pid, nothing)
         w === nothing && continue
         @async try
-            _loop(pid, w[1], w[2])
+            _loop(pid, w.host, w.pid)
         finally
             # A loop that leaves on an exception must not strand the ones waiting on it.
             notify(idle)
@@ -1079,6 +1118,8 @@ function run_loop!(
         end
         sleep(idle_sleep)
     end
+    master.state = :ended
+    master.interval > 0 && write_status(master)
     return (;
         ran=true,
         rounds=rounds,

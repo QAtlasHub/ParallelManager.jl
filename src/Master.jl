@@ -21,32 +21,91 @@ function state_root(vault::Vault)
 end
 
 """
+    WorkerSample
+
+The master's last reading of one worker: cumulative `cpu` seconds, `rss` bytes, `wall` (the
+worker's `time()` at the reading) and `util`, the CPU time used between this reading and the one
+before it, divided by the wall time between them and by the worker's cores (`NaN` until there are
+two readings).
+
+A worker inside a `work_fn` that does not yield answers when it next does, so `wall` can be older
+than the status that carries it; the status says how old.
+"""
+struct WorkerSample
+    cpu::Float64
+    wall::Float64
+    rss::Int
+    util::Float64
+end
+
+const WorkerIdentity = @NamedTuple{host::String, pid::Int, cores::Int}
+
+"""
     Master()
 
-One master's identity and the worker identities it has collected. [`run_loop!`](@ref) builds one
-and keeps it across its rounds; a bare [`run!`](@ref) builds its own.
+One master: its identity, what it has learned about its workers, and the round it is running.
+[`run_loop!`](@ref) builds one and keeps it across its rounds; a bare [`run!`](@ref) builds its
+own.
 
 - `id` — `<hostname>_<pid>`, the same pair that names the master's event log.
+- `job` — the scheduler's id for the job this master runs in (`""` outside one).
 - `started` — `time()` at construction.
-- `who` — Distributed id => `(hostname, os pid)` of each worker asked so far.
+- `who` — Distributed id => `(; host, pid, cores)` of each worker asked so far.
+- `samples` — Distributed id => the last [`WorkerSample`](@ref).
+- `table` — the [`TaskTable`](@ref) of the round in progress (or of the last one).
+- `state` — `:starting`, `:running`, `:waiting` (between rounds of a `run_loop!`), `:ended`.
+
+The rest is bookkeeping for the status file (see `Status.jl`).
 """
 mutable struct Master
     const id::String
+    const host::String
+    const pid::Int
+    const job::String
     const started::Float64
-    const who::Dict{Int,Tuple{String,Int}}
+    const who::Dict{Int,WorkerIdentity}
+    const samples::Dict{Int,WorkerSample}
+    const probing::Set{Int}
+    const progress::Dict{String,Progress}
+    const warnings::Vector{String}
     const lock::ReentrantLock
+    table::Union{TaskTable,Nothing}
+    vault::Union{Vault,Nothing}
+    stage::String
+    state::Symbol
+    multi::Bool
+    interval::Float64
+    last_status::Float64
+    short_since::Float64
+    short_logged::Tuple{Int,Int,Int}
 end
 
 function Master()
     return Master(
         string(gethostname(), "_", getpid()),
+        gethostname(),
+        getpid(),
+        _slurm_queue_id(),
         time(),
-        Dict{Int,Tuple{String,Int}}(),
+        Dict{Int,WorkerIdentity}(),
+        Dict{Int,WorkerSample}(),
+        Set{Int}(),
+        Dict{String,Progress}(),
+        String[],
         ReentrantLock(),
+        nothing,
+        nothing,
+        "",
+        :starting,
+        false,
+        0.0,
+        0.0,
+        0.0,
+        (-1, -1, -1),
     )
 end
 
-_whoami() = (gethostname(), getpid())
+_whoami()::WorkerIdentity = (; host=gethostname(), pid=getpid(), cores=_my_cores())
 
 # Ask the workers not asked yet who they are, all at once. A worker that cannot answer is left out,
 # and the dispatcher does not hand it work: it could not be named in a lock.

@@ -145,3 +145,58 @@ rm out/manifest/<project>/<run>/manifest.jld2
 
 Per-key `.done` files written by `DataVault.mark_done!` are the
 authoritative source of truth — the manifest is just a cache.
+
+## 9. Asking a running sweep what it is doing
+
+Every master rewrites one file, atomically, every `RunOpts.status_interval`
+seconds (60 by default):
+
+    <outdir>/sweeprunner/<project>/<run>/masters/<host>_<pid>/status.json
+
+Read it from a login node while the job runs, or after it has ended:
+
+```sh
+bin/sweeprunner status out/campaign            # every master under the outdir
+bin/sweeprunner status out/campaign --workers  # plus one line per worker
+bin/sweeprunner status out/campaign --json     # the raw records
+```
+
+```
+phase1  c001_41233 job 3087883  running  updated 12 s ago
+  tasks    total 9000  done 2400  running 1743  todo 4857  held 0  failed 0
+  workers  planned 3735  launched 1782  joined 1743  busy 1743  idle 0
+  cores    busy 3486 of 9216 allocated (38%)
+  nodes    8 allocated with no worker: c065 c066 c067 c068 c069 c070 c071 c072
+  ! workers_short: planned 3735, launched 1782, joined 1743 for 1260 s
+  node                 workers  busy  cores   cpu
+  c001                      28    28     56  0.97
+  ...
+```
+
+or from Julia: `SweepRunner.read_status(vault)` returns the same records as
+`Dict`s, `print_status(vault)` prints them.
+
+Per worker the record holds the key it is on, since when, the lock token it
+holds, the progress last reported for that key
+([`report_progress`](@ref SweepRunner.report_progress)), CPU utilisation (CPU
+time between two readings, over wall time, over the worker's cores) and RSS.
+A worker inside a `work_fn` that never yields answers the reading when it next
+does; `sampled` says when that was.
+
+**Planned against joined.** The master knows how many workers joined. It does
+not know how many were meant to, unless whatever starts them says so:
+
+```julia
+SweepRunner.note_workers!(planned = 3735)      # when the pool is sized
+SweepRunner.note_workers!(launched = n_steps)  # as job steps come up
+```
+
+[`init_workers!`](@ref SweepRunner.init_workers!) does this for the pools it
+starts. When fewer have joined than were planned for longer than the worker
+timeout (`JULIA_WORKER_TIMEOUT`, else 60 s), the status carries a
+`workers_short` line and the event log one `workers_short` event at `:warn` —
+the ramp-up that stops at half its workers no longer does so silently.
+
+A master whose file has not been rewritten for three intervals, and which did
+not write `ended`, is shown as `GONE`: killed at the wall clock, or its node
+was lost.
