@@ -25,6 +25,7 @@ independently.
 | `Status.jl`     | [`read_status`](@ref), [`print_status`](@ref), [`note_workers!`](@ref) |
 | `Locks.jl`      | [`locks`](@ref), [`judge_lock`](@ref), [`reap_dead_locks!`](@ref) |
 | `Control.jl`    | [`control!`](@ref), [`should_stop`](@ref), [`stop_point`](@ref) |
+| `Account.jl`    | [`account_snapshot`](@ref), [`print_account`](@ref) |
 | `Cost.jl`       | [`key_costs`](@ref), [`cost_summary`](@ref), [`measured_cost`](@ref), [`note_key!`](@ref) |
 | `Campaign.jl`   | [`load_campaign`](@ref), [`plan_campaign`](@ref), [`run_campaign!`](@ref) |
 | `Jobs.jl`       | [`Scheduler`](@ref), [`JobPolicy`](@ref), [`decide`](@ref), [`manage!`](@ref) |
@@ -78,6 +79,7 @@ include("Manifest.jl")
 include("InitWorkers.jl")
 include("Liveness.jl")
 include("TaskTable.jl")       # the master's table of a round's units, and its queue
+include("Account.jl")         # where a job's core-hours went
 include("Master.jl")          # a master's identity; state_root
 include("Locks.jl")           # judge_lock: ask the holder's master; locks(), reap_dead_locks!
 include("Run.jl")

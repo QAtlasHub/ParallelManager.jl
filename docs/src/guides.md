@@ -579,3 +579,45 @@ any way you like — per node, per thread count.
 The peak is counted from the start of the key on Linux (the kernel's
 high-water mark is reset), so it is the key's and not the largest key that
 worker ever ran.
+
+## 15. Where a job's core-hours went
+
+A job is charged nodes × elapsed time. The master keeps an account of it as it
+dispatches, in core-seconds, and writes it to the event log when it ends
+(`job_account`) and to its status while it runs:
+
+```sh
+bin/sweeprunner account out/campaign
+```
+
+```
+phase1  c001_41233 job 3087883  ended  0.83 h
+allocated         7632.0 core-h
+computing         2890.0 core-h (38%)
+  kept            2410.0 core-h (32%)
+  lost             480.0 core-h (6%)   217 key(s) cut
+start-up           410.0 core-h (5%)
+never started     3960.0 core-h (52%)
+idle               350.0 core-h (5%)
+  lock_busy         60.0 core-h (1%)
+  queue_empty      290.0 core-h (4%)
+other               22.0 core-h (0%)
+```
+
+| line | what it is | measured or estimated |
+| :-- | :-- | :-- |
+| `computing` | a worker had a key | measured at each dispatch |
+| `kept` | the key finished, or the part of it up to its last `report_progress` | measured |
+| `lost` | the part after the last progress stamp of a key that was cut, stopped, failed, or whose worker died | measured |
+| `start-up` | each worker's cores from the master's start to that worker's first key | measured |
+| `never started` | (workers planned − joined) × mean cores × elapsed | estimated; needs `note_workers!(planned=…)` |
+| `idle` | a worker that had already had a key had none, by reason: `queue_empty`, `lock_busy`, `paused`, `stopping` | measured |
+| `other` | the rest of the allocation: the master, cores no worker was given | by subtraction |
+
+`lost` is the number the checkpoint interval is tuned against: it is what
+every job end, cancel and out-of-memory kill threw away. A `work_fn` that
+reports progress more often loses less; one that never reports loses the whole
+attempt.
+
+`SweepRunner.account_snapshot(master)` returns the same numbers as a `Dict`;
+`read_status(vault)[i]["account"]` reads them from outside while the job runs.

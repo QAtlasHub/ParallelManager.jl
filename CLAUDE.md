@@ -19,6 +19,9 @@ for how the three layers fit together.
 - `read_status(vault | outdir)` / `print_status` / `bin/sweeprunner status <outdir>` — what every
   master is doing (tasks, workers planned/launched/joined/busy, per-worker key, CPU, RSS), read
   from the status file each master rewrites. A spawner reports `note_workers!(planned=, launched=)`.
+- Account: the master books where the core-seconds went as it dispatches — computing (kept /
+  lost after the last `report_progress`), start-up, never started, idle by reason — and writes
+  `job_account` when it ends; `bin/sweeprunner account <outdir>` prints it.
 - Cost: every `key_done` records wall, CPU, cores, peak RSS, host and `class`
   (`run!(…; key_class = key -> label)`); `SweepRunner.note_key!(…)` adds fields from `work_fn`.
   `key_costs` / `cost_summary` / `bin/sweeprunner costs <outdir>` read them back, `run_loop!`

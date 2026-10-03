@@ -265,6 +265,8 @@ function status_snapshot(m::Master)
         # asks when it finds a `.running`: see `judge_lock`.
         "held" => _out_tokens(),
         "locks" => copy(m.locks),
+        # Where the core-hours went so far (Account.jl).
+        "account" => account_snapshot(m; now=now),
         # What control requests have changed about this master.
         "control" => Dict{String,Any}(
             "paused" => m.ctl.paused,
