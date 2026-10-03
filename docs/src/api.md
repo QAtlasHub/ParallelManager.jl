@@ -107,6 +107,22 @@ SweepRunner.print_locks
 SweepRunner.reap_dead_locks!
 ```
 
+## Control
+
+```@docs
+SweepRunner.control!
+SweepRunner.should_stop
+SweepRunner.stop_point
+SweepRunner.StopRequested
+SweepRunner.KeyFilter
+SweepRunner.matches
+SweepRunner.read_requests
+SweepRunner.read_acks
+SweepRunner.control_dir
+SweepRunner.poll_control!
+SweepRunner.ControlState
+```
+
 ## Artifacts
 
 ```@docs

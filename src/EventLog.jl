@@ -62,6 +62,15 @@ stay within that guarantee.
 |                 | the re-dispatch bound (includes `deaths`)                          |
 | `worker_lost`   | every worker died with keys still queued; this key was left for a  |
 |                 | later run rather than completed or failed                          |
+| `control_request` | a [`control!`](@ref) request was applied (includes `id`, `op`,   |
+|                 | `by`: who asked, `asked_at`, and `detail`: what it changed)        |
+| `key_stopped`   | a unit told to stop left at a safe point ([`stop_point`](@ref));   |
+|                 | no attempt spent                                                   |
+| `key_cut`       | a unit told to stop was still running after its grace: its lock    |
+|                 | was released and its result will be refused (`:warn`)              |
+| `worker_retired`| a `:resize` took a worker out of the pool, between units           |
+| `workers_joined`| workers that joined after the round began were adopted (`n`)       |
+| `workers_rejected` | workers that joined late could not be readied and get no work   |
 | `workers_short` | fewer workers joined than `note_workers!` said were planned, for   |
 |                 | longer than the worker timeout (includes `planned`, `launched`,    |
 |                 | `joined`); logged once per distinct shortfall, at `:warn`          |

@@ -91,3 +91,28 @@ function _observe_processes!(vault::Vault, multi::Bool, observe::Bool, log, stag
     end
     return nothing
 end
+
+# The same, for workers that joined after the round began (see `_drive_workers!`).
+function _observe_late!(vault::Vault, pids, observe::Bool, log, stage)
+    for pid in pids
+        if !observe
+            remotecall_fetch(SweepRunner._forget_observation!, pid, vault)
+            continue
+        end
+        token, err = remotecall_fetch(SweepRunner._observe_here!, pid, vault, "worker")
+        if token === nothing
+            log_event(
+                log,
+                :observe_failed;
+                level=:warn,
+                stage=stage,
+                pid=pid,
+                role="worker",
+                err=err,
+            )
+        else
+            log_event(log, :observed; stage=stage, pid=pid, role="worker", token=token)
+        end
+    end
+    return nothing
+end
