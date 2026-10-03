@@ -536,7 +536,8 @@ function run!(
     flush_manifest =
         () -> begin
             (opts.manifest_interval > 0 && time() - flushed[] >= opts.manifest_interval) || return nothing
-            flushed[] = time()
+            t_flush = time()
+            flushed[] = t_flush
             try
                 done_now = lock(table.lock) do
                     return DataKey[
@@ -552,7 +553,7 @@ function run!(
                     log, :manifest_failed; level=:warn, stage=stage, err=_short_err(e)
                 )
             end
-            manifest_secs[] += time() - flushed[]
+            manifest_secs[] += time() - t_flush
             return nothing
         end
     master.table = table
@@ -592,7 +593,15 @@ function run!(
     t_dispatch = time()
     try
         _with_status(master, log) do
-            return _dispatch!(drive, table, vault, stage, log, opts)
+            return _dispatch!(
+                drive,
+                table,
+                vault,
+                stage,
+                log,
+                opts;
+                standing=() -> _apply_standing!(master, table),
+            )
         end
     finally
         # A master that is leaving says so. On the way out through an exception (an interrupt, a
@@ -985,7 +994,13 @@ artifact it waited on has usually been built by then), after `opts.defer_poll` s
 which `run!` counts with `busy`: it was never attempted.
 """
 function _dispatch!(
-    drive, table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts
+    drive,
+    table::TaskTable,
+    vault::Vault,
+    stage::Symbol,
+    log::EventLog,
+    opts::RunOpts;
+    standing=Returns(nothing),
 )
     round = 0
     while true
@@ -994,6 +1009,8 @@ function _dispatch!(
             drive()
             _stop_reason(opts) === nothing || break
             _rescan_busy!(table, vault, stage, log, opts) == 0 && break
+            # What was just put back is still subject to what requests cancelled or moved.
+            standing()
         end
         deferred = [i for (i, r) in enumerate(table.rows) if r.outcome === :deferred]
         isempty(deferred) && break
@@ -1002,6 +1019,7 @@ function _dispatch!(
         round += 1
         log_event(log, :deferred_round; stage=stage, round=round, keys=length(deferred))
         foreach(i -> requeue!(table, i), deferred)
+        standing()
     end
     return nothing
 end
@@ -1294,7 +1312,8 @@ function _drive_workers!(
                             attempts=row.deaths,
                             err="worker exited on this key every time it was dispatched",
                         )
-                        :error
+                        # The outcome the event names: counted in `gave_up` (and in `err`).
+                        :gave_up
                     else
                         nothing            # goes back on the queue
                     end
@@ -1319,6 +1338,13 @@ function _drive_workers!(
                 # A unit that was cut comes back as a lost lock, an error from the interrupt, or
                 # not at all. Whatever it is, the unit was stopped, not failed.
                 order.cut && outcome !== :ok && (outcome = :stopped)
+                # Told to stop, and its worker died before it left: it stays stopped. Requeued,
+                # it would be the next key handed out.
+                outcome === nothing && (outcome = :stopped)
+            end
+            # The same for a key a request cancelled while it was running.
+            if outcome === nothing && any(f -> matches(f, row.key), c.cancels)
+                outcome = :cancelled
             end
             outcome === :lock_busy && (master.collisions += 1)
             _account_key!(master, vault, row, pid, t0, outcome)
@@ -1367,11 +1393,12 @@ function _drive_workers!(
     _adopt!()
     done = Ref(false)
     idle_since = Ref(0.0)
-    tick = opts.control_interval > 0 ? opts.control_interval : 10.0
+    # `every`, not `tick`: `tick` is the caller's per-tick callback (a keyword of this function).
+    every = opts.control_interval > 0 ? opts.control_interval : 10.0
     # A pool is looked at more often than requests are: a start it does not make is idle room.
-    pool === nothing || (tick = min(tick, pool.poll))
+    pool === nothing || (every = min(every, pool.poll))
     @async while true
-        sleep(tick)
+        sleep(every)
         done[] && break
         try
             poll_control!(
@@ -1412,7 +1439,7 @@ function _drive_workers!(
                 _stop_reason(opts, master) === nothing
             ) || break
             _pool_wants(pool, table) || break
-            sleep(min(tick, 0.2))
+            sleep(min(every, 0.2))
         end
     finally
         done[] = true
@@ -1599,12 +1626,14 @@ function _run_one_with_retry!(
             end
             # A unit whose lock is gone (cut after its grace, or reclaimed) has nothing to retry
             # for: its result would be refused at the commit.
+            # The error is on record first: a unit that failed AND lost its lock used to leave only
+            # `lock_lost`, and the exception was never seen.
+            last_err = _short_err(e)
+            log_event(log, :error; stage=stage, key=kstr, attempt=attempt, err=last_err)
             if DataVault.running_owner(vault, key) != tok
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
                 return :lock_busy
             end
-            last_err = _short_err(e)
-            log_event(log, :error; stage=stage, key=kstr, attempt=attempt, err=last_err)
             if attempt < opts.max_attempts
                 log_event(log, :retry; stage=stage, key=kstr, next_attempt=attempt + 1)
                 sleep(0.1 * attempt)  # linear backoff

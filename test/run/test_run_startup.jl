@@ -185,6 +185,40 @@ end
     end
 end
 
+@testset "workers: the per-tick work runs — the manifest is kept, and nothing fails quietly (#98)" begin
+    _su_workers(2) do
+        _su_vault() do v, outdir
+            ks = DataVault.keys(v)
+            seen = joinpath(outdir, "seen")
+            mkpath(seen)
+            # The last key waits until the manifest holds the keys before it: only the ticker can
+            # put them there while the round is still running.
+            lastk = ParamIO.canonical(ks[end])
+            work = k -> begin
+                if ParamIO.canonical(k) == lastk
+                    t0 = time()
+                    n = 0
+                    while time() - t0 < 30
+                        n = length(SweepRunner.load_manifest(v).complete)
+                        n >= 1 && break
+                        sleep(0.1)
+                    end
+                    write(joinpath(seen, "n"), string(n))
+                end
+                return Dict{String,Any}("x" => 1)
+            end
+            r = run!(
+                work, v, ks; opts=RunOpts(; manifest_interval=0.1, control_interval=0.2)
+            )
+            @test r.done == length(ks)
+            @test parse(Int, read(joinpath(seen, "n"), String)) >= 1
+            kinds = [e.kind for e in _su_events(outdir)]
+            @test !("control_failed" in kinds)
+            @test !("manifest_failed" in kinds)
+        end
+    end
+end
+
 @testset "a key of a round that is not installed is an error, not a silent nothing" begin
     k = ParamIO.DataKey(Dict{String,Any}("N" => 1), 1)
     @test_throws ErrorException SweepRunner._run_installed(UInt64(42), k)
