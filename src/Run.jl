@@ -91,6 +91,11 @@ Execution options for [`run!`](@ref).
 - `checkpoint_every::Float64 = 600.0` — how often [`checkpoint_due`](@ref) says it is time to
   save, inside a `work_fn` that keeps a checkpoint ([`save_checkpoint!`](@ref)). It is also due
   at once on a stop and when the `deadline` is close. `0`: only then.
+- `stop_grace::Float64 = Inf` — a bound on the job's own stop. Once `stop_flag` is raised or
+  `deadline` has passed, a unit still running after this many seconds is cut: its worker is
+  removed and its lock released, so `run!` returns. Units that call [`stop_point`](@ref) leave
+  before that with their checkpoint. `Inf` (the default) waits for running units, as before;
+  set it below the lead your scheduler gives before it kills the job.
 - `shard::Union{Tuple{Int,Int},Nothing}` — `(i, m)`: this is master `i` of `m` cooperating on one
   sweep (`0 <= i < m`). It starts on the keys whose hash falls in its share and reaches the
   others' only when its own run out, so masters that start together do not spend their first
@@ -127,6 +132,7 @@ struct RunOpts
     min_busy_fraction::Float64
     idle_grace::Float64
     checkpoint_every::Float64
+    stop_grace::Float64
     shard::Union{Tuple{Int,Int},Nothing}
     order::Symbol
     manifest_interval::Float64
@@ -146,6 +152,7 @@ function RunOpts(;
     min_busy_fraction::Real=0.0,
     idle_grace::Real=600.0,
     checkpoint_every::Real=600.0,
+    stop_grace::Real=Inf,
     shard::Union{Tuple{<:Integer,<:Integer},Nothing}=_shard_from_env(),
     order::Symbol=:given,
     manifest_interval::Real=300.0,
@@ -189,6 +196,7 @@ function RunOpts(;
         Float64(min_busy_fraction),
         Float64(idle_grace),
         Float64(checkpoint_every),
+        Float64(stop_grace),
         shard === nothing ? nothing : (Int(shard[1]), Int(shard[2])),
         order,
         Float64(manifest_interval),
@@ -1212,6 +1220,7 @@ function _drive_workers!(
     stopped = Ref(false)
     rid = rand(UInt64)
     unidentified = Set{Int}()
+    graced = Ref(false)
     # With a pool: whether anything is queued, kept by the ticker, so a dispatch task whose size
     # fits nothing right now waits for a key that will come back rather than leaving.
     queued_now = Ref(pool !== nothing)
@@ -1314,21 +1323,14 @@ function _drive_workers!(
                 if e isa ProcessExitedException
                     died = true
                     _release_dead!(vault, row, tok, stage, log)
-                    pool === nothing || _pool_death!(pool, row, pid, log, stage)
-                    row.deaths += 1
-                    if row.deaths > _WORKER_DEATH_REDISPATCHES
-                        log_event(
-                            log,
-                            :gave_up;
-                            stage=stage,
-                            key=row.kstr,
-                            attempts=row.deaths,
-                            err="worker exited on this key every time it was dispatched",
-                        )
-                        # The outcome the event names: counted in `gave_up` (and in `err`).
-                        :gave_up
+                    ord = get(c.stopping, row.kstr, nothing)
+                    if ord !== nothing && ord.cut
+                        # Removed on purpose: not a death of the key, and not its memory.
+                        :stopped
                     else
-                        nothing            # goes back on the queue
+                        pool === nothing || _pool_death!(pool, row, pid, log, stage)
+                        row.deaths += 1
+                        _after_death(row, log, stage)
                     end
                 else
                     log_event(
@@ -1448,6 +1450,12 @@ function _drive_workers!(
             end
             _adopt!()
             _leave_if_underused!(master, table, out[], idle_since, opts, log)
+            # The job's own stop gets its grace once, when it is first seen.
+            if !graced[] && _stop_reason(opts) !== nothing
+                graced[] = true
+                _order_stops_all!(master, table, opts.stop_grace, "stop_grace")
+            end
+            _enforce_stops!(master, table, log)
             tick()
             held_now[] = lock(() -> any(r -> r.state === :held, table.rows), table.lock)
         catch e
@@ -1486,6 +1494,15 @@ function _drive_workers!(
             pid in workers() && remote_do(_drop_round, pid, rid)
         end
     end
+    # A cut removes a worker and then releases its lock; the round is over when that is done,
+    # so what it reports (and what the next round finds on disk) is settled.
+    for t in c.cuts
+        try
+            wait(t)
+        catch
+        end
+    end
+    empty!(c.cuts)
     failure === nothing || throw(failure)
     # A pool that cannot start workers is not a round that ended: said, and an error.
     if pool !== nothing && _pool_gave_up(pool) && _has_queued(table)
@@ -1519,6 +1536,22 @@ function _drive_workers!(
         end
     end
     return nothing
+end
+
+# What becomes of a key whose worker died under it: back on the queue (`nothing`), or, once it
+# has taken down `_WORKER_DEATH_REDISPATCHES + 1` workers, given up on.
+function _after_death(row::TaskRow, log::EventLog, stage::Symbol)
+    row.deaths > _WORKER_DEATH_REDISPATCHES || return nothing
+    log_event(
+        log,
+        :gave_up;
+        stage=stage,
+        key=row.kstr,
+        attempts=row.deaths,
+        err="worker exited on this key every time it was dispatched",
+    )
+    # The outcome the event names: counted in `gave_up` (and in `err`).
+    return :gave_up
 end
 
 # The queue is empty and most of the workers have nothing: the job is holding its nodes for a few
@@ -1557,7 +1590,9 @@ function _leave_if_underused!(
         secs=round(Int, lasted),
     )
     try
-        opts.control_interval > 0 && control!(m.vault, :stop; master=m.id)
+        # Written whatever `control_interval` is: this is how the running units hear of it
+        # (`should_stop` reads the requests itself).
+        control!(m.vault, :stop; master=m.id)
     catch e
         e isa InterruptException && rethrow()
     end

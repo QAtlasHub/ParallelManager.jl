@@ -104,8 +104,9 @@ stay within that guarantee.
 |                 | `by`: who asked, `asked_at`, and `detail`: what it changed)        |
 | `key_stopped`   | a unit told to stop left at a safe point ([`stop_point`](@ref));   |
 |                 | no attempt spent                                                   |
-| `key_cut`       | a unit told to stop was still running after its grace: its lock    |
-|                 | was released and its result will be refused (`:warn`)              |
+| `key_cut`       | a unit told to stop was still running after its grace: its worker  |
+|                 | was removed, then its lock released (`worker_removed`,             |
+|                 | `lock_released`, `request`; `:warn`)                               |
 | `worker_retired`| a `:resize` took a worker out of the pool, between units           |
 | `workers_joined`| workers that joined after the round began were adopted (`n`)       |
 | `workers_rejected` | workers that joined late could not be readied and get no work   |

@@ -314,11 +314,22 @@ is released, and the next job resumes from the progress recorded.
 throw. Both look at the filesystem at most once every `poll` seconds.
 
 A unit that never reaches a safe point is bounded by `--grace`: once it has
-passed, the master releases the lock it named (`key_cut` in the event log), so
-another worker or job can take the key at once. The cut unit is not waited
-for, and whatever it eventually returns is refused at the owner-checked
-commit. `--interrupt` additionally signals the worker, which is best effort
-and depends on the cluster manager.
+passed, the master **removes the unit's worker and then releases its lock**
+(`key_cut` in the event log). In that order: with the lock released first, the
+key would be taken by another master while the old worker went on writing its
+checkpoint over the new owner's. With the worker gone the round returns, so a
+six-hour unit cannot hold a job that was told to stop. The worker is lost for
+the rest of the job (a pool starts another when the queue needs one).
+
+The job's own stop gets the same bound with `RunOpts(stop_grace = seconds)`:
+once `stop_flag` is raised or the `deadline` has passed, units still running
+after `stop_grace` are cut. It is `Inf` by default — a deadline set hours
+ahead to let long keys finish is not turned into a kill — so set it below the
+lead your scheduler gives before it kills the job.
+
+Independently of any cut, a unit that no longer holds its key cannot write
+over the one who does: `report_progress` returns `false` and
+`save_checkpoint!` throws `StopRequested`, so the unit leaves.
 
 ### Workers that arrive late
 
@@ -330,7 +341,13 @@ not from the next round.
 ### Limits
 
 - On the sequential path (no workers) requests are read between keys. The
-  running key sees a stop through `should_stop`, but cannot be cut.
+  running key sees a stop through `should_stop`, but cannot be cut: the master
+  is the process inside it.
+- A cut needs a handle on what launched the worker (local workers and the
+  pool's job steps have one). A worker started by a cluster manager that keeps
+  none is asked to leave and may not; `key_cut` then says
+  `worker_removed = false`, and the owner checks above are what protects the
+  key's files.
 - Enqueued keys run under the stage's `work_fn`; a prerequisite stage is not
   re-run for them.
 - Growing the pool needs a `spawn` hook: `run!(…; spawn = n -> addprocs(…))`.

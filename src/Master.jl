@@ -108,6 +108,8 @@ mutable struct ControlState
     const priorities::Vector{KeyFilter}
     const extra::Vector{DataKey}
     const stopping::Dict{String,StopOrder}
+    # Cuts under way (a worker being removed, then its lock released); a round waits for them.
+    const cuts::Vector{Task}
 end
 
 function ControlState()
@@ -125,6 +127,7 @@ function ControlState()
         KeyFilter[],
         DataKey[],
         Dict{String,StopOrder}(),
+        Task[],
     )
 end
 
