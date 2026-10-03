@@ -19,6 +19,10 @@ for how the three layers fit together.
 - `read_status(vault | outdir)` / `print_status` / `bin/sweeprunner status <outdir>` — what every
   master is doing (tasks, workers planned/launched/joined/busy, per-worker key, CPU, RSS), read
   from the status file each master rewrites. A spawner reports `note_workers!(planned=, launched=)`.
+- Dispatch: `RunOpts(shard=(i, m))` (or `SWEEPRUNNER_SHARD=i/m`, or a Slurm array) makes a
+  master start on its own share of the keys; `RunOpts(order=:longest_first)` with
+  `run!(…; cost)` draws long keys first; with a `deadline`, a key whose `min_time` exceeds the
+  time left is not started (`held_back`). `collisions` counts keys lost to another master.
 - Account: the master books where the core-seconds went as it dispatches — computing (kept /
   lost after the last `report_progress`), start-up, never started, idle by reason — and writes
   `job_account` when it ends; `bin/sweeprunner account <outdir>` prints it.

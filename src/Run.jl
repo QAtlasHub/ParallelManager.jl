@@ -91,6 +91,15 @@ Execution options for [`run!`](@ref).
 - `checkpoint_every::Float64 = 600.0` — how often [`checkpoint_due`](@ref) says it is time to
   save, inside a `work_fn` that keeps a checkpoint ([`save_checkpoint!`](@ref)). It is also due
   at once on a stop and when the `deadline` is close. `0`: only then.
+- `shard::Union{Tuple{Int,Int},Nothing}` — `(i, m)`: this is master `i` of `m` cooperating on one
+  sweep (`0 <= i < m`). It starts on the keys whose hash falls in its share and reaches the
+  others' only when its own run out, so masters that start together do not spend their first
+  passes on each other's locks. Every master still covers every key: a share is where it
+  STARTS, not all it does. **Defaults to `ENV["SWEEPRUNNER_SHARD"]`** written `i/m`, and to the
+  Slurm array task (`SLURM_ARRAY_TASK_ID` of `SLURM_ARRAY_TASK_COUNT`) when the job is one.
+- `order::Symbol = :given` — `:longest_first` hands out the keys with the largest `cost` first
+  (see `cost` in [`run!`](@ref)), so the long keys start while there is time for them and the
+  short ones fill what is left of the job. `:given` keeps the caller's order.
 
 # Example
 
@@ -114,6 +123,8 @@ struct RunOpts
     min_busy_fraction::Float64
     idle_grace::Float64
     checkpoint_every::Float64
+    shard::Union{Tuple{Int,Int},Nothing}
+    order::Symbol
 end
 
 function RunOpts(;
@@ -130,6 +141,8 @@ function RunOpts(;
     min_busy_fraction::Real=0.0,
     idle_grace::Real=600.0,
     checkpoint_every::Real=600.0,
+    shard::Union{Tuple{<:Integer,<:Integer},Nothing}=_shard_from_env(),
+    order::Symbol=:given,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -140,6 +153,14 @@ function RunOpts(;
         ArgumentError(
             "RunOpts: log_level must be :debug/:info/:warn/:error, got $(repr(log_level))",
         ),
+    )
+    order in (:given, :longest_first) || throw(
+        ArgumentError(
+            "RunOpts: order must be :given or :longest_first, got $(repr(order))"
+        ),
+    )
+    (shard === nothing || (shard[2] >= 1 && 0 <= shard[1] < shard[2])) || throw(
+        ArgumentError("RunOpts: shard must be (i, m) with 0 <= i < m, got $(repr(shard))"),
     )
     heartbeat_interval < stale_after || throw(
         ArgumentError(
@@ -162,7 +183,28 @@ function RunOpts(;
         Float64(min_busy_fraction),
         Float64(idle_grace),
         Float64(checkpoint_every),
+        shard === nothing ? nothing : (Int(shard[1]), Int(shard[2])),
+        order,
     )
+end
+
+# `i/m` from `SWEEPRUNNER_SHARD`, else the Slurm array task; `nothing` when neither says.
+function _shard_from_env()
+    s = get(ENV, "SWEEPRUNNER_SHARD", "")
+    if !isempty(s)
+        parts = split(s, '/')
+        if length(parts) == 2
+            i, m = tryparse(Int, parts[1]), tryparse(Int, parts[2])
+            (i !== nothing && m !== nothing && m >= 1 && 0 <= i < m) && return (i, m)
+        end
+        return nothing
+    end
+    id = tryparse(Int, get(ENV, "SLURM_ARRAY_TASK_ID", ""))
+    n = tryparse(Int, get(ENV, "SLURM_ARRAY_TASK_COUNT", ""))
+    lo = something(tryparse(Int, get(ENV, "SLURM_ARRAY_TASK_MIN", "")), 0)
+    (id === nothing || n === nothing || n < 2) && return nothing
+    i = id - lo
+    return 0 <= i < n ? (i, n) : nothing
 end
 
 # Why the loop is stopping, so `:stage_done` can say which of the two fired rather than leaving
@@ -289,6 +331,19 @@ finished key leaves a `key_done` record with its wall time, CPU time, cores, pea
 next job can be sized from what keys of each class actually took. Inside `work_fn`,
 [`note_key!`](@ref) adds fields to the record.
 
+# Cost and the wall clock
+
+`cost` is `key -> seconds`, the key's expected run time ([`measured_cost`](@ref) builds one from
+what earlier keys took). With `RunOpts(order=:longest_first)` the queue is drawn longest first.
+
+`min_time` is `key -> seconds`, how long the key needs to get somewhere: to its next checkpoint,
+or to its end if it keeps none (it defaults to `cost`). With a `deadline`, a key that needs more
+than the time left is NOT started: a key that is run, cut at the wall clock and started again
+from the same point by the next job occupies a worker for nothing. Such keys are counted in
+`held_back`, logged once (`held_back`), and left for a job with more time. The check is made each
+time a key is handed out, so as the job runs down the long keys are passed over and the short ones
+still fill it.
+
 `spawn` is `n -> start n more workers`: what a `:resize` request calls to grow the pool. Without
 it the pool can only shrink.
 
@@ -310,8 +365,11 @@ While it runs, the master rewrites `<state_root>/masters/<id>/status.json` every
 `opts.status_interval` seconds; [`read_status`](@ref) / [`print_status`](@ref) read it from any
 process, during the job or after it.
 
-Returns `(; stage, done, err, busy, gave_up, stop, cancelled, skipped, total, remaining,
-stopped_by)`. `cancelled` counts the keys a request took out of this job; `total` includes the
+Returns `(; stage, done, err, busy, gave_up, stop, cancelled, held_back, collisions, skipped,
+total, remaining, stopped_by)`. `cancelled` counts the keys a request took out of this job;
+`held_back` the keys not started because they could not get anywhere before the deadline;
+`collisions` the keys that were handed to a worker and came back because another master took
+them first; `total` includes the
 keys a request added; `remaining` is how many keys are not done after the round (`0`: the sweep
 is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, `:underused`, or `nothing`: a stage that finished every key reports `nothing` even if the
 deadline passed while its last key ran, since no key was ever held back by it.
@@ -358,6 +416,8 @@ function run!(
     master::Union{Master,Nothing}=nothing,
     spawn=nothing,
     key_class=nothing,
+    cost=nothing,
+    min_time=nothing,
 )
     stage = Symbol(vault.run)
     # A master handed in outlives this call (`run_loop!` between rounds); one made here does not.
@@ -394,6 +454,8 @@ function run!(
             gave_up=0,
             stop=0,
             cancelled=0,
+            held_back=0,
+            collisions=0,
             skipped=length(keys),
             total=length(keys),
             remaining=0,
@@ -402,6 +464,7 @@ function run!(
     end
 
     log_event(log, :stage_start; stage=stage, total=length(keys), todo=length(todo))
+    collisions0 = master.collisions
 
     # Dispatch strategy: fan out when Distributed workers are present (unless the
     # caller forced `workers=:sequential`), otherwise draw the queue on this process.
@@ -438,6 +501,9 @@ function run!(
     _observe_processes!(vault, multi, observe, log, stage)
     # The master's view of the round: one pass over the markers, then the queue the dispatcher
     # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
+    todo = _ordered(todo, opts, cost)
+    # Whether a key can still get somewhere before the deadline; asked at each hand-out.
+    fits = _fits(opts, something(min_time, cost, Returns(0.0)))
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
     scan = _scan!(table, vault, stage, log, opts)
     master.locks = Dict{String,Any}(String(k) => v for (k, v) in pairs(scan))
@@ -457,10 +523,19 @@ function run!(
             affinity=affinity,
             prepare=prepare,
             key_class=key_class,
+            fits=fits,
         )
     else
         () -> _drive_sequential!(
-            work_fn, vault, table, stage, log, opts, master; key_class=key_class
+            work_fn,
+            vault,
+            table,
+            stage,
+            log,
+            opts,
+            master;
+            key_class=key_class,
+            fits=fits,
         )
     end
     try
@@ -488,6 +563,7 @@ function run!(
     n_gave_up = 0
     n_stop = 0
     n_cancelled = 0
+    n_held_back = 0
     n_complete = 0
     stop_seen = nothing
     for row in table.rows
@@ -513,6 +589,8 @@ function run!(
                 (stop_seen = something(_stop_reason(opts), master.ctl.stop_why))
         elseif outcome === :cancelled
             n_cancelled += 1
+        elseif outcome === :no_fit
+            n_held_back += 1
         elseif outcome === :gave_up
             n_gave_up += 1
             n_err += 1
@@ -543,8 +621,23 @@ function run!(
         gave_up=n_gave_up,
         stop=n_stop,
         cancelled=n_cancelled,
+        held_back=n_held_back,
+        collisions=master.collisions - collisions0,
         skipped=length(keys) - length(todo),
         stopped_by=stopped_by === nothing ? nothing : String(stopped_by),
+    )
+    # Said once, with the count: the keys this job did not start because they could not get
+    # anywhere before its deadline.
+    n_held_back > 0 && log_event(
+        log,
+        :held_back;
+        stage=stage,
+        keys=n_held_back,
+        secs_left=if opts.deadline === nothing
+            nothing
+        else
+            round(Int, opts.deadline - time())
+        end,
     )
     return (
         stage=stage,
@@ -554,6 +647,8 @@ function run!(
         gave_up=n_gave_up,
         stop=n_stop,
         cancelled=n_cancelled,
+        held_back=n_held_back,
+        collisions=master.collisions - collisions0,
         skipped=length(keys) - length(todo),
         # What the manifest already had, plus every row of the table: the keys a request added
         # while the round ran are rows too.
@@ -867,6 +962,7 @@ function _drive_sequential!(
     opts::RunOpts,
     master::Master;
     key_class=nothing,
+    fits=Returns(true),
 )
     c = master.ctl
     while true
@@ -885,7 +981,7 @@ function _drive_sequential!(
             poll_control!(master, table, log, opts; force=true)
             continue
         end
-        i = next_task!(table, myid())
+        i = _next_fitting!(table, myid(), fits)
         i === nothing && break
         row = table.rows[i]
         tok = owner_token()
@@ -912,6 +1008,7 @@ function _drive_sequential!(
             _out_remove!(tok)
         end
         delete!(c.stopping, row.kstr)
+        outcome === :lock_busy && (master.collisions += 1)
         _account_key!(master, vault, row, myid(), t0, outcome)
         settle!(table, i, outcome)
     end
@@ -1013,6 +1110,7 @@ function _drive_workers!(
     affinity=nothing,
     prepare=nothing,
     key_class=nothing,
+    fits=Returns(true),
 )
     c = master.ctl
     # All dispatch tasks and the ticker are `@async` on this task's thread, so a plain counter and
@@ -1048,7 +1146,7 @@ function _drive_workers!(
                 break
             end
             host in c.drained && break
-            i = (c.paused || stopped[]) ? nothing : next_task!(table, pid)
+            i = (c.paused || stopped[]) ? nothing : _next_fitting!(table, pid, fits)
             if i === nothing
                 # Leave when nothing is out and nothing can arrive. A paused master keeps its
                 # queue, and its dispatch tasks with it.
@@ -1132,6 +1230,7 @@ function _drive_workers!(
                 # not at all. Whatever it is, the unit was stopped, not failed.
                 order.cut && outcome !== :ok && (outcome = :stopped)
             end
+            outcome === :lock_busy && (master.collisions += 1)
             _account_key!(master, vault, row, pid, t0, outcome)
             if outcome === nothing
                 # What it had reported before it died is where the next worker starts.
@@ -1459,7 +1558,7 @@ known to be missing.
 one level deep and resolved inside `work_fn`, so this is "all of the prerequisite, then all of the
 dependents", not a DAG.
 
-`affinity`, `spawn` and `key_class` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
+`affinity`, `spawn`, `key_class`, `cost` and `min_time` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
 [`Master`](@ref) for all its rounds, so what a [`control!`](@ref) request changed — a cancelled
 filter, enqueued keys, a pause — holds from round to round, and a `:stop` with no scope ends the
 loop (`stopped_by = :request`).
@@ -1481,6 +1580,8 @@ function run_loop!(
     observe::Bool=true,
     spawn=nothing,
     key_class=nothing,
+    cost=nothing,
+    min_time=nothing,
 )
     pre = nothing
     if prerequisite !== nothing
@@ -1525,12 +1626,20 @@ function run_loop!(
             master=master,
             spawn=spawn,
             key_class=key_class,
+            cost=cost,
+            min_time=min_time,
         )
         n_done += result.done
         n_busy = result.busy
         # Every key is done. No later round can find anything, and sitting out
         # `max_empty_rounds` idle rounds would hold the allocation for nothing.
         result.remaining == 0 && break
+        # Nothing was done, nobody else holds anything, and what is left was held back: no key
+        # that remains can get anywhere before the deadline. Idle rounds would not change that.
+        if result.done == 0 && result.busy == 0 && result.held_back > 0
+            stopped = :deadline
+            break
+        end
         if result.done > 0
             empty_count = 0
             busy_waited = 0.0
@@ -1581,6 +1690,61 @@ function run_loop!(
         stopped_by=stopped,
         prerequisite=pre,
     )
+end
+
+# `todo` in the order it is drawn: the caller's, or longest expected time first; then, for a
+# master that is one of several, its own share of the keys ahead of the others'.
+function _ordered(todo::Vector{DataKey}, opts::RunOpts, cost)
+    out = todo
+    if opts.order === :longest_first && cost !== nothing
+        # Stable, so keys of equal cost keep the caller's order.
+        out = sort(out; by=k -> -_seconds_or(cost, k, 0.0), alg=MergeSort)
+    end
+    sh = opts.shard
+    if sh !== nothing && sh[2] > 1
+        mine = [_shard_of(canonical(k), sh[2]) == sh[1] for k in out]
+        out = vcat(out[mine], out[.!mine])
+    end
+    return out
+end
+
+# Which of `m` shares a key falls in. From the key's SHA-1, not `hash`: every master, on any
+# node and Julia version, has to agree.
+function _shard_of(kstr::AbstractString, m::Int)::Int
+    d = sha1(String(kstr))
+    v = UInt64(0)
+    for b in @view d[1:8]
+        v = (v << 8) | UInt64(b)
+    end
+    return Int(v % UInt64(m))
+end
+
+# `f(key)` as seconds; a hook that throws or answers nonsense is `default`.
+function _seconds_or(f, key::DataKey, default::Float64)::Float64
+    try
+        x = Float64(f(key))
+        return isfinite(x) ? x : default
+    catch e
+        e isa InterruptException && rethrow()
+        return default
+    end
+end
+
+# `key -> Bool`: can this key still get somewhere before the deadline? Always, without one.
+function _fits(opts::RunOpts, need)
+    d = opts.deadline
+    d === nothing && return Returns(true)
+    return key -> time() + _seconds_or(need, key, 0.0) <= d
+end
+
+# The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
+function _next_fitting!(table::TaskTable, worker::Int, fits)
+    while true
+        i = next_task!(table, worker)
+        i === nothing && return nothing
+        fits(table.rows[i].key) && return i
+        settle!(table, i, :no_fit)
+    end
 end
 
 # The class label of a key, for its cost record. A `key_class` that throws costs the label, not

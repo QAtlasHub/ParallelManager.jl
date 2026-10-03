@@ -170,6 +170,8 @@ mutable struct Master
     multi::Bool
     interval::Float64
     last_status::Float64
+    # Keys handed to a worker that came back because another master had taken them.
+    collisions::Int
     short_since::Float64
     short_logged::Tuple{Int,Int,Int}
 end
@@ -197,6 +199,7 @@ function Master()
         false,
         0.0,
         0.0,
+        0,
         0.0,
         (-1, -1, -1),
     )
