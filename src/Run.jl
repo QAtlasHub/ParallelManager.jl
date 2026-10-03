@@ -88,6 +88,9 @@ Execution options for [`run!`](@ref).
   The units still running are told to stop (they leave at their next [`stop_point`](@ref), with
   their progress recorded), and `run!` returns `stopped_by = :underused`, so the allocation is
   given back instead of being held to the wall clock. `0` (the default) never does.
+- `checkpoint_every::Float64 = 600.0` — how often [`checkpoint_due`](@ref) says it is time to
+  save, inside a `work_fn` that keeps a checkpoint ([`save_checkpoint!`](@ref)). It is also due
+  at once on a stop and when the `deadline` is close. `0`: only then.
 
 # Example
 
@@ -110,6 +113,7 @@ struct RunOpts
     control_interval::Float64
     min_busy_fraction::Float64
     idle_grace::Float64
+    checkpoint_every::Float64
 end
 
 function RunOpts(;
@@ -125,6 +129,7 @@ function RunOpts(;
     control_interval::Real=10.0,
     min_busy_fraction::Real=0.0,
     idle_grace::Real=600.0,
+    checkpoint_every::Real=600.0,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -156,6 +161,7 @@ function RunOpts(;
         Float64(control_interval),
         Float64(min_busy_fraction),
         Float64(idle_grace),
+        Float64(checkpoint_every),
     )
 end
 
@@ -1305,7 +1311,16 @@ function _run_one_with_retry!(
                 resume = _read_progress_one(vault, kstr)
             end
             ctx = KeyContext(
-                vault, key, kstr, String(tok), resume, opts, reported, watch, notes
+                vault,
+                key,
+                kstr,
+                String(tok),
+                resume,
+                opts,
+                reported,
+                watch,
+                notes,
+                CheckpointState(),
             )
             payload = with(() -> work_fn(key), _KEY => ctx)
             payload isa Dict || error(
@@ -1332,7 +1347,10 @@ function _run_one_with_retry!(
             end
             # A finished unit has no resume point. Only when one was written, so a unit that
             # never reports costs no extra filesystem call.
-            reported[] && _clear_progress(vault, kstr)
+            if reported[]
+                _clear_progress(vault, kstr)
+                _clear_checkpoint(vault, kstr)
+            end
             log_event(
                 log,
                 :key_done;

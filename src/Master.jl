@@ -69,6 +69,22 @@ end
 
 StopWatch(since, master, job) = StopWatch(since, master, job, Set{String}(), 0.0, false)
 
+# A key's checkpoint bookkeeping during one `work_fn` call (Checkpoint.jl). `mode` is `:normal`
+# under `run!`; `check_checkpoints` uses `:never` (never due) and `:cut` (always due, and cut
+# after every save).
+mutable struct CheckpointState
+    const mode::Symbol
+    last::Float64             # when the key started, then when it was last saved
+    saves::Int
+    used::Bool
+    near::Bool                # the deadline is close
+    near_saved::Bool          # ... and a save has been made since it came close
+end
+
+function CheckpointState(mode::Symbol=:normal)
+    return CheckpointState(mode, time(), 0, false, false, false)
+end
+
 """
     ControlState
 
