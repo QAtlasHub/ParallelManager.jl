@@ -1387,7 +1387,7 @@ function _drive_workers!(
         isempty(fresh) && return nothing
         late = !isempty(started)
         # Workers `run!` found were readied by it; a pool's own, and any that join later, here.
-        mine = pool === nothing ? fresh : [p for p in fresh if !(p in pool.foreign)]
+        mine = pool === nothing ? Int[] : [p for p in fresh if !(p in pool.foreign)]
         ready = if prepare === nothing
             fresh
         elseif late
