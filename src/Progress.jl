@@ -61,12 +61,17 @@ it AFTER whatever makes the step resumable is on disk: the next attempt at this 
 of any job, gets the value back from [`resume_point`](@ref).
 
 Returns `false` and does nothing outside a `run!`, so a `work_fn` that calls it stays runnable on
-its own. A write that fails is not an error either: progress is advice to the next attempt, and
+its own. It also returns `false`, and writes nothing, when the unit no longer holds its key (it
+was cut after a stop's grace, or its lock was reclaimed): the stamp belongs to whoever holds the
+key now. A write that fails is not an error either: progress is advice to the next attempt, and
 losing it costs a re-probe, not a result.
 """
 function report_progress(step::Integer; of::Union{Integer,Nothing}=nothing, note="")
     ctx = _KEY[]
     ctx === nothing && return false
+    # A unit that no longer holds its key (it was cut, or reclaimed) must not write over the
+    # stamp of whoever holds it now.
+    _still_owner(ctx) || return false
     try
         _write_progress(ctx.vault, ctx.kstr, Progress(step, of, time(), String(note)))
         ctx.reported[] = true
@@ -99,6 +104,13 @@ end
 function resume_point()
     ctx = _KEY[]
     return ctx === nothing ? nothing : ctx.resume
+end
+
+# Does this `work_fn` call still hold its key's lock? Outside the per-key pipeline
+# (`check_checkpoints`) there is no lock to hold.
+function _still_owner(ctx::KeyContext)::Bool
+    ctx.cp.mode === :normal || return true
+    return DataVault.running_owner(ctx.vault, ctx.key) == ctx.owner
 end
 
 function _write_progress(vault::Vault, kstr::AbstractString, p::Progress)

@@ -86,6 +86,10 @@ With `step`, the progress stamp is written too ([`report_progress`](@ref)), whic
 status, the lock listing and the account read: "alive and advancing", and how much of the key was
 kept when it was cut. Without `step` the stamp counts the saves.
 
+A unit that no longer holds its key (cut after a stop's grace, or reclaimed) does not save: the
+call throws [`StopRequested`](@ref), so the unit leaves and the checkpoint of whoever holds the
+key now is not replaced by older state.
+
 Returns `false` and does nothing outside a `run!`. A save that fails throws: a `work_fn` that
 believes it has a checkpoint it does not have would lose more than the one step.
 """
@@ -95,6 +99,9 @@ function save_checkpoint!(
     ctx = cp.ctx
     ctx === nothing && return false
     c = ctx.cp
+    # The key is no longer this unit's: its state must not replace the new owner's checkpoint,
+    # and it has nothing left to compute for. It leaves here, as at a stop.
+    _still_owner(ctx) || throw(StopRequested())
     path = _checkpoint_file(ctx.vault, ctx.kstr)
     mkpath(dirname(path))
     # The extension stays `.jld2`: JLD2 picks its format from it.

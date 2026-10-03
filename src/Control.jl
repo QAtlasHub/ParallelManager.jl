@@ -159,12 +159,14 @@ Send a request to every master running on `vault`'s `(project, run)` and return 
 | :------------ | :-------------------------------- | :-------------------------------------------------- |
 | `:enqueue`    | `keys=` or `config=`              | add units to the queue; `config` is a ParamIO config the master expands. Units already done are settled, not recomputed |
 | `:cancel`     | `select=`, `samples=`, `running=`  | drop queued units matching the filter, for the rest of the job; with `running=true` also stop the running ones (see `:stop`) |
-| `:stop`       | `select=`/`samples=`, or `node=`, or neither; `grace=`, `interrupt=` | running units in scope stop at their next safe point ([`should_stop`](@ref)); queued units in scope are not started. With neither filter nor node the scope is everything and the master returns. After `grace` seconds a unit still running is cut: its lock is released so another worker or job can take the key, and whatever it returns is discarded |
+| `:stop`       | `select=`/`samples=`, or `node=`, or neither; `grace=` | running units in scope stop at their next safe point ([`should_stop`](@ref)); queued units in scope are not started. With neither filter nor node the scope is everything and the master returns. After `grace` seconds a unit still running is cut: its worker is removed, then its lock released, so the round returns and another worker or job can take the key |
 | `:prioritise` | `select=`, `samples=`              | move matching queued units to the front             |
 | `:resize`     | `n=`                              | retire workers down to `n` (idle ones first, each after its current unit), or start more through the `spawn` hook of [`run!`](@ref) |
 | `:drain`      | `node=`                           | stop dispatching to the workers on a node           |
 | `:pause`      |                                   | no new dispatch; running units continue             |
 | `:resume`     |                                   | undo `:pause`                                       |
+
+`interrupt` is accepted for compatibility and ignored: a cut now removes the worker.
 
 `master` limits the request to one master (its id, or its scheduler job id). A master applies only
 requests made after it started, so an old `:stop` does not stop next week's job.
@@ -549,9 +551,7 @@ function _order_stops!(m::Master, table::Union{TaskTable,Nothing}, pred, req::Ab
     return length(rows)
 end
 
-# Cut the units that were told to stop and are still running past their grace: release the lock
-# the master named, so the key is free for another worker or job now. The worker is not waited
-# for; whatever it returns for that key is refused at the owner-checked commit.
+# Cut the units that were told to stop and are still running past their grace (`_cut!`).
 function _enforce_stops!(m::Master, table::TaskTable, log::EventLog)::Bool
     c = m.ctl
     isempty(c.stopping) && return false
@@ -567,33 +567,79 @@ function _enforce_stops!(m::Master, table::TaskTable, log::EventLog)::Bool
         (o.cut || time() <= o.deadline) && continue
         o.cut = true
         changed = true
-        tok = row.owner
+        _cut!(m, row, o, log)
+    end
+    return changed
+end
+
+# Cut one unit that outlived its grace. The worker goes FIRST, then the lock: released while the
+# worker was still computing, the key would be taken by another master and the first worker
+# would go on writing its checkpoint and progress over the new owner's. With the worker removed
+# the dispatch task's call returns, so the round — and the allocation — is not held by a unit
+# that was told to stop.
+#
+# A worker whose launcher this process cannot kill (one started by a cluster manager that keeps
+# no process handle) is asked to leave and may not; that is said in the event
+# (`worker_removed=false`), and the unit's writes are refused by the owner check instead.
+function _cut!(m::Master, row::TaskRow, o::StopOrder, log::EventLog)
+    v = m.vault
+    tok = row.owner
+    pid = row.worker
+    task = @async begin
+        removed = false
+        if pid != 0 && pid != myid()
+            _kill_worker!(pid)
+            removed = !(pid in procs())
+        end
+        released = false
+        err = nothing
         try
-            tok === nothing || DataVault.clear_running!(v, row.key, tok)
+            released = tok === nothing ? false : DataVault.clear_running!(v, row.key, tok)
         catch e
             e isa InterruptException && rethrow()
+            err = _short_err(e)
+        end
+        # The dispatch task releases a dead worker's lock too, and may have got there first:
+        # what matters, and what is reported, is that the lock is no longer this unit's.
+        if !released && err === nothing
+            released = try
+                DataVault.running_owner(v, row.key) != tok
+            catch
+                false
+            end
         end
         log_event(
             log,
             :key_cut;
             level=:warn,
             stage=m.stage,
-            key=kstr,
+            key=row.kstr,
             owner=tok,
-            worker=row.worker,
+            worker=pid,
             request=o.request,
+            worker_removed=removed,
+            lock_released=released,
+            err=err,
         )
-        if o.interrupt && row.worker != 0 && row.worker != myid()
-            # Best effort, and only on request: whether a signal reaches the computation depends
-            # on the cluster manager and on where the worker is when it arrives.
-            try
-                interrupt(row.worker)
-            catch e
-                e isa InterruptException && rethrow()
-            end
-        end
     end
-    return changed
+    push!(m.ctl.cuts, task)
+    return nothing
+end
+
+# Give every running unit a stop order with `grace`, for a stop that did not come as a request
+# (the job's flag or deadline).
+function _order_stops_all!(m::Master, table::TaskTable, grace::Real, why::AbstractString)
+    isfinite(grace) || return 0
+    rows = lock(table.lock) do
+        return [r for r in table.rows if r.state === :running]
+    end
+    n = 0
+    for r in rows
+        haskey(m.ctl.stopping, r.kstr) && continue
+        m.ctl.stopping[r.kstr] = StopOrder(time() + grace, false, String(why), false)
+        n += 1
+    end
+    return n
 end
 
 # Bring the number of dispatching workers to `ctl.target`.

@@ -552,6 +552,90 @@ end
     end
 end
 
+@testset "workers: a cut returns — the worker is removed, then the lock released (#100)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            target = ks[1]
+            sel = Dict(String(n) => val for (n, val) in target.params)
+            tname = ParamIO.canonical(target)
+            # A unit that would hold the job for a minute and never looks at should_stop.
+            work = k -> begin
+                ParamIO.canonical(k) == tname && sleep(60)
+                return Dict{String,Any}("x" => 1)
+            end
+            before = nworkers()
+            t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
+            t0 = time()
+            while !DataVault.is_running(v, target) && time() - t0 < 60
+                sleep(0.05)
+            end
+            t_stop = time()
+            control!(v, :stop; select=sel, grace=0.2)
+            r = fetch(t)
+            @test time() - t_stop < 40                         # not the minute the unit wanted
+            @test (r.stop, r.done, r.err) == (1, 1, 0)
+            @test !DataVault.is_done(v, target)
+            @test !DataVault.is_running(v, target)
+            @test nworkers() == before - 1                     # the worker is gone
+            cut = only([e for e in _ct_events(outdir) if e.kind == "key_cut"])
+            @test cut.worker_removed == true
+            @test cut.lock_released == true
+        end
+    end
+end
+
+@testset "workers: the job's own stop has a grace too (stop_grace) (#100)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)[1:1]
+            flag = joinpath(outdir, "STOP")
+            work = k -> (touch(flag); sleep(60); Dict{String,Any}("x" => 1))
+            t0 = time()
+            r = run!(
+                work,
+                v,
+                ks;
+                opts=RunOpts(; control_interval=0.2, stop_flag=flag, stop_grace=0.3),
+            )
+            @test time() - t0 < 45
+            @test (r.done, r.stop) == (0, 1)
+            @test r.stopped_by === :flag
+            @test count(e -> e.kind == "key_cut", _ct_events(outdir)) == 1
+        end
+    end
+end
+
+@testset "a unit that lost its key writes neither progress nor a checkpoint over the new owner's (#100)" begin
+    _ct_vault() do v, outdir
+        k = DataVault.keys(v)[1]
+        sib = owner_token()
+        cpfile = joinpath(
+            SweepRunner.checkpoint_dir(v),
+            SweepRunner._key_hash(ParamIO.canonical(k)) * ".jld2",
+        )
+        said = Any[]
+        work = key -> begin
+            cp = SweepRunner.checkpoint()
+            save_checkpoint!(cp, "mine"; step=1)                # while it still holds the key
+            # The key changes hands: another master holds it now and has saved its own state.
+            DataVault.clear_running!(v, key)
+            DataVault.acquire_running!(v, key, sib)
+            write(cpfile, "the new owner's checkpoint")
+            push!(said, report_progress(7))
+            save_checkpoint!(cp, "stale")                       # must not land
+            return Dict{String,Any}("x" => 1)
+        end
+        r = run!(work, v, [k]; opts=_ct_opts())
+        @test said == [false]
+        @test (r.done, r.stop, r.err) == (0, 1, 0)             # it left, as at a stop
+        @test read(cpfile, String) == "the new owner's checkpoint"
+        @test read_progress(v)[ParamIO.canonical(k)].step == 1  # not 7
+        @test DataVault.running_owner(v, k) == sib
+        DataVault.clear_running!(v, k, sib)
+    end
+end
+
 @testset "cli: requests from a shell" begin
     _ct_vault() do v, outdir
         io = IOBuffer()
