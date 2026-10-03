@@ -287,10 +287,11 @@ end
     write_status(master) -> Union{String,Nothing}
 
 Write [`status_snapshot`](@ref) to [`status_path`](@ref), atomically, and return the path. A
-master that is not attached to a vault yet writes nothing. A write that fails is swallowed: the
-status is a view of the run, and must never be what stops it.
+master that is not attached to a vault yet writes nothing. A write that fails does not stop the
+run — the status is a view of it — but is logged (`status_write_failed`) when a `log` is given,
+once per run of failures.
 """
-function write_status(m::Master)
+function write_status(m::Master; log::Union{EventLog,Nothing}=nothing)
     v = m.vault
     v === nothing && return nothing
     try
@@ -298,9 +299,17 @@ function write_status(m::Master)
         path = status_path(v, m)
         atomic_write(io -> JSON3.write(io, snap), path)
         m.last_status = time()
+        m.status_failed = false
         return path
     catch e
         e isa InterruptException && rethrow()
+        # A reader of the old file will call this master gone. Said once per run of failures.
+        if log !== nothing && !m.status_failed
+            m.status_failed = true
+            log_event(
+                log, :status_write_failed; level=:warn, stage=m.stage, err=_short_err(e)
+            )
+        end
         return nothing
     end
 end
@@ -396,18 +405,26 @@ what was planned, and rewrite the status file. `run!` calls it on a timer
 (`RunOpts.status_interval`), and between keys on the sequential path.
 """
 function status_tick!(m::Master, log::EventLog)
-    try
-        _probe_workers!(m)
-        v = m.vault
-        if v !== nothing
+    # Each step by itself: one that fails must not take the others with it (the check for
+    # workers that did not join is the last, and the one that matters most).
+    steps = (
+        () -> _probe_workers!(m),
+        () -> begin
+            v = m.vault
+            v === nothing && return nothing
             p = read_progress(v)
-            lock(() -> (empty!(m.progress); merge!(m.progress, p)), m.lock)
+            return lock(() -> (empty!(m.progress); merge!(m.progress, p)), m.lock)
+        end,
+        () -> _check_short!(m, log),
+    )
+    for step in steps
+        try
+            step()
+        catch e
+            e isa InterruptException && rethrow()
         end
-        _check_short!(m, log)
-    catch e
-        e isa InterruptException && rethrow()
     end
-    return write_status(m)
+    return write_status(m; log=log)
 end
 
 # Rate-limited `status_tick!` for code that has no timer (the sequential path, between keys).
@@ -476,6 +493,10 @@ function _read_status_files(files)
             push!(out, d)
         catch e
             e isa InterruptException && rethrow()
+            # A master whose status cannot be read is treated as absent by whoever asks it about
+            # a lock: worth one line.
+            @warn "SweepRunner: a status file could not be read" file = f exception = e maxlog =
+                3
         end
     end
     return sort!(out; by=d -> (d["stage"], d["started"]))

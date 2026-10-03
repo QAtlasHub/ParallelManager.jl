@@ -102,6 +102,17 @@ stay within that guarantee.
 |                 | `idle_grace`: the master stopped on purpose (`busy`, `workers`)    |
 | `control_request` | a [`control!`](@ref) request was applied (includes `id`, `op`,   |
 |                 | `by`: who asked, `asked_at`, and `detail`: what it changed)        |
+| `control_not_applied` | a request this master could not carry out (`detail` has      |
+|                 | `error` or `unsupported`); `:warn`                                 |
+| `control_bad_request` | a request file that could not be read after three tries      |
+| `control_ack_failed` | the acknowledgement of a request could not be written         |
+| `release_failed`| a lock this master meant to release is still there (`err`)         |
+| `checkpoint_unreadable` | a key's checkpoint could not be read: kept aside (`kept`), |
+|                 | the key starts over                                                |
+| `progress_unreadable` | progress stamps that could not be read (`files`)             |
+| `status_write_failed` | the status file could not be written; once per run of        |
+|                 | failures                                                           |
+| `cost_table_failed` | the per-class cost table could not be written                  |
 | `key_stopped`   | a unit told to stop left at a safe point ([`stop_point`](@ref));   |
 |                 | no attempt spent                                                   |
 | `key_cut`       | a unit told to stop was still running after its grace: its worker  |

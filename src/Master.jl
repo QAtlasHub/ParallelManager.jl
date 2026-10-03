@@ -63,11 +63,14 @@ mutable struct StopWatch
     const master::String
     const job::String
     const seen::Set{String}
+    const unread::Dict{String,Int}
     checked::Float64
     hit::Bool
 end
 
-StopWatch(since, master, job) = StopWatch(since, master, job, Set{String}(), 0.0, false)
+function StopWatch(since, master, job)
+    return StopWatch(since, master, job, Set{String}(), Dict{String,Int}(), 0.0, false)
+end
 
 # A key's checkpoint bookkeeping during one `work_fn` call (Checkpoint.jl). `mode` is `:normal`
 # under `run!`; `check_checkpoints` uses `:never` (never due) and `:cut` (always due, and cut
@@ -110,6 +113,8 @@ mutable struct ControlState
     const stopping::Dict{String,StopOrder}
     # Cuts under way (a worker being removed, then its lock released); a round waits for them.
     const cuts::Vector{Task}
+    # Request files that could not be read, and how many times that has happened.
+    const unread::Dict{String,Int}
 end
 
 function ControlState()
@@ -128,6 +133,7 @@ function ControlState()
         DataKey[],
         Dict{String,StopOrder}(),
         Task[],
+        Dict{String,Int}(),
     )
 end
 
@@ -173,6 +179,7 @@ mutable struct Master
     multi::Bool
     interval::Float64
     last_status::Float64
+    status_failed::Bool
     # Keys handed to a worker that came back because another master had taken them.
     collisions::Int
     short_since::Float64
@@ -202,6 +209,7 @@ function Master()
         false,
         0.0,
         0.0,
+        false,
         0,
         0.0,
         (-1, -1, -1),

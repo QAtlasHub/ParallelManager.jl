@@ -287,7 +287,18 @@ with it.
 | `pause` / `resume` | no new dispatch; running units continue |
 
 A master applies only requests made after it started, so a `stop` from last
-week does not stop today's job.
+week does not stop today's job. For the same reason a request sent when no
+master is running is applied by nobody: the CLI then exits **3** and says so.
+`--wait SECONDS` waits for a master's acknowledgement and prints what it did
+(exit 4: nobody acknowledged in time; exit 5: a master could not apply it, for
+example a `resize` with no worker pool). From Julia, `wait_acks(vault, id)`
+does the same and `masters_listening(vault)` says who would read a request
+sent now.
+
+A request file that cannot be read is tried again on the next polls and, if it
+stays unreadable, reported (`control_bad_request`) and acknowledged with the
+error rather than dropped; a request a master cannot carry out is a
+`control_not_applied` warning.
 
 ### Giving a stop a bound
 

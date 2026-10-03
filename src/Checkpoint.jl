@@ -57,9 +57,11 @@ end
     load_checkpoint(cp) -> Union{Any,Nothing}
 
 The state last saved for this key with [`save_checkpoint!`](@ref) — by an earlier attempt, on any
-worker of any job — or `nothing` when there is none. A checkpoint that cannot be read is
-`nothing` too (and is logged by the caller's own means if it cares): starting over is always
-correct, resuming from a damaged file is not.
+worker of any job — or `nothing` when there is none. A checkpoint that cannot be read (a
+truncated file, a type that no longer loads after a code change) is `nothing` too: starting over
+is always correct, resuming from a damaged file is not. It is not dropped quietly, though: the
+file is moved aside (`….unreadable.<time>`) and a `checkpoint_unreadable` warning names the key,
+the error and where the file went.
 """
 function load_checkpoint(cp::Checkpoint)
     ctx = cp.ctx
@@ -71,6 +73,24 @@ function load_checkpoint(cp::Checkpoint)
         return JLD2.jldopen(f -> f["state"], path, "r")
     catch e
         e isa InterruptException && rethrow()
+        # Starting over is correct; saying nothing and letting the next save overwrite a file
+        # that might have been recoverable is not. It is kept aside and reported.
+        aside = string(path, ".unreadable.", round(Int, time()))
+        kept = try
+            mv(path, aside; force=true)
+            aside
+        catch
+            nothing
+        end
+        ctx.log === nothing || log_event(
+            ctx.log,
+            :checkpoint_unreadable;
+            level=:warn,
+            stage=ctx.stage,
+            key=ctx.kstr,
+            err=_short_err(e),
+            kept=kept,
+        )
         return nothing
     end
 end
@@ -179,6 +199,8 @@ function _call_with_checkpoints(work_fn, vault::Vault, key::DataKey, mode::Symbo
         StopWatch(time(), "", ""),
         Dict{String,Any}(),
         CheckpointState(mode),
+        nothing,
+        Symbol(vault.run),
     )
     return with(() -> work_fn(key), _KEY => ctx)
 end

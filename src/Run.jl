@@ -945,7 +945,11 @@ This is the read the workers used to do one key at a time, and the reconciliatio
 starts used to skip: it joined a vault without knowing whose locks were in it.
 """
 function _scan!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts)
-    progress = read_progress(vault)
+    lost = Ref(0)
+    progress = read_progress(vault; unreadable=lost)
+    # Those keys start without their resume point: said, with how many.
+    lost[] > 0 &&
+        log_event(log, :progress_unreadable; level=:warn, stage=stage, files=lost[])
     masters = _lazy_masters(vault)
     infos = LockInfo[]
     done = reaped = 0
@@ -1168,6 +1172,16 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
             )
         catch e
             e isa InterruptException && rethrow()
+            # Said as what it is: the lock is still there, until `stale_after`.
+            log_event(
+                log,
+                :release_failed;
+                level=:warn,
+                stage=stage,
+                key=r.kstr,
+                owner=tok,
+                err=_short_err(e),
+            )
         end
         _out_remove!(tok)
         settle!(table, i, :lock_busy)
@@ -1653,6 +1667,8 @@ function _run_one_with_retry!(
                 watch,
                 notes,
                 CheckpointState(),
+                log,
+                stage,
             )
             payload = with(() -> work_fn(key), _KEY => ctx)
             payload isa Dict || error(
@@ -1798,9 +1814,12 @@ dependents", not a DAG.
 filter, enqueued keys, a pause — holds from round to round, and a `:stop` with no scope ends the
 loop (`stopped_by = :request`).
 
-Returns `(; ran, rounds, done, busy, stopped_by, prerequisite)`. `busy` is how many keys the last
-round found held by a sibling, so a caller can tell "everything is done" from "someone else still
-has work out". `ran` is `false` exactly when a prerequisite blocked the stage.
+Returns `(; ran, rounds, done, busy, err, gave_up, remaining, stopped_by, prerequisite)`. `busy`
+is how many keys the last round found held by a sibling, so a caller can tell "everything is
+done" from "someone else still has work out". `err`, `gave_up` and `remaining` are the last
+round's: a stage whose remaining keys all fail is `done = 0, busy = 0` like a clean finish, and
+`err > 0`, `remaining > 0` is what tells them apart. `ran` is `false` exactly when a prerequisite
+blocked the stage.
 """
 function run_loop!(
     work_fn::Function, vault::Vault, keys::AbstractVector{DataKey}; pool=nothing, kwargs...
@@ -1838,6 +1857,9 @@ function _run_loop!(
             rounds=0,
             done=0,
             busy=0,
+            err=0,
+            gave_up=0,
+            remaining=length(keys),
             stopped_by=pre.stopped_by,
             prerequisite=pre,
         )
@@ -1849,6 +1871,9 @@ function _run_loop!(
     rounds = 0
     n_done = 0
     n_busy = 0
+    n_err = 0
+    n_gave_up = 0
+    n_remaining = length(keys)
     busy_waited = 0.0
     # A lock is reclaimable once its heartbeat is `stale_after` old, so waiting that long is what
     # separates "a sibling is working on it" from "the holder is gone". The margin covers the round
@@ -1879,6 +1904,7 @@ function _run_loop!(
         )
         n_done += result.done
         n_busy = result.busy
+        n_err, n_gave_up, n_remaining = result.err, result.gave_up, result.remaining
         # Every key is done. No later round can find anything, and sitting out
         # `max_empty_rounds` idle rounds would hold the allocation for nothing.
         result.remaining == 0 && break
@@ -1928,6 +1954,13 @@ function _run_loop!(
             write_cost_table(vault)
         catch e
             e isa InterruptException && rethrow()
+            log_event(
+                EventLog(joinpath(vault.outdir, "events_$(master.id).jsonl")),
+                :cost_table_failed;
+                level=:warn,
+                stage=Symbol(vault.run),
+                err=_short_err(e),
+            )
         end
     end
     return (;
@@ -1935,6 +1968,11 @@ function _run_loop!(
         rounds=rounds,
         done=n_done,
         busy=n_busy,
+        # Of the LAST round: what is still failing, and what is still not done. A stage whose
+        # remaining keys all fail used to come back looking like a clean finish.
+        err=n_err,
+        gave_up=n_gave_up,
+        remaining=n_remaining,
         stopped_by=stopped,
         prerequisite=pre,
     )

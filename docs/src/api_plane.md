@@ -74,6 +74,8 @@ SweepRunner.KeyFilter
 SweepRunner.matches
 SweepRunner.read_requests
 SweepRunner.read_acks
+SweepRunner.wait_acks
+SweepRunner.masters_listening
 SweepRunner.control_dir
 SweepRunner.poll_control!
 SweepRunner.ControlState
