@@ -529,6 +529,11 @@ function run!(
     # The master's view of the round: one pass over the markers, then the queue the dispatcher
     # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
     prepare_secs = time() - t_prepare
+    # A hook the caller gave is taken at its word: a key it has no answer for is not assumed to
+    # fit a deadline. A table this package loaded by itself is not: a class it has not seen has
+    # to run once to be seen.
+    strict_cost = cost !== nothing || min_time !== nothing
+    cost = _default_cost(vault, cost, key_class, todo, log, stage)
     todo = _ordered(todo, opts, cost)
     t_scan = time()
     # Whether a key can still get somewhere before the deadline; asked at each hand-out.
@@ -539,7 +544,8 @@ function run!(
         base_time = need_time
         need_time = key -> _pool_min_time(pool, key, opts.deadline, base_time)
     end
-    fits = _fits(opts, need_time)
+    unknown = Ref(0)
+    fits = _fits(opts, need_time; strict=strict_cost, unknown=unknown)
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
     scan = _scan!(table, vault, stage, log, opts)
     scan_secs = time() - t_scan
@@ -562,6 +568,8 @@ function run!(
                 end
                 foreach(k -> add_complete!(m, k), done_now)
                 merge_and_save_manifest!(m)
+                # The cost table with it: a job killed at its wall clock leaves what it measured.
+                write_cost_table(vault)
             catch e
                 e isa InterruptException && rethrow()
                 log_event(
@@ -719,6 +727,7 @@ function run!(
         :held_back;
         stage=stage,
         keys=n_held_back,
+        cost_unknown=unknown[],
         secs_left=if opts.deadline === nothing
             nothing
         else
@@ -1337,6 +1346,18 @@ function _drive_workers!(
                 if e isa ProcessExitedException
                     died = true
                     _release_dead!(vault, row, tok, stage, log)
+                    # The worker cannot say what the attempt cost; the master knows how long.
+                    log_event(
+                        log,
+                        :key_spent;
+                        stage=stage,
+                        key=row.kstr,
+                        outcome="worker_died",
+                        secs=time() - t0,
+                        cores=get(master.acct.cores, pid, 0),
+                        host=host,
+                        class=_class_of(key_class, row.key),
+                    )
                     ord = get(c.stopping, row.kstr, nothing)
                     if ord !== nothing && ord.cut
                         # Removed on purpose: not a death of the key, and not its memory.
@@ -1648,8 +1669,27 @@ function _run_one_with_retry!(
         t0 = time()
         cpu0 = _cpu_seconds()
         notes = Dict{String,Any}()
-        # The peak is counted from here, so it is this key's and not the worker's lifetime's.
-        _reset_peak_rss()
+        # The peak is counted from here, so it is this key's and not the worker's lifetime's —
+        # where that reset works; where it does not, the record says the peak is the process's.
+        scope = _reset_peak_rss() ? "key" : "process"
+        # What this attempt cost, for an attempt that did not finish the key: without it the
+        # classes that fail, are cut, or run long and resume are the ones with no data.
+        spent =
+            outcome -> log_event(
+                log,
+                :key_spent;
+                stage=stage,
+                key=kstr,
+                outcome=String(outcome),
+                secs=time() - t0,
+                attempt=attempt,
+                cpu=_finite(_cpu_seconds() - cpu0),
+                cores=_my_cores(),
+                rss=_peak_rss(),
+                rss_scope=scope,
+                host=gethostname(),
+                class=String(class),
+            )
         try
             # What `work_fn` can ask about the key it was handed (`resume_point`,
             # `report_progress`). A retry starts from what the failed attempt reported.
@@ -1679,6 +1719,7 @@ function _run_one_with_retry!(
                 # A sibling master reclaimed our lock while work_fn ran; it now
                 # owns this key. Discard our result rather than double-committing.
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                spent(:lock_lost)
                 return :lock_busy
             end
             # The digest save! took before its rename goes into the marker, so `.done` names the
@@ -1691,6 +1732,7 @@ function _run_one_with_retry!(
             )
             if !committed
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                spent(:lock_lost)
                 return :lock_busy
             end
             # A finished unit has no resume point. Only when one was written, so a unit that
@@ -1712,6 +1754,7 @@ function _run_one_with_retry!(
                 cpu=_finite(_cpu_seconds() - cpu0),
                 cores=_my_cores(),
                 rss=_peak_rss(),
+                rss_scope=scope,
                 host=gethostname(),
                 class=String(class),
                 note=notes,
@@ -1727,6 +1770,7 @@ function _run_one_with_retry!(
             # Not a failure either: the unit was told to stop and left at a safe point.
             if e isa StopRequested
                 log_event(log, :key_stopped; stage=stage, key=kstr, attempt=attempt)
+                spent(:stopped)
                 return :stopped
             end
             # A unit whose lock is gone (cut after its grace, or reclaimed) has nothing to retry
@@ -1735,6 +1779,7 @@ function _run_one_with_retry!(
             # `lock_lost`, and the exception was never seen.
             last_err = _short_err(e)
             log_event(log, :error; stage=stage, key=kstr, attempt=attempt, err=last_err)
+            spent(:error)
             if DataVault.running_owner(vault, key) != tok
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
                 return :lock_busy
@@ -1949,7 +1994,7 @@ function _run_loop!(
         account=account_snapshot(master),
     )
     # What the keys cost, where the next job (and whatever sizes it) can read it.
-    if n_done > 0
+    if rounds > 0
         try
             write_cost_table(vault)
         catch e
@@ -1984,7 +2029,8 @@ function _ordered(todo::Vector{DataKey}, opts::RunOpts, cost)
     out = todo
     if opts.order === :longest_first && cost !== nothing
         # Stable, so keys of equal cost keep the caller's order.
-        out = sort(out; by=k -> -_seconds_or(cost, k, 0.0), alg=MergeSort)
+        # A key of unknown cost sorts as the shortest: it is not put ahead of the measured ones.
+        out = sort(out; by=k -> -something(key_seconds(cost, k), 0.0), alg=MergeSort)
     end
     sh = opts.shard
     if sh !== nothing && sh[2] > 1
@@ -2005,22 +2051,67 @@ function _shard_of(kstr::AbstractString, m::Int)::Int
     return Int(v % UInt64(m))
 end
 
-# `f(key)` as seconds; a hook that throws or answers nonsense is `default`.
-function _seconds_or(f, key::DataKey, default::Float64)::Float64
+"""
+    key_seconds(f, key) -> Union{Float64,Nothing}
+
+Ask a cost hook (`cost`, `min_time`) about one key, guarded: `nothing` when the hook throws or
+answers something that is not a finite, non-negative number. This is the one way the run, the
+campaign and the job controller ask, so "unknown" is the same everywhere — and is never silently
+zero.
+"""
+function key_seconds(f, key::DataKey)::Union{Float64,Nothing}
     try
         x = Float64(f(key))
-        return isfinite(x) ? x : default
+        return (isfinite(x) && x >= 0) ? x : nothing
     catch e
         e isa InterruptException && rethrow()
-        return default
+        return nothing
     end
 end
 
 # `key -> Bool`: can this key still get somewhere before the deadline? Always, without one.
-function _fits(opts::RunOpts, need)
+# A key whose need is unknown is not assumed to fit when the hook is the caller's (`strict`);
+# `unknown` counts those.
+function _fits(opts::RunOpts, need; strict::Bool=false, unknown=Ref(0))
     d = opts.deadline
     d === nothing && return Returns(true)
-    return key -> time() + _seconds_or(need, key, 0.0) <= d
+    return key -> begin
+        t = key_seconds(need, key)
+        if t === nothing
+            strict || return true
+            unknown[] += 1
+            return false
+        end
+        return time() + t <= d
+    end
+end
+
+# The cost hook `run!` works with: the measured table of this stage where there is one, with the
+# caller's hook for the classes it has not seen. Said in the log, with how many of this round's
+# keys fell back.
+function _default_cost(vault::Vault, cost, key_class, todo, log::EventLog, stage::Symbol)
+    key_class === nothing && return cost
+    table = try
+        load_cost_table(vault; strict=true)
+    catch e
+        e isa InterruptException && rethrow()
+        log_event(log, :cost_table_unreadable; level=:warn, stage=stage, err=_short_err(e))
+        return cost
+    end
+    isempty(table) && return cost
+    fallback = cost === nothing ? (k -> NaN) : cost
+    seen = count(k -> haskey(table, _class_of(key_class, k)), todo)
+    log_event(
+        log,
+        :cost_source;
+        stage=stage,
+        source="measured",
+        classes=length(table),
+        measured_keys=seen,
+        fallback_keys=length(todo) - seen,
+        fallback=cost === nothing ? "none" : "the caller's cost",
+    )
+    return measured_cost(table, k -> _class_of(key_class, k); fallback=fallback)
 end
 
 # The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
@@ -2111,4 +2202,4 @@ function _with_extra(keys::AbstractVector{DataKey}, extra::Vector{DataKey})
     return vcat(collect(keys), DataKey[k for k in extra if !(canonical(k) in have)])
 end
 
-export RunOpts, run!, run_loop!, manifest_root, load_manifest, todo_count
+export RunOpts, run!, run_loop!, manifest_root, load_manifest, todo_count, key_seconds

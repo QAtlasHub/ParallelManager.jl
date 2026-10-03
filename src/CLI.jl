@@ -201,11 +201,24 @@ function _cli_jobs(io::IO, rest)
     end
     ctl = JobController(_CLI_SCHEDULER[](), policy, c.outdir)
     work = campaign_work(s -> (;), c)
-    if every === nothing
-        print_decisions(io, manage!(ctl, work), ctl.ledger, policy)
-    else
-        controller_loop!(ctl, work; interval=every)
-        print_decisions(io, Decision[], ctl.ledger, policy)
+    try
+        if every === nothing
+            print_decisions(io, manage!(ctl, work), ctl.ledger, policy)
+        else
+            controller_loop!(ctl, work; interval=every)
+            print_decisions(io, Decision[], ctl.ledger, policy)
+        end
+    catch e
+        e isa ArgumentError || rethrow()
+        # A profile with `max_key_time` needs a cost per key, and the command line has none.
+        println(io, "sweeprunner jobs: ", e.msg)
+        println(
+            io,
+            "  The command line has no cost model. Run the controller from Julia with ",
+            "`campaign_work(open_stage, campaign; cost = …)`, or use a profile without ",
+            "max_key_time for this partition.",
+        )
+        return 2
     end
     return 0
 end

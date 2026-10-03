@@ -13,8 +13,14 @@ function _co_vault(f; run="co")
     end
 end
 
-function _co_cost(class, wall; cpu=wall, cores=1, rss=1000)
-    return KeyCost("s", "k", class, wall, cpu, cores, rss, "h", 1, Dict{String,Any}())
+const _CO_N = Ref(0)
+
+# One finished attempt of its own key (every call is a different key).
+function _co_cost(class, wall; cpu=wall, cores=1, rss=1000, key=nothing, outcome="ok")
+    k = key === nothing ? "k$(_CO_N[] += 1)" : key
+    return KeyCost(
+        "s", k, class, wall, cpu, cores, rss, "h", 1, Dict{String,Any}(), outcome, "key"
+    )
 end
 
 # Burn CPU for about `secs` and hold `mb` MiB, so both show up in the record.
@@ -139,4 +145,118 @@ end
         write(SweepRunner.cost_table_path(v), "{ not json")
         @test isempty(load_cost_table(v))
     end
+end
+
+@testset "cost_summary: a key's time is the sum over its attempts; unfinished keys are counted" begin
+    cs = [
+        # One key: two legs that did not finish it, then the one that did.
+        _co_cost("a", 100.0; key="x", outcome="stopped"),
+        _co_cost("a", 50.0; key="x", outcome="error"),
+        _co_cost("a", 30.0; key="x"),
+        _co_cost("a", 20.0; key="y"),
+        # A key that never finished: killed for memory twice.
+        _co_cost("a", 5.0; key="z", outcome="worker_died", rss=9000),
+        _co_cost("a", 6.0; key="z", outcome="worker_died", rss=9500),
+    ]
+    a = cost_summary(cs)["a"]
+    @test a.n == 2                                   # x and y finished
+    @test a.wall_p90 == 180.0                        # x took 100 + 50 + 30, not its last 30
+    @test a.wall_median == 20.0
+    @test a.unfinished == 1                          # z
+    @test a.rss_peak == 9500                         # the peak of the attempts that died counts
+    @test a.rss_process == false
+    only_dead = cost_summary([_co_cost("b", 5.0; outcome="worker_died")])["b"]
+    @test only_dead.n == 0 && isnan(only_dead.wall_median) && only_dead.unfinished == 1
+end
+
+@testset "every attempt leaves a record, with its outcome (#106)" begin
+    _co_vault() do v, _
+        k = DataVault.keys(v)[1]
+        n = Ref(0)
+        work = key -> begin
+            n[] += 1
+            sleep(0.3)
+            n[] == 1 && error("first leg fails")
+            return Dict{String,Any}("x" => 1)
+        end
+        r = run!(work, v, [k]; opts=RunOpts(; max_attempts=2), key_class=key -> "c")
+        @test r.done == 1
+        cs = key_costs(v)
+        @test [c.outcome for c in sort(cs; by=c -> c.attempt)] == ["error", "ok"]
+        @test all(c -> c.class == "c" && c.wall >= 0.3 && c.rss > 0, cs)
+        @test all(c -> c.rss_scope in ("key", "process"), cs)
+        # The class's time is both legs.
+        @test cost_summary(cs)["c"].wall_median >= 0.6
+        @test cost_summary(cs)["c"].n == 1
+    end
+    # A key that never finishes is on record too, as unfinished.
+    _co_vault() do v, _
+        k = DataVault.keys(v)[1]
+        run!(
+            key -> error("always"),
+            v,
+            [k];
+            opts=RunOpts(; max_attempts=2),
+            key_class=key -> "c",
+        )
+        s = cost_summary(key_costs(v))["c"]
+        @test (s.n, s.unfinished) == (0, 1)
+        write_cost_table(v)
+        @test isempty(load_cost_table(v))            # nothing to estimate from
+    end
+end
+
+@testset "the measured table is the default cost, and the fallback is said (#106)" begin
+    _co_vault() do v, outdir
+        ks = DataVault.keys(v)
+        class = k -> "N=$(k.params["N"])"
+        n4 = [k for k in ks if k.params["N"] == 4]
+        n8 = [k for k in ks if k.params["N"] == 8]
+        run_loop!(k -> (sleep(0.05); Dict{String,Any}("x" => 1)), v, n4; key_class=class)
+        @test collect(keys(load_cost_table(v))) == ["N=4"]
+        # The next round finds the table by itself; N=8 has not been seen.
+        run!(k -> Dict{String,Any}("x" => 1), v, n8; key_class=class, cost=k -> 7.0)
+        logs = filter(f -> startswith(f, "events_"), readdir(outdir))
+        ev = [JSON3.read(l) for f in logs for l in readlines(joinpath(outdir, f))]
+        src = only([e for e in ev if e.kind == "cost_source"])
+        @test src.source == "measured"
+        @test (src.measured_keys, src.fallback_keys) == (0, length(n8))
+        @test src.fallback == "the caller's cost"
+        # A table that cannot be read is said, and the run goes on with the caller's hook.
+        write(SweepRunner.cost_table_path(v), "{ not json")
+        @test_throws Exception load_cost_table(v; strict=true)
+        v2 = DataVault.Vault(_CO_CFG; run="co2", outdir=outdir)
+        mkpath(dirname(SweepRunner.cost_table_path(v2)))
+        write(SweepRunner.cost_table_path(v2), "{ not json")
+        r = run!(k -> Dict{String,Any}("x" => 1), v2, DataVault.keys(v2); key_class=class)
+        @test r.done == length(ks)
+        ev = [JSON3.read(l) for f in logs for l in readlines(joinpath(outdir, f))]
+        @test any(e -> e.kind == "cost_table_unreadable", ev)
+    end
+end
+
+@testset "the table is kept while the round runs, not only at a clean end (#106)" begin
+    _co_vault() do v, _
+        ks = DataVault.keys(v)
+        seen = Bool[]
+        work = k -> begin
+            push!(seen, haskey(load_cost_table(v), "c"))
+            sleep(0.05)
+            return Dict{String,Any}("x" => 1)
+        end
+        run!(work, v, ks; opts=RunOpts(; manifest_interval=0.01), key_class=k -> "c")
+        # A job killed after its second key would have left what the first one cost.
+        @test seen[1] == false
+        @test seen[end] == true
+    end
+end
+
+@testset "key_seconds: one guarded way to ask a cost hook" begin
+    k = ParamIO.DataKey(Dict{String,Any}("N" => 1), 1)
+    @test key_seconds(x -> 12, k) == 12.0
+    @test key_seconds(x -> NaN, k) === nothing
+    @test key_seconds(x -> Inf, k) === nothing
+    @test key_seconds(x -> -1.0, k) === nothing
+    @test key_seconds(x -> error("no model"), k) === nothing
+    @test key_seconds(x -> "soon", k) === nothing
 end
