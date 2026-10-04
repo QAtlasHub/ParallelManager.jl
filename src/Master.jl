@@ -206,6 +206,10 @@ mutable struct Master
     min_utilisation::Float64
     low_since::Float64
     low_said::Float64
+    # The cores THIS master has to fill: its pool's nodes, or its node group. `0`: not told —
+    # then the job's cores less what the other masters of the job report as theirs.
+    own_cores::Int
+    util_unknown_said::Bool
 end
 
 function Master()
@@ -242,6 +246,8 @@ function Master()
         0.5,
         0.0,
         0.0,
+        0,
+        false,
     )
 end
 

@@ -220,8 +220,9 @@ A warning that exists only as a line in `events_<host>_<pid>.jsonl` is one
 somebody has to go and find. So:
 
 - **Warn-level events are also printed on the master's stderr** — the job's
-  output — rate-limited per kind: the first of a kind, then every hundredth,
-  with the count. `stage_done` carries the round's warnings by kind, and the
+  output — rate-limited per kind: the first of a kind, then at most one a
+  minute, with the count; an *error* is always printed. Warnings logged on a
+  worker are in the event file only. `stage_done` carries the round's warnings by kind, and the
   master prints one line when a stage ends (`stage … ended with warnings:
   key_cut ×3, pool_at_limit ×1`). `SweepRunner.echo_warnings!(nothing)` or
   `SWEEPRUNNER_QUIET_WARNINGS=1` turns the echo off; the event file always has
@@ -232,7 +233,11 @@ somebody has to go and find. So:
   `RunOpts(min_utilisation = 0.5)` of the *allocated* cores have a key, with
   keys queued, for ten minutes, the master says `low_utilisation` with the
   reason it can see: the workers cover only part of the allocation (planned /
-  launched / joined), or workers are idle with keys nobody fits. This is the
+  launched / joined), or workers are idle with keys nobody fits. "Allocated"
+  is the master's own share: its pool's nodes, its node group
+  (`SWEEPRUNNER_NODELIST`), or the job's cores less what the other masters of
+  the job report as theirs — so four masters each filling a quarter are each
+  at 100%. This is the
   check `workers_short` is not — that one compares the workers that joined
   with the ones that were planned, and a plan that is too small passes it.
 - An allocation that cannot be read (`SLURM_JOB_CPUS_PER_NODE` missing or not
