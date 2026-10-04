@@ -1,7 +1,9 @@
 # CLI — asking a sweep from a shell.
 #
 #     sweeprunner status <outdir> [--workers] [--json]
-#     sweeprunner locks  <outdir>
+#     sweeprunner locks  <outdir> [--reap]
+#     sweeprunner account <outdir>
+#     sweeprunner costs <outdir>
 #     sweeprunner campaign <meta.toml> [--profile NAME] [--studies a,b]
 #     sweeprunner jobs <meta.toml> [--submit] [--loop SECONDS]
 #     sweeprunner pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir> [options]
@@ -43,7 +45,7 @@ usage: sweeprunner <command> <outdir> [options]
       --loop repeats every SECONDS until nothing is left.
 
   pause | resume <outdir>
-  stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS] [--interrupt]
+  stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS]
   cancel <outdir> --select name=v1,v2 [...] [--samples 1,2] [--running] [--grace SECONDS]
   prioritise <outdir> --select name=v1,v2 [...] [--samples 1,2]
   resize <outdir> --n N
@@ -60,8 +62,17 @@ usage: sweeprunner <command> <outdir> [options]
 """
     cli(args=ARGS; io=stdout) -> Int
 
-The `sweeprunner` command line. Returns the exit code: `0`, or `2` for a usage error (the usage
-text is printed to `io`).
+The `sweeprunner` command line. Returns the exit code:
+
+| code | meaning |
+|---|---|
+| `0` | done |
+| `1` | nothing to act on (no sweep state under `<outdir>`; a campaign that is not launchable), or `locks --reap` could not remove a dead lock |
+| `2` | usage error (the usage text is printed to `io`) |
+| `3` | a request was written and no master that reports a status is running to apply it |
+| `4` | `--wait`: a listening master did not acknowledge in time (it is named) |
+| `5` | `--wait`: a master answered that the request was refused or is unsupported |
+| `6` | `jobs`: the round refused — the scheduler could not be asked or trusted, the ledger could not be used, or the budget was reached |
 
 ```
 sweeprunner status out/campaign --workers
@@ -109,7 +120,13 @@ function cli(args::AbstractVector{<:AbstractString}=ARGS; io::IO=stdout)
         if "--reap" in flags
             r = reap_dead_locks!(pos[1])
             println(io, "reaped $(r.reaped) of $(r.dead) dead lock(s)")
-            r.failed == 0 || println(io, "$(r.failed) could not be removed")
+            r.changed_hands == 0 ||
+                println(io, "$(r.changed_hands) had been released or taken in the meantime")
+            if r.failed > 0
+                println(io, "$(r.failed) could not be removed:")
+                foreach(f -> println(io, "  ", f), r.failures)
+                return 1
+            end
         end
         return 0
     end
@@ -210,13 +227,19 @@ function _cli_jobs(io::IO, rest)
     work = campaign_work(s -> (;), c)
     try
         if every === nothing
-            print_decisions(io, manage!(ctl, work), ctl.ledger, policy)
+            ds = manage!(ctl, work)
+            print_decisions(io, ds, ctl.ledger, policy)
+            # A round in which nothing could be decided, or a submission was refused, is not
+            # a success for whoever calls this from a script.
+            any(d -> d.action === :refuse, ds) && return 6
         else
-            controller_loop!(ctl, work; interval=every)
+            controller_loop!(ctl, work; interval=every, io=io)
             print_decisions(io, Decision[], ctl.ledger, policy)
         end
     catch e
-        e isa ArgumentError || rethrow()
+        # Only the one error this message is about: any other `ArgumentError` used to be
+        # turned into "no cost model" too.
+        (e isa ArgumentError && occursin("max_key_time", e.msg)) || rethrow()
         # A profile with `max_key_time` needs a cost per key, and the command line has none.
         println(io, "sweeprunner jobs: ", e.msg)
         println(
@@ -313,13 +336,23 @@ function _cli_control(io::IO, op::Symbol, rest)
     if isempty(listening)
         println(
             io,
-            "no master is running under $outdir: the request was written, and nothing will ",
-            "apply it",
+            "no master is seen running under $outdir: the request was written, and nothing ",
+            "will apply it (a master run with status_interval = 0 writes no status and is ",
+            "not seen here)",
         )
         return 3
     end
-    wait_s === nothing && return 0
-    acks = _acks_under(outdir, ids, wait_s)
+    if wait_s === nothing
+        # Whether it will be applied, refused or unsupported is not known without waiting.
+        println(
+            io,
+            "sent to ",
+            length(listening),
+            " master(s); not waited for (--wait <secs> says whether each applied it)",
+        )
+        return 0
+    end
+    acks = _acks_under(outdir, ids, wait_s; masters=listening)
     if isempty(acks)
         println(
             io, "no master acknowledged within $(wait_s) s (", join(listening, ", "), ")"
@@ -332,12 +365,18 @@ function _cli_control(io::IO, op::Symbol, rest)
         println(io, a["master"], ": ", isempty(d) ? "applied" : JSON3.write(d))
         (haskey(d, "error") || haskey(d, "unsupported")) && (code = 5)
     end
+    # Every master that is listening, not the first to answer: the ones that did not are named.
+    missing = setdiff(listening, [String(a["master"]) for a in acks])
+    if !isempty(missing)
+        println(io, "no acknowledgement within $(wait_s) s from: ", join(missing, ", "))
+        code == 0 && (code = 4)
+    end
     return code
 end
 
 # The acknowledgements of the requests `ids`, wherever under `outdir` they were sent, waiting up
 # to `timeout` seconds for the first.
-function _acks_under(outdir::AbstractString, ids, timeout::Real)
+function _acks_under(outdir::AbstractString, ids, timeout::Real; masters=String[])
     t0 = time()
     while true
         acks = Dict{String,Any}[]
@@ -354,7 +393,10 @@ function _acks_under(outdir::AbstractString, ids, timeout::Real)
                 end
             end
         end
-        (!isempty(acks) || time() - t0 >= timeout) && return acks
+        # With the masters known, wait for each of them; without, for the first answer.
+        got = Set(String(get(a, "master", "")) for a in acks)
+        done = isempty(masters) ? !isempty(acks) : all(m -> m in got, masters)
+        (done || time() - t0 >= timeout) && return acks
         sleep(0.2)
     end
 end

@@ -157,22 +157,44 @@ _slurm_minutes(secs::Real) = string(max(1, ceil(Int, secs / 60)))
 # Run a command with a bound and return its stdout, or `nothing` if it failed or timed out.
 function _run_command(cmd::Cmd; timeout::Real=60.0)::Union{String,Nothing}
     out = tempname()
+    err = tempname()
+    name = String(first(cmd.exec))
+    _COMMAND_FAILURE[] = ""
     proc = try
-        run(pipeline(cmd; stdout=out, stderr=devnull); wait=false)
+        run(pipeline(cmd; stdout=out, stderr=err); wait=false)
     catch e
         e isa InterruptException && rethrow()
+        _COMMAND_FAILURE[] = "$name could not be started: $(_short_err(e))"
+        rm(err; force=true)
         return nothing
     end
     try
         if timedwait(() -> !process_running(proc), Float64(timeout); pollint=0.05) !== :ok
             kill(proc, Base.SIGKILL)
+            _COMMAND_FAILURE[] = "$name did not answer within $(timeout) s"
             return nothing
         end
-        return success(proc) ? read(out, String) : nothing
+        success(proc) && return read(out, String)
+        said = try
+            strip(read(err, String))
+        catch
+            ""
+        end
+        _COMMAND_FAILURE[] =
+            "$name exited with code $(proc.exitcode)" *
+            (isempty(said) ? "" : ": " * first(said, 500))
+        return nothing
     finally
         rm(out; force=true)
+        rm(err; force=true)
     end
 end
+
+# Why the last command run through `_run_command` gave `nothing`: could not be started, timed
+# out, or its exit code and what it wrote to stderr. The three used to be one silent `nothing`,
+# so the error was "sbatch failed" with no reason.
+const _COMMAND_FAILURE = Ref("")
+_why_failed() = isempty(_COMMAND_FAILURE[]) ? "" : " (" * _COMMAND_FAILURE[] * ")"
 
 """
     SlurmScheduler(; user=ENV["USER"], run=<run a Cmd, return its stdout or nothing>)
@@ -194,7 +216,8 @@ function submit(s::SlurmScheduler, spec::JobSpec)::String
     mins = _slurm_minutes(spec.time_limit)
     cmd = `sbatch --parsable -J $(spec.name) -p $(spec.partition) -N $(spec.nodes) -t $mins --export=$exports $(spec.script) $(spec.args)`
     out = s.run(cmd)
-    out === nothing && error("sbatch failed for job $(spec.name) on $(spec.partition)")
+    out === nothing &&
+        error("sbatch failed for job $(spec.name) on $(spec.partition)" * _why_failed())
     id = strip(first(split(strip(out), ';')))
     isempty(id) && error("sbatch printed no job id for $(spec.name)")
     return String(id)
@@ -205,7 +228,8 @@ cancel(s::SlurmScheduler, id::AbstractString) = s.run(`scancel $id`) !== nothing
 function job_states(s::SlurmScheduler)::Vector{JobState}
     # The name last, and split with a limit: a job name may contain the separator.
     out = s.run(`squeue -h -u $(s.user) -o "%i|%P|%T|%D|%l|%M|%j"`)
-    out === nothing && error("squeue failed: the jobs that exist are not known")
+    out === nothing &&
+        error("squeue failed: the jobs that exist are not known" * _why_failed())
     jobs = JobState[]
     for line in split(out, '\n'; keepempty=false)
         f = split(strip(line, ['"', ' ']), '|'; limit=7)
@@ -1263,6 +1287,7 @@ function controller_loop!(
     interval::Real=300.0,
     stop=() -> false,
     max_rounds::Union{Integer,Nothing}=nothing,
+    io::Union{IO,Nothing}=nothing,
 )
     rounds = 0
     while !stop()
@@ -1280,10 +1305,20 @@ function controller_loop!(
                 round=rounds,
                 err=_short_err(e),
             )
+            io === nothing || println(io, "round $rounds failed: ", _short_err(e))
             (max_rounds !== nothing && rounds >= max_rounds) && break
             ctl.policy.dry_run && rethrow()
             sleep(interval)
             continue
+        end
+        # With `io`, each round is said as it happens: a loop that printed nothing until it
+        # ended looked the same whether every round was refused or none.
+        if io !== nothing
+            println(io, "round $rounds:")
+            for d in decisions
+                println(io, "  ", rpad(d.action, 7), rpad(d.partition, 12), d.reason)
+            end
+            flush(io)
         end
         live = _ledger_live(ctl.ledger)
         idle = all(

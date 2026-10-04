@@ -414,7 +414,8 @@ end
 
 function _reap_under!(dir::AbstractString, masters, stale_after, log)
     infos = _locks_under(dir, masters, stale_after)
-    reaped = failed = 0
+    reaped = failed = changed = 0
+    failures = String[]
     for info in infos
         (info.verdict === :dead && info.owner !== nothing) || continue
         path = joinpath(dir, info.key)                # `_locks_under` names a lock by its path
@@ -425,9 +426,31 @@ function _reap_under!(dir::AbstractString, masters, stale_after, log)
             log === nothing ||
                 log_event(log, :reap_failed; lock=info.key, err=_short_err(e))
             failed += 1
+            push!(failures, string(info.key, ": ", _short_err(e)))
             continue
         end
-        ok || continue                                # released or reclaimed meanwhile
+        if !ok
+            # Not removed. Either it was released or reclaimed between the listing and now —
+            # not a failure, and counted so the numbers add up to the dead locks found — or it
+            # is still there under the dead holder's token, and could not be moved.
+            now_is = _read_lock_file(path)
+            if now_is !== nothing && now_is[1] == info.owner
+                failed += 1
+                push!(
+                    failures,
+                    string(
+                        info.key,
+                        ": still there under the dead holder's token; the file could not be moved",
+                    ),
+                )
+                log === nothing || log_event(
+                    log, :reap_failed; lock=info.key, err="the file could not be moved"
+                )
+            else
+                changed += 1
+            end
+            continue
+        end
         reaped += 1
         log === nothing || log_event(
             log,
@@ -438,7 +461,13 @@ function _reap_under!(dir::AbstractString, masters, stale_after, log)
             age=round(Int, info.age),
         )
     end
-    return (; lock_summary(infos)..., reaped=reaped, failed=failed)
+    return (;
+        lock_summary(infos)...,
+        reaped=reaped,
+        failed=failed,
+        changed_hands=changed,
+        failures=failures,
+    )
 end
 
 # Remove one lock judged `:dead`. Nothing here may be fatal: reaping is an optimisation over

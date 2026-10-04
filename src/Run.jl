@@ -20,7 +20,7 @@ using ParamIO: DataKey, canonical
 """
     RunOpts(; workers=:auto, max_attempts=3, stale_after=600.0, heartbeat_interval=60.0,
              stop_flag=ENV["SWEEPRUNNER_STOP_FLAG"], log_level=:info, deadline=nothing,
-             defer_poll=30.0, status_interval=60.0, control_interval=10.0,
+             deadline_in=nothing, defer_poll=30.0, status_interval=60.0, control_interval=10.0,
              min_busy_fraction=0.0, idle_grace=600.0, checkpoint_every=600.0,
              stop_grace=Inf, shard=<env>, order=:given, manifest_interval=300.0,
              stuck_after=0.0, min_utilisation=0.5)
@@ -65,10 +65,10 @@ Execution options for [`run!`](@ref).
   that misspells it gets no error and no graceful stop, only a killed job.
   Pass `stop_flag=nothing` explicitly to opt out.
 
-  **Granularity: the flag is read between keys, not inside one.** A key already
-  in `work_fn` runs to completion, so the time between raising the flag and
-  `run!` returning is bounded by the longest key, which the caller usually
-  cannot predict.
+  **Granularity: between keys, unless the unit or the options say otherwise.** By itself a
+  key already in `work_fn` runs to completion, so the time between raising the flag and `run!`
+  returning is the longest key's. A `work_fn` that calls [`stop_point`](@ref) leaves at its
+  next safe point, and `stop_grace` (below) bounds the rest by removing the worker.
 - `deadline::Union{Float64,Nothing} = nothing` — an absolute `time()` past which
   no new key is handed out. The same mechanism as `stop_flag` with the same
   in-key granularity, and the reason to have both is that a deadline is set in
@@ -127,7 +127,7 @@ The numbers are checked when the options are built: `max_attempts >= 1`; `stale_
 - `stuck_after::Float64 = 0.0` — a running key that has reported no progress for this many
   seconds (since it started, or since its last [`report_progress`](@ref) /
   [`save_checkpoint!`](@ref)) is said to be stuck: a `key_stuck` warning in the event log, once
-  per key, and `stuck` on its worker's row in the status, with a line in the warnings. Nothing
+  per stall (a key that advances and stalls again is said again), and `stuck` on its worker's row in the status, with a line in the warnings. Nothing
   is cut — a heartbeat only shows the process is alive, and this is the missing half, "alive
   and not advancing", left for a person or a [`control!`](@ref) request to act on. Set it above
   the longest step your `work_fn` takes between two reports. `0` (the default) never says it.
@@ -246,7 +246,7 @@ function RunOpts(;
     )
     0 <= min_busy_fraction <= 1 || throw(
         ArgumentError(
-            "RunOpts: min_busy_fraction is a fraction of the workers, in [0, 1]; got " *
+            "RunOpts: min_busy_fraction is a fraction of the workers' cores, in [0, 1]; got " *
             "$min_busy_fraction",
         ),
     )
@@ -1347,10 +1347,27 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
             end
         end
         try
-            DataVault.clear_running!(vault, r.key, tok)
-            log_event(
-                log, :lock_released; stage=stage, key=r.kstr, owner=tok, why="master_exit"
-            )
+            # `false`: the lock was not this token's any more (released by a cut, or taken by
+            # a sibling). Said as that, not as a release that did not happen.
+            if DataVault.clear_running!(vault, r.key, tok)
+                log_event(
+                    log,
+                    :lock_released;
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    why="master_exit",
+                )
+            else
+                log_event(
+                    log,
+                    :lock_not_ours;
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    why="master_exit: the lock was already released or is held by another",
+                )
+            end
         catch e
             e isa InterruptException && rethrow()
             # Said as what it is: the lock is still there, until `stale_after`.
@@ -2148,7 +2165,8 @@ more work to do. This is the infra equivalent of FiniteTemperature.jl's
 The loop exits when:
 - a round leaves no key undone (`remaining == 0`), at once, or
 - `max_empty_rounds` consecutive rounds produce zero new completions AND leave nothing held by a
-  sibling, or
+  sibling (once the busy budget below is spent, rounds with keys still held count as empty
+  too, so the return with `busy > 0` comes `max_empty_rounds` rounds after it, not at once), or
 - `opts.stop_flag` is raised, or `opts.deadline` has passed, or
 - a round held keys back because they could not get anywhere before `opts.deadline`
   (`held_back > 0`): the loop returns `stopped_by = :deadline` instead of sitting out idle rounds
