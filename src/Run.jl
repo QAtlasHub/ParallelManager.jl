@@ -416,6 +416,9 @@ function _stop_outcome(reason::Symbol)::Symbol
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
+# How many times a worker that joined late is readied before it is given up on.
+const _PREPARE_TRIES = 3
+
 # The ticker's steps: how often a failing one is said again, and how many failures in a row end
 # the round.
 const _TICK_SAY_EVERY = 100
@@ -1528,6 +1531,7 @@ function _drive_workers!(
     task_of = Dict{Int,Task}()
     # Workers that could not be readied in this round: left out, not asked again every tick.
     rejected = Set{Int}()
+    prep_tries = Dict{Int,Int}()
     # With a pool: the workers that were there when `run!` began, which it readied itself.
     first_foreign = pool === nothing ? Set{Int}() : Set(p for p in workers() if p != myid())
     # Set when the round has to end with an error (a unit that could not be cut, a tick step
@@ -1548,6 +1552,7 @@ function _drive_workers!(
             log_event(
                 log, :workers_rejected; level=:warn, stage=stage, n=1, err=_short_err(e)
             )
+            pool === nothing || _pool_rejected!(pool, pid, log, stage)
             return nothing
         end
         while true
@@ -1609,6 +1614,7 @@ function _drive_workers!(
             end
             row = table.rows[i]
             tok = owner_token(host, ospid)
+            pool === nothing || _pool_served!(pool)
             start_task!(table, i, tok, pid)
             _out_add!(tok, vault, row.key)
             out[] += 1
@@ -1729,11 +1735,14 @@ function _drive_workers!(
                 # re-readying every worker and logging the same line each second.
                 ok = Int[]
                 for p in todo
-                    if isempty(prepare([p]))
-                        push!(rejected, p)
-                    else
+                    if !isempty(prepare([p]))
                         push!(ok, p)
-                    end
+                    elseif (prep_tries[p] = get(prep_tries, p, 0) + 1) >= _PREPARE_TRIES
+                        # Given up on: left out of the round, and — if it is the pool's —
+                        # retired there, so that it is not counted as a worker any more.
+                        push!(rejected, p)
+                        pool === nothing || _pool_rejected!(pool, p, log, stage)
+                    end                                 # else: once more, next tick
                 end
             end
             vcat(found, ok)
@@ -1744,7 +1753,12 @@ function _drive_workers!(
         for pid in ready
             w = get(who, pid, nothing)
             if w === nothing
-                # Could not say who it is: asked again next tick, and said once.
+                # Could not say who it is: asked again on the next ticks, said once, and given
+                # up on after a few — it was asked, and readied again, every tick for ever.
+                if (prep_tries[pid] = get(prep_tries, pid, 0) + 1) >= _PREPARE_TRIES
+                    push!(rejected, pid)
+                    pool === nothing || _pool_rejected!(pool, pid, log, stage)
+                end
                 if !(pid in unidentified)
                     push!(unidentified, pid)
                     log_event(
@@ -1953,7 +1967,7 @@ function _drive_workers!(
             " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
         end
         error(
-            "SizedPool: $(pool.fails) worker starts failed in a row with keys still queued." *
+            "SizedPool: $(max(pool.fails, pool.rejects)) worker starts failed in a row with keys still queued." *
             nodes_out *
             " The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
             "\"pool_spawn_short\").",
