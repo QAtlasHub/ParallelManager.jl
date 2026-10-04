@@ -321,7 +321,9 @@ run!(work, v, DataVault.keys(v)[1:1]; opts=RunOpts(; control_interval=0))
         @test DataVault.is_running(v, k)                        # it holds the key
         kill(p, Base.SIGTERM)
         t0 = time()
-        while process_running(p) && time() - t0 < 60
+        # Minutes, not seconds: on a loaded runner (and under coverage, which is written at
+        # exit) the process has taken more than one to go.
+        while process_running(p) && time() - t0 < 240
             sleep(0.1)
         end
         @test !process_running(p)

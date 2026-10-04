@@ -129,3 +129,13 @@ end
     c = task_counts(t)
     @test (c.done, c.held, c.other) == (1, 2, 0)
 end
+
+@testset "TaskTable: a key that is done is not put back on the queue (#140)" begin
+    t = TaskTable(_tt_keys(2))
+    settle!(t, 1, :ok)
+    @test_throws ArgumentError SweepRunner.requeue!(t, 1)
+    @test t.rows[1].state === :settled && t.rows[1].outcome === :ok
+    settle!(t, 2, :worker_lost)
+    SweepRunner.requeue!(t, 2)                                   # retriable: allowed
+    @test t.rows[2].state === :todo
+end

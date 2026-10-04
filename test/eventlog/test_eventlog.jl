@@ -93,3 +93,21 @@ end
         @test !occursin("println", s)
     end
 end
+
+@testset "merge_event_logs: the masters' logs as one file, in time order" begin
+    dir = mktempdir()
+    a = EventLog(joinpath(dir, "events_hostA_1.jsonl"))
+    b = EventLog(joinpath(dir, "events_hostB_2.jsonl"))
+    log_event(a, :first; n=1)
+    sleep(0.01)
+    log_event(b, :second; n=2)
+    sleep(0.01)
+    log_event(a, :third; n=3)
+    out = merge_event_logs(dir)
+    @test out == joinpath(dir, "events_merged.jsonl")
+    kinds = [JSON3.read(l).kind for l in readlines(out)]
+    @test kinds == ["first", "second", "third"]
+    # Merging again does not fold the merged file into itself.
+    merge_event_logs(dir)
+    @test length(readlines(out)) == 3
+end

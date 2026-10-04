@@ -1564,7 +1564,7 @@ function _drive_workers!(
                         # Removed on purpose: not a death of the key, and not its memory.
                         :stopped
                     else
-                        row.deaths += 1
+                        lock(() -> row.deaths += 1, table.lock)
                         # More memory for the next hand-out, when there is one: a key that is
                         # given up on now is not "retried with more".
                         (pool === nothing || row.deaths > _WORKER_DEATH_REDISPATCHES) ||
@@ -1731,6 +1731,9 @@ function _drive_workers!(
         # Each step under its own guard: one that throws used to switch off every step after
         # it, each tick — the cut of units past their grace, the manifest, the pool.
         step(:control) do
+            # Without a pool the ticker runs once per `control_interval`, so every tick is a
+            # poll. With one it runs at the pool's pace, and requests are still read only
+            # every `control_interval`.
             poll_control!(
                 master, table, log, opts; affinity=affinity, force=pool === nothing
             )
