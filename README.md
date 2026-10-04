@@ -36,7 +36,8 @@ and the store from [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl).
   `stale_after`.
 - **Early skip** — full-done re-runs take O(1) filesystem operations
   (a single `manifest.jld2` read), not O(N) per-key `.done` stats.
-  A 3600-key warm re-run takes milliseconds; the test suite bounds it at 500 ms.
+  The test suite bounds the manifest read plus `todo_keys` for 3600 keys at 500 ms, and a
+  3600-key warm `run!` at 1 s.
 - **Structured events** — JSONL event log atomic across concurrent writers;
   per-item `println` is a non-goal, by design. Every lock acquisition writes a
   flushed `key_acquired` line, so a run that a `kill -9` truncated still says
@@ -217,6 +218,8 @@ path builders that leak phase1's storage layout into phase2's code.
 | [`src/Cost.jl`](src/Cost.jl) | What a key cost: `key_costs`, `cost_summary`, `measured_cost` |
 | [`src/Account.jl`](src/Account.jl) | Where a job's core-hours went |
 | [`src/Observe.jl`](src/Observe.jl) | One source observation per process, carried by every `.done` it writes |
+| [`src/Artifacts.jl`](src/Artifacts.jl) | `artifact_affinity`: keys that share an artifact go to one worker |
+| [`src/Prerequisite.jl`](src/Prerequisite.jl) | A stage that has to complete before another starts |
 | [`src/CLI.jl`](src/CLI.jl) | `bin/sweeprunner status|locks|costs|account|campaign|jobs|pause|stop|cancel|…` |
 | [`src/Preflight.jl`](src/Preflight.jl) | `check_injective!` / `check_opens!` / `on_grid` — refuse a campaign *before* it burns compute |
 

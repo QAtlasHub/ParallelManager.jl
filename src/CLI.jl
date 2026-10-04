@@ -45,7 +45,7 @@ usage: sweeprunner <command> <outdir> [options]
       --loop repeats every SECONDS until nothing is left.
 
   pause | resume <outdir>
-  stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS] [--interrupt]
+  stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS]
   cancel <outdir> --select name=v1,v2 [...] [--samples 1,2] [--running] [--grace SECONDS]
   prioritise <outdir> --select name=v1,v2 [...] [--samples 1,2]
   resize <outdir> --n N

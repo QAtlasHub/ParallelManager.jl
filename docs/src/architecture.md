@@ -62,6 +62,11 @@ and owns the coordination story separately.
 | [`src/Checkpoint.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Checkpoint.jl) | A key's checkpoint inside `work_fn`: `load_checkpoint`, `save_checkpoint!`, `checkpoint_due`; `check_checkpoints` |
 | [`src/Account.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Account.jl)     | Where a job's core-hours went: computing (kept / lost), start-up, never started, idle by reason |
 | [`src/Cost.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Cost.jl)           | What a key cost: `key_costs`, `cost_summary`, the per-stage table, `measured_cost` / `measured_mem` |
+| [`src/Liveness.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Liveness.jl) | Is a holder still there: its process, its Slurm job; `owner_token` |
+| [`src/Observe.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Observe.jl) | One source observation per process per `run!`, carried by every `.done` it writes |
+| [`src/Artifacts.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Artifacts.jl) | `artifact_affinity`: keys that share an artifact go to one worker |
+| [`src/Prerequisite.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Prerequisite.jl) | A stage that has to complete before another starts (`Prerequisite`, `run_prerequisite!`) |
+| [`src/Preflight.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Preflight.jl) | `check_injective!` / `check_opens!` / `on_grid`: refuse a campaign before it burns compute |
 | [`src/Campaign.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Campaign.jl)   | A meta config naming the stages of a campaign: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!`, `remaining_work` |
 | [`src/Jobs.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Jobs.jl)           | `Scheduler` (`SlurmScheduler`, `MockScheduler`), `JobPolicy`, `Ledger`, `decide` / `manage!`: submissions decided from what is left, inside a budget |
 | [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|costs|account|campaign|jobs|pause|resume|stop|cancel|prioritise|resize|drain|enqueue` (`bin/sweeprunner`) |

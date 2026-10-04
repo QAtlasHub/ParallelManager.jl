@@ -19,7 +19,11 @@ jq -c 'select(.kind == "key_done")' out/events_*.jsonl | wc -l
 jq -c 'select(.kind == "key_done") | {key, secs}' out/events_*.jsonl \
   | jq -s 'sort_by(-.secs) | .[:10]'
 
-# Lock contention across all masters:
+# Lock contention: how many keys each round found held or lost to another master.
+jq -c 'select(.kind == "stage_done") | {stage, busy, collisions}' out/events_*.jsonl
+
+# Per key, the `lock_busy` events — only with RunOpts(log_level = :debug): at the default
+# level they are not written, their totals are in `stage_done`.
 jq -c 'select(.kind == "lock_busy") | .key' out/events_*.jsonl | sort | uniq -c | sort -nr
 ```
 
@@ -46,8 +50,9 @@ done
 wait
 ```
 
-The per-key `.running` lock arbitrates. Expect `:lock_busy`
-events in proportion to contention. Eventually every key is done,
+The per-key `.running` lock arbitrates. Expect `busy` and `collisions` in
+`stage_done` in proportion to contention (the per-key `:lock_busy` events are
+written only at `log_level = :debug`). Eventually every key is done,
 regardless of which master happened to win each race.
 
 ## 3. Recovering from a crashed master
@@ -259,7 +264,8 @@ removed; stale and unknown ones are left to `stale_after`.
 
 **Alive but not advancing.** `RunOpts(stuck_after = 1800)` turns an old progress
 stamp into a verdict: a running key that has reported nothing for that long gets
-a `key_stuck` warning in the event log (once), a `stuck` mark on its worker's
+a `key_stuck` warning in the event log (once per stall: a key that advances
+and stalls again is said again), a `stuck` mark on its worker's
 row in `sweeprunner status --workers`, and a line in the warnings. Nothing is
 cut; `control!(…, :stop; keys = …, grace = …)` is how you act on it. It needs a
 `work_fn` that reports (`report_progress` or `save_checkpoint!`); set it above
@@ -611,8 +617,8 @@ the wall clock for a few long units:
 RunOpts(min_busy_fraction = 0.25, idle_grace = 900)
 ```
 
-When the queue is empty and fewer than a quarter of the workers have had a
-unit for 15 minutes, the master stops (`underused` in the event log,
+When the queue is empty and less than a quarter of the workers' cores have had
+a unit for 15 minutes, the master stops (`underused` in the event log,
 `stopped_by = :underused`). The units still running are told to stop and leave
 at their next [`stop_point`](@ref SweepRunner.stop_point) with their progress
 recorded, so the next job — sized to what is left — resumes them.
@@ -816,7 +822,8 @@ locks. Tell each which share to start on:
 RunOpts(shard = (i, m))        # master i of m, 0 <= i < m
 ```
 
-or set `SWEEPRUNNER_SHARD=i/m` in the batch script; a Slurm array task gets
+or set `SWEEPRUNNER_SHARD=i/m` in the batch script; a Slurm array task (read
+from `SLURM_ARRAY_TASK_*`; tested on the variables, not on a cluster) gets
 its share from the array on its own. A master draws the keys whose hash falls
 in its share first and the others' after, so **every master still covers every
 key** — a share is where it starts. The test suite runs two masters on 24
@@ -878,8 +885,13 @@ cluster's `SrunPortRange`. Past the range, workers neither join nor fail: a
 72-node job planned 3735 workers, stopped at 1782 without an error, and ran at
 48% of its cores to the end. `init_workers!` now refuses to start more than
 `max_workers` — `SWEEPRUNNER_MAX_WORKERS`, else `srun_worker_limit()` read from
-`scontrol show config` (1607 on that cluster) — and says how many masters it
-would take.
+`scontrol show config` — and says how many masters it would take.
+
+The limit is an estimate, not a measurement: "about seven ports per `srun`" is
+fitted to that one stall (12500 ports, 1782 steps), and the default keeps a
+tenth back, which gives 1607 for that range. `srun_worker_limit()` has been
+tested on the text of `scontrol show config`, not run against a real
+`scontrol`; set `SWEEPRUNNER_MAX_WORKERS` where you know better.
 
 **Several masters in one allocation.** Above the limit, cut the allocation
 into node groups and run one master per group, each on its own share of the

@@ -166,7 +166,9 @@ Send a request to every master running on `vault`'s `(project, run)` and return 
 | `:pause`      |                                   | no new dispatch; running units continue             |
 | `:resume`     |                                   | undo `:pause`                                       |
 
-`interrupt` is accepted for compatibility and ignored: a cut now removes the worker.
+`interrupt` does nothing: a cut removes the worker. (The keyword was written while a cut meant
+interrupting the unit; no release had it, and it is kept only so that a script written against
+`next` does not fail.)
 
 `master` limits the request to one master (its id, or its scheduler job id). A master applies only
 requests made after it started, so an old `:stop` does not stop next week's job.

@@ -104,9 +104,9 @@ process on the master's node, a few MB each, and a large job has thousands.
 job step sees the STEP's `--mem` in `SLURM_MEM_PER_NODE`, not the node's: pass
 `mem_per_node_mb`, or set `SWEEPRUNNER_MEM_PER_NODE_MB`, to the allocation's figure.
 
-Each default is what the downstream pool arrived at after a failure on a cluster: 4 GB of
-headroom after workers were killed at the node's limit, the `srun` reservation after the master's
-node ran short on a 72-node job.
+The defaults (4 GB of headroom, the `srun` reservation, 3 GB for the master) are the values the
+downstream pool this was moved from uses; nothing in this repository measures them, and the
+spawner has not been run on a cluster from here.
 """
 struct SlurmStepSpawner <: Spawner
     nodes::Vector{PoolNode}
