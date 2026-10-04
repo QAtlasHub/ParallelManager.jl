@@ -401,9 +401,11 @@ worker (`lock_kept`).
 
 The master's periodic work is a list of named steps (requests, the pool, the
 stops, the manifest). One that fails is logged as `tick_failed step=…` — once,
-then every hundredth time — and does not switch off the others; thirty failures
-in a row of one step end the round with an error, after the running units have
-finished.
+then every hundredth time — and does not switch off the others. A step the
+round cannot do without (the pool's planning, adopting workers, enforcing
+stops) that has failed for five minutes on end ends the round with an error,
+after the running units have finished; a flush or a request poll that cannot
+reach the file system is said and tried again, and never ends it.
 
 The job's own stop gets the same bound with `RunOpts(stop_grace = seconds)`:
 once `stop_flag` is raised or the `deadline` has passed, units still running

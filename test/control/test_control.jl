@@ -858,6 +858,78 @@ end
     end
 end
 
+@testset "workers: two workers that cannot be removed — run! still returns, with both locks kept (#152)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            work = k -> (sleep(600.0); Dict{String,Any}("x" => 1))
+            SweepRunner._KILL_WORKER[] = pid -> nothing
+            SweepRunner._CUT_RETRY[] = 0.2
+            try
+                t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
+                t0 = time()
+                while !all(k -> DataVault.is_running(v, k), ks) && time() - t0 < 60
+                    sleep(0.05)
+                end
+                owners = [DataVault.running_owner(v, k) for k in ks]
+                t_stop = time()
+                control!(v, :stop; grace=0.2)                   # every unit, none of which leaves
+                @test timedwait(() -> istaskdone(t), 90.0) === :ok
+                err = try
+                    istaskdone(t) ? (fetch(t); nothing) : :hung
+                catch e
+                    e isa TaskFailedException ? e.task.exception : e
+                end
+                @test err isa ErrorException
+                @test occursin("could not be removed", err.msg)
+                # Neither key was freed for somebody else to run a second time.
+                @test [DataVault.running_owner(v, k) for k in ks] == owners
+                ev = _ct_events(outdir)
+                gave_up = [e for e in ev if e.kind == "key_cut" && get(e, :gave_up, false)]
+                @test Set(e.key for e in gave_up) == Set(ParamIO.canonical.(ks))
+                @test count(e -> e.kind == "lock_kept", ev) == 2
+            finally
+                SweepRunner._KILL_WORKER[] = nothing
+                SweepRunner._CUT_RETRY[] = 5.0
+                SweepRunner._release_all_at_exit()
+            end
+        end
+    end
+end
+
+@testset "a worker that goes between two tries of a cut was removed on purpose, and a cut that throws is bounded (#152)" begin
+    # The order as it stands between two tries: `cut` is false again, `tries` is not zero.
+    o = SweepRunner.StopOrder(time() - 1, false, "r", false)
+    o.tries = 1
+    @test o.cut == false && (o.cut || o.tries > 0)             # what the dispatch task asks
+    _ct_vault() do v, outdir
+        ks = DataVault.keys(v)
+        m = SweepRunner.Master()
+        m.vault = v
+        table = TaskTable(ks)
+        i = SweepRunner.next_task!(table, 2)
+        SweepRunner.start_task!(table, i, "tok", 2)
+        row = table.rows[i]
+        log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+        order = SweepRunner.StopOrder(time() - 1, true, "r", false)
+        m.ctl.stopping[row.kstr] = order
+        SweepRunner._KILL_WORKER[] = pid -> error("the kill itself failed")
+        try
+            for n in 1:SweepRunner._CUT_TRIES
+                SweepRunner._cut!(m, table, row, order, log)
+                wait(last(m.ctl.cuts))
+                @test order.tries == n
+            end
+        finally
+            SweepRunner._KILL_WORKER[] = nothing
+        end
+        @test order.failed                                      # not retried for ever
+        @test occursin("threw", order.why)
+        @test count(e -> e.kind == "key_cut_failed", _ct_events(outdir)) ==
+            SweepRunner._CUT_TRIES
+    end
+end
+
 @testset "a second stop on a unit keeps the earlier deadline and a cut under way (#131)" begin
     _ct_vault() do v, _
         ks = DataVault.keys(v)

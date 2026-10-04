@@ -695,9 +695,18 @@ function _cut!(m::Master, table::TaskTable, row::TaskRow, o::StopOrder, log::Eve
         end
     catch e
         e isa InterruptException && rethrow()
-        # A cut that threw is a cut that did not happen: tried again, and said.
-        o.cut = false
-        o.next = time() + _CUT_RETRY[]
+        # A cut that threw is a cut that did not happen: tried again, and said — and counted, so
+        # that one which throws every time reaches `failed` like one whose worker will not go.
+        o.tries += 1
+        if o.tries >= _CUT_TRIES
+            o.failed = true
+            o.why =
+                "the cut of key $(row.kstr) on worker $pid threw $(o.tries) times " *
+                "(last: $(_short_err(e))); its lock is kept"
+        else
+            o.cut = false
+            o.next = time() + _CUT_RETRY[]
+        end
         log_event(
             log,
             :key_cut_failed;
@@ -731,11 +740,8 @@ function _cut_release!(m::Master, row::TaskRow, o::StopOrder, tok, pid::Int, log
     # The dispatch task releases a dead worker's lock too, and may have got there first: what
     # matters, and what is reported, is that the lock is no longer this unit's.
     if !released && err === nothing
-        released = try
-            DataVault.running_owner(v, row.key) != tok
-        catch
-            false
-        end
+        # On a positive answer only: a lock that could not be read is not one that was released.
+        released = _lock_state(v, row.key, tok).state === :lost
     end
     log_event(
         log,
