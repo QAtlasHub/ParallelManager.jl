@@ -104,3 +104,74 @@ end
         rm(outdir; recursive=true, force=true)
     end
 end
+
+# ── what the first version of this file could not see (#141) ─────────────────────────────────────
+
+const _DOC_SRC = joinpath(_DOC_ROOT, "src")
+function _doc_src_text()
+    return join((read(joinpath(_DOC_SRC, f), String) for f in readdir(_DOC_SRC)), "\n")
+end
+
+@testset "the guide's [jobs] block loads as a policy" begin
+    guide = read(joinpath(_DOC_ROOT, "docs", "src", "guides.md"), String)
+    blocks = filter(b -> occursin("[jobs]", b), _doc_blocks(guide, "toml"))
+    @test !isempty(blocks)
+    for b in blocks
+        dir = mktempdir()
+        try
+            path = joinpath(dir, "campaign.toml")
+            write(path, b)
+            policy = load_job_policy(path)
+            @test !isempty(policy.partitions)
+            @test policy.dry_run                                  # the example does not submit
+        finally
+            rm(dir; recursive=true, force=true)
+        end
+    end
+end
+
+@testset "an event a recipe selects is one the default log level writes" begin
+    src = _doc_src_text()
+    for page in _DOC_PAGES
+        for block in vcat(
+            _doc_blocks(read(page, String), "bash"), _doc_blocks(read(page, String), "sh")
+        )
+            for m in eachmatch(r"\.kind == \"([a-z_]+)\"", block)
+                kind = m.captures[1]
+                sites = collect(eachmatch(Regex(":$kind;\\s*(level=:[a-z]+)?"), src))
+                isempty(sites) && @error "no such event" page kind
+                @test !isempty(sites)
+                written = any(s -> s.captures[1] != "level=:debug", sites)
+                # Emitted only at debug: the recipe has to say that it needs the debug level.
+                written || @test occursin("log_level", block)
+            end
+        end
+    end
+end
+
+@testset "the module tables list every file of src/" begin
+    files = filter(f -> endswith(f, ".jl") && f != "SweepRunner.jl", readdir(_DOC_SRC))
+    for page in (
+        joinpath(_DOC_ROOT, "docs", "src", "architecture.md"),
+        joinpath(_DOC_ROOT, "README.md"),
+    )
+        text = read(page, String)
+        for f in files
+            occursin("src/$f", text) || @error "not in the module table" page f
+            @test occursin("src/$f", text)
+        end
+    end
+end
+
+@testset "the exit codes the CLI documents are the ones it returns" begin
+    cli = read(joinpath(_DOC_SRC, "CLI.jl"), String)
+    doc = match(r"The `sweeprunner` command line\. Returns the exit code:(.*?)\n```"s, cli)
+    @test doc !== nothing
+    documented = Set(
+        parse(Int, m.captures[1]) for m in eachmatch(r"\| `(\d)` \|", doc.captures[1])
+    )
+    returned = Set(parse(Int, m.captures[1]) for m in eachmatch(r"\breturn (\d)\b", cli))
+    union!(returned, parse(Int, m.captures[1]) for m in eachmatch(r"code = (\d)\b", cli))
+    @test returned ⊆ documented
+    @test documented ⊆ union(returned, Set([0]))
+end

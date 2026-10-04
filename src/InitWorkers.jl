@@ -50,8 +50,8 @@ comfortably.  Set lower values only for local debugging.
   `ENV["SWEEPRUNNER_SYSIMAGE"]`.** Building one (PackageCompiler, once per commit) is the
   application's step; start the master from the same image.
 - `max_workers` — the most workers ONE master may start under `:slurm`. Every worker there is an
-  `srun` client on the master's node and takes about seven ports of the cluster's
-  `SrunPortRange`; past the range, further workers neither join nor fail, and the job runs at a
+  `srun` client on the master's node and takes ports of the cluster's `SrunPortRange` (about
+  seven each, by one observation — see [`srun_worker_limit`](@ref)); past the range, further workers neither join nor fail, and the job runs at a
   fraction of its cores to the end. Asking for more than the limit is an error that says so,
   instead of that stall. Defaults to `ENV["SWEEPRUNNER_MAX_WORKERS"]`, else what
   [`srun_worker_limit`](@ref) reads from the cluster, else no limit. Above it, run several
@@ -365,8 +365,10 @@ How many workers one master can start as `srun` job steps: the size of the clust
 `srun` takes, with a tenth held back. `nothing` when the range is not configured or cannot be
 read — then there is no known limit.
 
-On a cluster with `SrunPortRange = 52501-65000` this is 1607: the master that planned 3735
-workers and stalled without an error at 1782 was past it.
+An estimate: "seven ports per `srun`" is fitted to one stall (a master that planned 3735 workers
+on `SrunPortRange = 52501-65000` and stopped without an error at 1782), and a tenth is held back,
+which gives 1607 for that range. The parsing is tested; the function has not been run against a
+real `scontrol`.
 """
 function srun_worker_limit(config_text::AbstractString)
     m = match(r"SrunPortRange\s*=\s*(\d+)\s*-\s*(\d+)", config_text)
