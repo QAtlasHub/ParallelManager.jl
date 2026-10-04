@@ -133,10 +133,12 @@ function save_checkpoint!(
         rm(tmp; force=true)
     end
     c.saves += 1
-    c.last = time()
     c.used = true
     c.near_saved = c.near
     report_progress(something(step, c.saves); of=of, note=note)
+    # After the stamp too: the interval is counted from when the save was FINISHED, so the time
+    # the writes took is not charged to the next one.
+    c.last = time()
     c.mode === :cut && throw(CheckpointCut())
     return true
 end
@@ -172,7 +174,16 @@ end
 
 function _clear_checkpoint(vault::Vault, kstr::AbstractString)
     try
-        rm(_checkpoint_file(vault, kstr); force=true)
+        path = _checkpoint_file(vault, kstr)
+        rm(path; force=true)
+        # And what a save that was killed half-way left for this key. The caller holds the
+        # key's lock and the key is finished, so nobody is writing one.
+        dir, stem = dirname(path), string(basename(path)[1:(end - 5)], ".tmp.")
+        if isdir(dir)
+            for f in readdir(dir)
+                startswith(f, stem) && rm(joinpath(dir, f); force=true)
+            end
+        end
     catch e
         e isa InterruptException && rethrow()
     end

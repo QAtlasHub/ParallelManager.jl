@@ -224,12 +224,12 @@ end
         _su_vault() do v, outdir
             ks = DataVault.keys(v)
             long = Set(ParamIO.canonical.(ks[1:2]))
-            need = k -> ParamIO.canonical(k) in long ? 1000.0 : 0.01
+            need = k -> ParamIO.canonical(k) in long ? 86400.0 : 0.01
             r = run!(
                 k -> Dict{String,Any}("pid" => Distributed.myid()),
                 v,
                 ks;
-                opts=RunOpts(; deadline_in=60, control_interval=0),
+                opts=RunOpts(; deadline_in=900, control_interval=0),
                 min_time=need,
             )
             @test r.held_back == 2

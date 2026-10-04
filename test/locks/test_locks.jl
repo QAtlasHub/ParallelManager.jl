@@ -314,7 +314,7 @@ run!(work, v, DataVault.keys(v)[1:1]; opts=RunOpts(; control_interval=0))
         err = joinpath(outdir, "err")
         p = run(pipeline(`$julia $script $_LK_CFG $outdir`; stderr=err); wait=false)
         t0 = time()
-        while !isfile(joinpath(outdir, "in_key")) && process_running(p) && time() - t0 < 300
+        while !isfile(joinpath(outdir, "in_key")) && process_running(p) && time() - t0 < 180
             sleep(0.1)
         end
         @test isfile(joinpath(outdir, "in_key"))
