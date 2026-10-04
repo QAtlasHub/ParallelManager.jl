@@ -186,6 +186,13 @@ end
                     end
                     return Dict{String,Any}("x" => 1)
                 end
+            # Once through the pipeline on other keys first: a worker's first key spends
+            # seconds compiling before its first report — on a loaded runner more than the
+            # threshold — and that is no progress either, but not what this is about.
+            warm =
+                k ->
+                    (SweepRunner.report_progress(1); sleep(0.5); Dict{String,Any}("x" => 1))
+            run!(warm, v, DataVault.keys(v)[3:4])
             opts = RunOpts(; status_interval=0.2, stuck_after=5.0)
             t = @async run!(work, v, ks; opts=opts)
             flagged = nothing
