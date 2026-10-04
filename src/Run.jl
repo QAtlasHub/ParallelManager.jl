@@ -726,7 +726,9 @@ function run!(
     # Whoever the cost comes from — the caller's hook or the table this package measured — a key
     # it has no answer for is treated one way: see `_fits`.
     cost = _default_cost(vault, cost, key_class, todo, log, stage)
-    _say_ignored(log, stage, opts, cost; pool=pool, affinity=affinity, spawn=spawn)
+    _say_ignored(
+        log, stage, opts, cost; pool=pool, affinity=affinity, spawn=spawn, multi=multi
+    )
     # A hook that throws is said — here, whatever the options: the ordering, the pool's sizing
     # and the campaign's filter ask it too, and there its error only read as "unknown".
     _say_hook_error(log, stage, something(min_time, cost, Some(nothing)), todo)
@@ -1348,7 +1350,7 @@ function _drive_sequential!(
         i === nothing && break
         row = table.rows[i]
         tok = owner_token()
-        start_task!(table, i, tok, myid())
+        start_task!(table, i, tok, myid()) || continue      # settled since it was drawn
         _out_add!(tok, vault, row.key)
         t0 = time()
         outcome = try
@@ -1640,8 +1642,9 @@ function _drive_workers!(
             end
             row = table.rows[i]
             tok = owner_token(host, ospid)
+            # Settled since it was drawn (a stop's `settle_queued!`): not started after all.
+            start_task!(table, i, tok, pid) || continue
             pool === nothing || _pool_served!(pool)
-            start_task!(table, i, tok, pid)
             _out_add!(tok, vault, row.key)
             out[] += 1
             t0 = time()
@@ -2621,6 +2624,7 @@ function _say_ignored(
     pool=nothing,
     affinity=nothing,
     spawn=nothing,
+    multi::Bool=true,
 )
     said =
         (option, why) -> log_event(
@@ -2637,6 +2641,15 @@ function _say_ignored(
         pool === nothing || said("pool", why)
         affinity === nothing || said("affinity", why)
         spawn === nothing || said("spawn", why)
+    end
+    # Options only the worker loop acts on. In one process nothing cuts a unit, nothing leaves
+    # an under-used allocation, and keys are visited in order.
+    if !multi
+        why = "the keys run in this process, one at a time: only a round with workers does this"
+        isfinite(opts.stop_grace) && said("stop_grace", why)
+        opts.min_busy_fraction > 0 && said("min_busy_fraction", why)
+        # (`affinity` in one process is not said: a script that passes it always and is run
+        # locally now and then is the ordinary case, and nothing is lost by it.)
     end
     return nothing
 end

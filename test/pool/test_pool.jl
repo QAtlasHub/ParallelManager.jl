@@ -722,8 +722,9 @@ end
             while count(k -> DataVault.is_running(v, k), ks) < 2 && time() - t0 < 120
                 sleep(0.05)
             end
-            control!(v, :drain; node=gethostname())
-            sleep(1.0)                                          # the request is read
+            id = control!(v, :drain; node=gethostname())
+            # Until the master has taken the request, not for a fixed second.
+            @test !isempty(wait_acks(v, id; timeout=60.0, poll=0.1))
             touch(gate)                                         # the two running keys finish
             @test timedwait(() -> istaskdone(t), 120.0) === :ok
             if istaskdone(t)
@@ -752,7 +753,7 @@ end
     # batch is still on its way.
     slow = (node, size, n, flags) -> begin
         touch(flag)
-        sleep(4.0)
+        sleep(15.0)                                             # far longer than run! takes to return
         return _pl_local(node, size, n, flags)
     end
     _pl_custom(slow) do pool
@@ -978,5 +979,45 @@ end
         @test now - SweepRunner._pool_oldest_start(pool, now) >= pool.stall_after
         delete!(pool.starting, 1)
         delete!(pool.start_at, 1)
+    end
+end
+
+@testset "with the pool's step failing, stops are still enforced: a unit past its grace is cut (#158)" begin
+    _pl_vault() do v, outdir
+        armed = joinpath(outdir, "armed")
+        # The planner's hook throws once a key is running, so the `pool` step fails every tick
+        # (two cores for four keys: two stay queued, and are asked about each tick).
+        req = k -> (isfile(armed) && error("no size for this key"); KeyReq(1, 1.0))
+        _pl_pool(; key_req=req, cores=2) do pool
+            ks = DataVault.keys(v)
+            running = Set(ParamIO.canonical.(ks[1:2]))
+            @test all(k -> k.params["N"] == ks[1].params["N"], ks[1:2])
+            # The units never look at a stop: only the `enforce_stops` step — later in the same
+            # tick as the failing one — ends them.
+            work = k -> (touch(armed); sleep(600.0); Dict{String,Any}("x" => 1))
+            SweepRunner._TICK_FATAL_AFTER[] = 30.0
+            t = @async run!(work, v, ks; pool=pool, opts=RunOpts(; control_interval=0.2))
+            try
+                @test timedwait(() -> isfile(armed), 120.0) === :ok
+                control!(v, :stop; select=Dict("N" => ks[1].params["N"]), grace=1.0)
+                # The round ends with the error of the step that kept failing...
+                @test timedwait(() -> istaskdone(t), 240.0) === :ok
+                err = try
+                    fetch(t)
+                    nothing
+                catch e
+                    e isa TaskFailedException ? e.task.exception : e
+                end
+                @test err isa ErrorException && occursin("`pool` step has failed", err.msg)
+            finally
+                SweepRunner._TICK_FATAL_AFTER[] = 300.0
+            end
+            ev = _pl_events(outdir)
+            @test any(e -> e.kind == "tick_failed" && e.step == "pool", ev)
+            # ...but before that, with that step failing every tick, the units were cut.
+            cuts = [e for e in ev if e.kind == "key_cut"]
+            @test Set(e.key for e in cuts) == running
+            @test all(e -> e.worker_removed == true && e.lock_released == true, cuts)
+        end
     end
 end
