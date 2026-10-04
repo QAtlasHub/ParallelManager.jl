@@ -277,25 +277,68 @@ function start_workers(
     n::Integer;
     exeflags,
 )
-    ids = addprocs(
-        StepManager(String(node), size.cores, size.mem_gb, s isa SlurmStepSpawner, Int(n));
-        exeflags=exeflags,
-    )
+    ids = _addprocs_clean() do
+        return addprocs(
+            StepManager(
+                String(node), size.cores, size.mem_gb, s isa SlurmStepSpawner, Int(n)
+            );
+            exeflags=exeflags,
+        )
+    end
     return _ready_workers!(ids, size)
+end
+
+# One `addprocs` at a time, and nothing left behind by one that throws. `addprocs` can fail after
+# part of its batch has connected (one worker's handshake throws inside its `@sync`): those
+# workers are in `procs()`, known to nobody, and would hold their cores while the room of the
+# whole batch is given back. Distributed serialises `addprocs` itself, so holding a lock around it
+# costs nothing and makes "what appeared during this call" this call's.
+const _ADDPROCS_LOCK = ReentrantLock()
+
+function _addprocs_clean(f)
+    return lock(_ADDPROCS_LOCK) do
+        before = Set(procs())
+        try
+            f()
+        catch
+            for p in setdiff(procs(), before)
+                _kill_worker!(p)
+            end
+            rethrow()
+        end
+    end
 end
 
 _set_blas_threads(n::Integer) = (BLAS.set_num_threads(n); nothing)
 
-# Ready each started worker by itself: one that fails is removed and fails alone, not its batch.
+# How long a started worker may take to load the package and answer. One that hangs in `using`
+# used to hold its whole batch unregistered.
+const _READY_TIMEOUT = Ref(600.0)
+# Why workers could not be readied, for whoever started them to say (`_pool_start!` drains it).
+const _READY_FAILS = String[]
+
+# Ready each started worker by itself: one that fails, or does not answer in time, is removed and
+# fails alone, not its batch — and why is kept, not dropped.
 function _ready_workers!(ids::AbstractVector{<:Integer}, size::KeyReq; ready=_ready_one)
     good = Int[]
     @sync for w in ids
-        @async try
-            ready(w, size)
-            push!(good, w)
-        catch e
-            e isa InterruptException && rethrow()
-            _kill_worker!(w)
+        @async begin
+            # A plain task, not `@async`: inside `@sync` that would hand its failure to the
+            # block, and one worker that cannot be readied would fail its whole batch.
+            t = Task(() -> ready(w, size))
+            schedule(t)
+            ok = timedwait(() -> istaskdone(t), _READY_TIMEOUT[]; pollint=0.05) === :ok
+            if ok && !istaskfailed(t)
+                push!(good, w)
+            else
+                why = if !ok
+                    "worker $w did not become ready within $(_READY_TIMEOUT[]) s"
+                else
+                    "worker $w: " * _short_err(t.exception)
+                end
+                push!(_READY_FAILS, why)
+                _kill_worker!(w)
+            end
         end
     end
     return sort!(good)
@@ -522,6 +565,11 @@ mutable struct SizedPool
     const too_big::Set{String}
     # Workers that existed before the pool started any: not its own, and take any key.
     const foreign::Set{Int}
+    # Every worker the pool has registered, ever: what tells its own from a caller's.
+    const seen::Set{Int}
+    # Starts that failed in a row, per node, and the nodes taken out for it.
+    const node_fails::Dict{String,Int}
+    const bad_nodes::Set{String}
     seq::Int
     fails::Int
     stuck::Bool
@@ -529,6 +577,7 @@ mutable struct SizedPool
     last_join::Float64      # the last time a start succeeded or failed
     last_stall::Float64
     said_limit::Bool
+    closing::Bool           # `shutdown!` is under way: a start that lands now is removed
 end
 
 """
@@ -616,12 +665,16 @@ function SizedPool(
         Dict{String,Float64}(),
         Set{String}(),
         Set{Int}(),
+        Set{Int}(),
+        Dict{String,Int}(),
+        Set{String}(),
         0,
         0,
         false,
         false,
         time(),
         0.0,
+        false,
         false,
     )
 end
@@ -680,6 +733,20 @@ function _pool_adoptable(pool::SizedPool, pid::Int)
     return haskey(pool.workers, pid) || pid in pool.foreign
 end
 
+# Workers that joined and are not the pool's: the caller's own `addprocs`, or a `spawn` hook's.
+# Told apart only while no start is in flight — in that window a worker that is visible and not
+# registered cannot be one of the pool's. They used to be taken once, at the first tick, so one
+# added later idled for the whole job.
+function _pool_note_foreign!(pool::SizedPool)
+    intersect!(pool.foreign, workers())               # one that left is no longer counted
+    isempty(pool.starting) || return nothing
+    for p in workers()
+        (p == myid() || p in pool.seen || p in pool.foreign) && continue
+        push!(pool.foreign, p)
+    end
+    return nothing
+end
+
 function _pool_retiring(pool::SizedPool, pid::Int)
     w = get(pool.workers, pid, nothing)
     return w !== nothing && w.retiring
@@ -721,13 +788,39 @@ end
 
 # Take a worker out: no more keys, the process removed, its room back once it is gone. The pool
 # is the one owner of this; the dispatch task only sees `retiring` and leaves.
-function _pool_retire!(pool::SizedPool, pid::Int)
+function _pool_retire!(pool::SizedPool, pid::Int, log=nothing, stage::Symbol=:pool)
     w = get(pool.workers, pid, nothing)
     (w === nothing || w.retiring) && return nothing
     w.retiring = true
-    @async begin
+    @async try
         _kill_worker!(pid)
-        _pool_free!(pool, pid)
+        if _worker_gone(pid, Set(procs()))
+            _pool_free!(pool, pid)
+        else
+            # Its room is NOT given back: the process is still there, on its cores and with
+            # its memory, and a worker placed on top of it is how a node runs out. The tick
+            # frees it when it is seen gone.
+            log === nothing || log_event(
+                log,
+                :pool_kill_failed;
+                level=:warn,
+                stage=stage,
+                worker=pid,
+                node=w.node,
+                cores=w.size.cores,
+                mem_gb=round(w.size.mem_gb; digits=2),
+            )
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        log === nothing || log_event(
+            log,
+            :pool_kill_failed;
+            level=:warn,
+            stage=stage,
+            worker=pid,
+            err=_short_err(e),
+        )
     end
     return nothing
 end
@@ -758,7 +851,8 @@ function _pool_tick!(
     if !pool.snapshot
         # What was here before the pool started anything is not the pool's.
         pool.snapshot = true
-        union!(pool.foreign, p for p in workers() if p != myid())
+        # A pool built long before its first round has not been stalled all that time.
+        pool.last_join = now
         log_event(
             log,
             :pool_limit;
@@ -767,6 +861,7 @@ function _pool_tick!(
             source=pool.limit_source,
         )
     end
+    _pool_note_foreign!(pool)
     live = Set(procs())
     for pid in collect(keys(pool.workers))
         _worker_gone(pid, live) || continue
@@ -839,7 +934,7 @@ function _pool_tick!(
         push!(rows, r)
     end
 
-    usable(node) = !(node in c.drained)
+    usable(node) = !(node in c.drained) && !(node in pool.bad_nodes)
     idle = [
         w.size for
         (pid, w) in pool.workers if !(pid in busy) && !w.retiring && usable(w.node)
@@ -901,6 +996,27 @@ function _pool_tick!(
         pid for (pid, w) in pool.workers if
         !(pid in busy) && !w.retiring && !any(n -> _fits(w.size, n), needs)
     ]
+    # Idle workers on a node that was drained take no more keys (their dispatch tasks left):
+    # they go, whatever is waiting.
+    drained_idle = Int[
+        pid for
+        (pid, w) in pool.workers if !(pid in busy) && !w.retiring && w.node in c.drained
+    ]
+    for pid in drained_idle
+        w = pool.workers[pid]
+        log_event(
+            log,
+            :pool_retire;
+            stage=stage,
+            worker=pid,
+            node=w.node,
+            cores=w.size.cores,
+            mem_gb=round(w.size.mem_gb; digits=2),
+            why="node drained",
+        )
+        _pool_retire!(pool, pid, log, stage)
+    end
+    filter!(p -> !(p in drained_idle), unwanted)
     if waiting_for_room
         for pid in unwanted
             w = pool.workers[pid]
@@ -914,7 +1030,7 @@ function _pool_tick!(
                 cores=w.size.cores,
                 mem_gb=round(w.size.mem_gb; digits=2),
             )
-            _pool_retire!(pool, pid)
+            _pool_retire!(pool, pid, log, stage)
         end
     end
 
@@ -950,25 +1066,35 @@ function _pool_tick!(
         isempty(pool.starting) &&
         isempty(busy) &&
         !freeing &&
-        !any(w -> !w.retiring && any(n -> _fits(w.size, n), needs), values(pool.workers))
+        # Over the nodes that can be used: a worker on a drained node takes no key, and counted
+        # as able to, it kept the round waiting until the deadline.
+        !any(
+            w -> !w.retiring && usable(w.node) && any(n -> _fits(w.size, n), needs),
+            values(pool.workers),
+        )
     return nothing
 end
 
 # What the status compares the workers that joined against: the pool's current plan, and the
 # processes it has asked for (a start that is under way has been launched and has not joined).
 function _pool_report!(pool::SizedPool)
-    n = length(pool.workers) + sum(x -> x[3], values(pool.starting); init=0)
-    note_workers!(; planned=n + length(pool.foreign), launched=n + length(pool.foreign))
+    # Planned: the workers the pool has and the ones it has asked for. Launched: the ones whose
+    # process is there. The difference is what is still on its way — or not coming.
+    have = length(pool.workers) + length(pool.foreign)
+    asked = sum(x -> x[3], values(pool.starting); init=0)
+    note_workers!(; planned=have + asked, launched=have)
     return nothing
 end
 
 function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
     node, size, n = pool.starting[tok]
     ids = Int[]
+    threw = false
     try
         ids = start_workers(pool.spawner, node, size, n; exeflags=pool.exeflags)
     catch e
         e isa InterruptException && rethrow()
+        threw = true
         log_event(
             log,
             :pool_spawn_failed;
@@ -983,6 +1109,15 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
     finally
         # Whatever happened, the start is over: its workers are registered or its room is back.
         # Left set, the pool would wait on it for ever.
+        union!(pool.seen, ids)
+        if pool.closing
+            # The pool was shut down while this start was in flight: nobody will tick it again,
+            # so its workers are removed rather than registered.
+            for pid in ids
+                _kill_worker!(pid)
+            end
+            empty!(ids)
+        end
         for pid in ids
             pool.workers[pid] = PoolWorker(node, size, time(), false)
         end
@@ -991,9 +1126,13 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
         pool.free_c[node] += short * size.cores
         pool.free_m[node] += short * size.mem_gb
         pool.last_join = time()
-        if short > 0
+        why = copy(_READY_FAILS)
+        empty!(_READY_FAILS)
+        if short > 0 && !pool.closing
             pool.fails += 1
-            isempty(ids) || log_event(
+            # Said also when NO worker came and nothing was thrown: the count rose in silence,
+            # and the error after ten failures pointed at events that did not exist.
+            threw || log_event(
                 log,
                 :pool_spawn_short;
                 level=:warn,
@@ -1002,10 +1141,20 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
                 cores=size.cores,
                 asked=n,
                 started=length(ids),
+                why=isempty(why) ? nothing : join(why, "; "),
             )
-        else
+            # A node that brought up SOME of what was asked can start workers: it is the start
+            # that brought none that counts against the node.
+            if isempty(ids)
+                _pool_node_failed!(pool, node, log, stage)
+            else
+                pool.node_fails[node] = 0
+            end
+        elseif short == 0
             pool.fails = 0
+            pool.node_fails[node] = 0
         end
+        isempty(pool.starting) && (pool.closing = false)
         _pool_report!(pool)
     end
     isempty(ids) || log_event(
@@ -1020,8 +1169,34 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
     return nothing
 end
 
+# How many starts in a row may fail on one node before it is taken out.
+const _NODE_MAX_FAILS = 5
+
+# A start on `node` failed or came up short. One node that cannot start workers used to be chosen
+# again each tick (a failed start gives its room back, and the node with the most room is
+# preferred), while a success anywhere else reset the one counter there was.
+function _pool_node_failed!(
+    pool::SizedPool, node::AbstractString, log::EventLog, stage::Symbol
+)
+    n = pool.node_fails[node] = get(pool.node_fails, node, 0) + 1
+    (n >= _NODE_MAX_FAILS && !(node in pool.bad_nodes)) || return nothing
+    push!(pool.bad_nodes, String(node))
+    log_event(
+        log,
+        :pool_node_out;
+        level=:warn,
+        stage=stage,
+        node=node,
+        fails=n,
+        nodes_left=count(x -> !(x.name in pool.bad_nodes), pool.nodes),
+    )
+    return nothing
+end
+
 # Has the pool stopped trying? Too many starts failed in a row.
-_pool_gave_up(pool::SizedPool) = pool.fails >= _POOL_MAX_FAILS
+function _pool_gave_up(pool::SizedPool)
+    return pool.fails >= _POOL_MAX_FAILS || all(n -> n.name in pool.bad_nodes, pool.nodes)
+end
 
 # Is there still something the pool is working towards?
 function _pool_wants(pool::SizedPool, table::TaskTable)
@@ -1050,7 +1225,12 @@ end
 Remove every worker the pool started and give their room back. `run!` / `run_loop!` call it when
 they return, unless the pool was made with `keep=true`.
 """
-function shutdown!(pool::SizedPool)
+function shutdown!(pool::SizedPool; wait::Real=60.0)
+    # Starts still in flight land in a pool nobody ticks any more: each removes its own workers
+    # when it sees `closing`. They are waited for, within a bound, so that when this returns
+    # what the pool started is gone.
+    pool.closing = !isempty(pool.starting)
+    timedwait(() -> isempty(pool.starting), Float64(wait); pollint=0.05)
     for pid in collect(keys(pool.workers))
         _kill_worker!(pid)
         _pool_free!(pool, pid)
