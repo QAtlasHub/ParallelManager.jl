@@ -82,11 +82,17 @@ end
     _ac_vault() do v, outdir
         ks = DataVault.keys(v)
         bad = ParamIO.canonical(ks[1])
+        # When the failed key started, stamped its progress, and failed — as it happened, so
+        # the bounds below are on what was measured and not on how long a `sleep` took.
+        at = Float64[]
         work = k -> begin
             if ParamIO.canonical(k) == bad
+                push!(at, time())
                 sleep(0.3)
                 SweepRunner.report_progress(1; of=2)
+                push!(at, time())
                 sleep(0.4)
+                push!(at, time())
                 error("cut after the first half")
             end
             sleep(0.2)
@@ -100,8 +106,13 @@ end
         cores = only(st["worker_table"])["cores"]
         @test a["keys_cut"] == 1
         @test a["computing"] ≈ a["kept"] + a["lost"]
-        # The failed key kept its first 0.3 s and lost the 0.4 s after its progress stamp.
-        @test 0.35 * cores <= a["lost"] <= 0.9 * cores
+        # The failed key kept its first part and lost what came after its progress stamp: at
+        # least the 0.4 s it slept there, and less than the whole of the key.
+        after_stamp = at[3] - at[2]
+        @test a["lost"] >= 0.35 * cores
+        @test a["lost"] >= 0.9 * after_stamp * cores
+        @test a["lost"] <= (after_stamp + 1.0) * cores            # plus the way out of the error
+        @test a["lost"] < a["computing"]
         @test a["kept"] >= (0.3 + 0.2 * (length(ks) - 1)) * cores * 0.9
         @test a["computing"] <= a["allocated"] + 1e-6
         @test a["startup"] >= 0
