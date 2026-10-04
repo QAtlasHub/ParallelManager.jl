@@ -705,14 +705,24 @@ over its attempts** — a key that ran six hours over four jobs took six hours,
 not the forty minutes of its last leg — and `unfinished` counts the keys of a
 class that have attempts and no finish (the ones too big for their request).
 
-**Unknown is not zero.** `SweepRunner.key_seconds(hook, key)` is how the run,
-the campaign and the job controller ask a cost hook: `nothing` when it throws
-or answers something that is not a finite, non-negative number. With a
-`deadline`, a key your hook has no answer for is not assumed to fit: it is
-held back and counted (`held_back`, with `cost_unknown`). A class missing from
-a table this package loaded by itself is different — it has to run once to be
-measured, so it runs. Under a profile's `max_key_time`, a key of unknown cost
-is not eligible. `key_costs(vault)` returns the raw
+**Unknown is not zero, and not for ever.** `SweepRunner.key_seconds(hook, key)`
+is how the run, the campaign and the job controller ask a cost hook: `nothing`
+when it throws or answers something that is not a finite, non-negative number.
+With a `deadline` there is one rule for such a key, whoever the cost comes from
+(your hook, or the table this package measured):
+
+- **one key per class per job is started regardless**, to be measured, and
+  said: `cost_explore class=… key=…`. (Without `key_class` all keys are one
+  class.) Held back instead, a class that had never completed was held back in
+  every job with a deadline, and so never completed.
+- **the others of that class are held back**, counted in `held_back` with
+  `cost_unknown` and `classes_unknown`.
+- a hook that **throws** is reported once (`cost_hook_failed`) with what it
+  threw.
+
+`order = :longest_first` puts a key of unknown cost first; `:finish_by` gives
+it the most cores. Under a profile's `max_key_time`, one key of unknown cost
+per stage is eligible and the rest are not. `key_costs(vault)` returns the raw
 records (`KeyCost`) and `cost_summary(costs; by = c -> c.host)` groups them
 any way you like — per node, per thread count.
 

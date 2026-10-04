@@ -301,13 +301,15 @@ end
 # works even on a worker that has not yet loaded SweepRunner (the same reason `verify_workers!`
 # evaluates its probe in the worker's `Main`). Idempotent: re-`using` an already-loaded module is a
 # no-op, so this composes with a project that still broadcasts modules by hand.
-function _ensure_worker_modules(modnames)
+function _ensure_worker_modules(modnames; pids=nothing)
     nprocs() > 1 || return nothing
     names = unique(modnames)                      # `modnames` is already a Vector{Symbol}
     isempty(names) && return nothing
     ex = Expr(:block, (Expr(:using, Expr(:., n)) for n in names)...)
     try
-        @sync for w in workers()
+        # `pids`: only these (workers that joined late), so that one of them failing is its own
+        # failure and not that of every worker asked in the same breath.
+        @sync for w in something(pids, workers())
             @async remotecall_fetch(Core.eval, w, Main, ex)
         end
     catch e

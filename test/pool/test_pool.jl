@@ -402,7 +402,7 @@ end
     end
 end
 
-@testset "starts that fail are logged, and ten in a row is an error, not a quiet end (#101)" begin
+@testset "starts that fail are logged, and a pool with no node left is an error, not a quiet end (#101)" begin
     _pl_custom((node, size, n, flags) -> error("no such partition")) do pool
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
@@ -416,7 +416,11 @@ end
             @test occursin("worker starts failed in a row", err.msg)
             ev = _pl_events(outdir)
             failed = [e for e in ev if e.kind == "pool_spawn_failed"]
-            @test length(failed) >= 10
+            # Its one node is taken out after five failures in a row (#133), and a pool with
+            # no node left has given up: not ten more tries at the same node.
+            @test length(failed) == SweepRunner._NODE_MAX_FAILS
+            @test occursin("1 of 1 node(s) taken out", err.msg)
+            @test only([e for e in ev if e.kind == "pool_node_out"]).nodes_left == 0
             @test occursin("no such partition", failed[1].err)
             @test count(e -> e.kind == "pool_gave_up", ev) == 1
             # Nothing is left starting, and the room is all back.
@@ -691,5 +695,183 @@ end
             )
             @test !any(e -> e.kind == "control_failed", ev)
         end
+    end
+end
+
+# ── paths that lost workers or hung a round (#133) ───────────────────────────────────────────────
+
+@testset "draining every node ends the round instead of hanging it, and its idle workers go (#133)" begin
+    _pl_pool(; cores=2, key_req=k -> KeyReq(1, 1.0)) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)                              # four keys, two cores
+            gate = joinpath(outdir, "gate")
+            work = k -> begin
+                while !isfile(gate)
+                    sleep(0.05)
+                end
+                return Dict{String,Any}("x" => 1)
+            end
+            t = @async run!(work, v, ks; pool=pool, opts=RunOpts(; control_interval=0.2))
+            t0 = time()
+            while count(k -> DataVault.is_running(v, k), ks) < 2 && time() - t0 < 120
+                sleep(0.05)
+            end
+            control!(v, :drain; node=gethostname())
+            sleep(1.0)                                          # the request is read
+            touch(gate)                                         # the two running keys finish
+            @test timedwait(() -> istaskdone(t), 120.0) === :ok
+            if istaskdone(t)
+                r = fetch(t)
+                # The two that were running finished; the two queued have nowhere to run and
+                # are handed back as retriable — as without a pool.
+                @test r.done == 2
+                @test r.busy == 2
+                ev = _pl_events(outdir)
+                @test count(e -> e.kind == "worker_lost", ev) == 2
+                # The workers on the drained node were removed, and their room is back.
+                @test timedwait(() -> isempty(pool.workers), 60.0) === :ok
+                @test any(
+                    e -> e.kind == "pool_retire" && get(e, :why, "") == "node drained", ev
+                )
+                @test _pl_room(pool, 2).free == 2
+            end
+        end
+    end
+end
+
+@testset "a batch still starting when the pool is shut down is removed, not left behind (#133)" begin
+    flagdir = mktempdir()
+    flag = joinpath(flagdir, "STOP")
+    # The start raises the job's stop flag and then takes its time: the round ends while the
+    # batch is still on its way.
+    slow = (node, size, n, flags) -> begin
+        touch(flag)
+        sleep(4.0)
+        return _pl_local(node, size, n, flags)
+    end
+    _pl_custom(slow) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            r = run!(
+                k -> Dict{String,Any}("x" => 1),
+                v,
+                ks;
+                pool=pool,
+                opts=RunOpts(; stop_flag=flag),
+            )
+            @test r.done == 0
+            @test r.stopped_by === :flag
+            @test !isempty(pool.starting)                       # in flight when run! returned
+            shutdown!(pool)
+            @test isempty(pool.starting)
+            @test isempty(pool.workers)
+            @test timedwait(() -> nprocs() == 1, 60.0) === :ok
+            @test _pl_room(pool, 4).free == 4
+        end
+    end
+    rm(flagdir; recursive=true, force=true)
+end
+
+@testset "a worker the caller adds while a pool runs is given keys (#133)" begin
+    _pl_pool(; cores=1, key_req=k -> KeyReq(1, 1.0)) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            gate = joinpath(outdir, "gate")
+            work = k -> begin
+                while !isfile(gate)
+                    sleep(0.05)
+                end
+                return Dict{String,Any}("pid" => Distributed.myid())
+            end
+            t = @async run!(
+                work,
+                v,
+                ks;
+                pool=pool,
+                load=[:Distributed],
+                opts=RunOpts(; control_interval=0.2),
+            )
+            t0 = time()
+            while !any(k -> DataVault.is_running(v, k), ks) && time() - t0 < 120
+                sleep(0.05)
+            end
+            mine = only(addprocs(1; exeflags="--project=$(dirname(Base.active_project()))"))
+            # It is adopted: with one pool worker on one key, a second key running is its.
+            adopted = timedwait(
+                () -> count(k -> DataVault.is_running(v, k), ks) >= 2, 120.0
+            )
+            @test adopted === :ok
+            touch(gate)
+            r = fetch(t)
+            @test r.done == length(ks)
+            @test mine in Set(DataVault.load(v, k)["pid"] for k in ks)
+            @test mine in pool.foreign
+        end
+    end
+end
+
+@testset "an addprocs that throws part-way leaves no worker behind (#133)" begin
+    nprocs() > 1 && rmprocs(workers())
+    flags = "--project=$(dirname(Base.active_project()))"
+    err = try
+        SweepRunner._addprocs_clean() do
+            addprocs(1; exeflags=flags)                         # one connected...
+            error("the next handshake failed")                  # ...and the call threw
+        end
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test timedwait(() -> nprocs() == 1, 60.0) === :ok
+    # A start that brings up no worker and throws nothing is said, with the reason.
+    SweepRunner._READY_TIMEOUT[] = 0.5
+    try
+        ids = addprocs(1; exeflags=flags)
+        good = SweepRunner._ready_workers!(ids, KeyReq(1, 1.0); ready=(w, s) -> sleep(30))
+        @test isempty(good)
+        @test any(m -> occursin("did not become ready", m), SweepRunner._READY_FAILS)
+        @test timedwait(() -> nprocs() == 1, 60.0) === :ok
+    finally
+        SweepRunner._READY_TIMEOUT[] = 600.0
+        empty!(SweepRunner._READY_FAILS)
+    end
+end
+
+# Two nodes, one of which cannot start workers.
+struct _PlTwo <: SweepRunner.Spawner end
+function SweepRunner.pool_nodes(::_PlTwo)
+    return [PoolNode("bad", 4, 16.0), PoolNode(gethostname(), 4, 8.0)]
+end
+function SweepRunner.start_workers(::_PlTwo, node, size, n; exeflags)
+    node == "bad" && error("no route to host")
+    return _pl_local(node, size, n, exeflags)
+end
+
+@testset "a node that cannot start workers is taken out, and said; the others are used (#133)" begin
+    nprocs() > 1 && rmprocs(workers())
+    pool = SizedPool(_PlTwo(); key_req=k -> KeyReq(1, 1.0), poll=0.05, keep=true)
+    try
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            r = run!(k -> (sleep(0.2); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
+            @test r.done == length(ks)
+            ev = _pl_events(outdir)
+            out = only([e for e in ev if e.kind == "pool_node_out"])
+            @test out.node == "bad"
+            @test out.fails == SweepRunner._NODE_MAX_FAILS
+            @test out.nodes_left == 1
+            # It was tried that often and no more; everything ran on the other node.
+            @test count(e -> e.kind == "pool_spawn_failed" && e.node == "bad", ev) ==
+                SweepRunner._NODE_MAX_FAILS
+            @test all(
+                e -> e.node == gethostname(), [e for e in ev if e.kind == "pool_spawn"]
+            )
+            @test "bad" in pool.bad_nodes
+        end
+    finally
+        shutdown!(pool)
+        nprocs() > 1 && rmprocs(workers())
+        note_workers!(; planned=0, launched=0)
     end
 end

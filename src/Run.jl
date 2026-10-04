@@ -603,7 +603,7 @@ function run!(
     # is not handed work, and the round goes on without it.
     prepare =
         pids -> try
-            _ensure_worker_modules(mods)
+            _ensure_worker_modules(mods; pids=pids)
             _observe_late!(vault, pids, observe, log, stage)
             _redirect_late!(pids)
             pids
@@ -625,10 +625,8 @@ function run!(
     # The master's view of the round: one pass over the markers, then the queue the dispatcher
     # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
     prepare_secs = time() - t_prepare
-    # A hook the caller gave is taken at its word: a key it has no answer for is not assumed to
-    # fit a deadline. A table this package loaded by itself is not: a class it has not seen has
-    # to run once to be seen.
-    strict_cost = cost !== nothing || min_time !== nothing
+    # Whoever the cost comes from — the caller's hook or the table this package measured — a key
+    # it has no answer for is treated one way: see `_fits`.
     cost = _default_cost(vault, cost, key_class, todo, log, stage)
     _say_ignored(log, stage, opts, cost; pool=pool, affinity=affinity, spawn=spawn)
     todo = _ordered(todo, opts, cost)
@@ -648,8 +646,28 @@ function run!(
         base_time = need_time
         need_time = key -> _pool_min_time(pool, key, opts.deadline, base_time)
     end
-    unknown = Ref(0)
-    fits = _fits(opts, need_time; strict=strict_cost, unknown=unknown)
+    # Keys whose time nobody could say, and what the hook threw the first time it did.
+    unknown_keys = Set{String}()
+    unknown_classes = Set{String}()
+    fits = _fits(
+        opts,
+        need_time;
+        class=k -> _class_of(key_class, k),
+        explored=master.explored,
+        unknown=unknown_keys,
+        classes=unknown_classes,
+        on_explore=(class, kstr) -> log_event(
+            log,
+            :cost_explore;
+            level=:warn,
+            stage=stage,
+            class=class,
+            key=kstr,
+            why="its time is not known; one key of the class is started to measure it",
+        ),
+        on_error=err ->
+            log_event(log, :cost_hook_failed; level=:warn, stage=stage, err=err),
+    )
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
     table_ref[] = table
     scan = _scan!(table, vault, stage, log, opts)
@@ -830,9 +848,13 @@ function run!(
     n_held_back > 0 && log_event(
         log,
         :held_back;
+        # Held for the deadline is the plan working; held because nobody knows how long the
+        # key takes is something to act on.
+        level=isempty(unknown_keys) ? :info : :warn,
         stage=stage,
         keys=n_held_back,
-        cost_unknown=unknown[],
+        cost_unknown=length(unknown_keys),
+        classes_unknown=sort!(collect(unknown_classes)),
         secs_left=if opts.deadline === nothing
             nothing
         else
@@ -1398,6 +1420,10 @@ function _drive_workers!(
     started = Set{Int}()
     tasks = Task[]
     task_of = Dict{Int,Task}()
+    # Workers that could not be readied in this round: left out, not asked again every tick.
+    rejected = Set{Int}()
+    # With a pool: the workers that were there when `run!` began, which it readied itself.
+    first_foreign = pool === nothing ? Set{Int}() : Set(p for p in workers() if p != myid())
     # Set when the round has to end with an error (a unit that could not be cut, a tick step
     # that keeps failing): no more keys are handed out, the units running finish, and the error
     # is thrown. `abandoned` are the dispatch tasks not waited for: each is inside a call to a
@@ -1572,20 +1598,38 @@ function _drive_workers!(
     # round began were prepared by `run!`; later ones are prepared here.
     function _adopt!()
         # `workers()` is `[1]` when there are none: the master is not one of its own workers.
-        fresh = [p for p in workers() if !(p in started) && p != myid()]
+        fresh = [p for p in workers() if !(p in started) && p != myid() && !(p in rejected)]
         # A worker the pool is still starting is visible here before the pool knows its size;
         # it gets a dispatch task once it is registered, not before.
         pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)
         isempty(fresh) && return nothing
         late = !isempty(started)
-        # Workers `run!` found were readied by it; a pool's own, and any that join later, here.
-        mine = pool === nothing ? Int[] : [p for p in fresh if !(p in pool.foreign)]
-        ready = if prepare === nothing
-            fresh
-        elseif late
-            prepare(fresh)
+        # Workers `run!` found when it began were readied by it; a pool's own, and any that
+        # join later, here.
+        found = if pool === nothing
+            (late ? Int[] : fresh)
         else
-            vcat(setdiff(fresh, mine), isempty(mine) ? Int[] : prepare(mine))
+            [p for p in fresh if p in first_foreign]
+        end
+        todo = setdiff(fresh, found)
+        ready = if prepare === nothing || isempty(todo)
+            fresh
+        else
+            ok = prepare(todo)
+            if length(ok) < length(todo)
+                # The batch failed as one. Each by itself, so the one that cannot be readied is
+                # the only one left out — and it is set aside: asked again every tick, it was
+                # re-readying every worker and logging the same line each second.
+                ok = Int[]
+                for p in todo
+                    if isempty(prepare([p]))
+                        push!(rejected, p)
+                    else
+                        push!(ok, p)
+                    end
+                end
+            end
+            vcat(found, ok)
         end
         _identify_workers!(master, ready)
         who = lock(() -> copy(master.who), master.lock)
@@ -1618,7 +1662,7 @@ function _drive_workers!(
             task_of[pid] = t
             push!(tasks, t)
         end
-        late && log_event(log, :workers_joined; stage=stage, n=n)
+        (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
         return nothing
     end
 
@@ -1769,11 +1813,18 @@ function _drive_workers!(
             level=:error,
             stage=stage,
             fails=pool.fails,
+            nodes_out=sort!(collect(pool.bad_nodes)),
             queued=count(r -> r.state === :todo, table.rows),
         )
+        out = if isempty(pool.bad_nodes)
+            ""
+        else
+            " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
+        end
         error(
-            "SizedPool: $(pool.fails) worker starts failed in a row with keys still queued. " *
-            "The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
+            "SizedPool: $(pool.fails) worker starts failed in a row with keys still queued." *
+            out *
+            " The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
             "\"pool_spawn_short\").",
         )
     end
@@ -2319,8 +2370,9 @@ function _ordered(todo::Vector{DataKey}, opts::RunOpts, cost)
     out = todo
     if opts.order === :longest_first && cost !== nothing
         # Stable, so keys of equal cost keep the caller's order.
-        # A key of unknown cost sorts as the shortest: it is not put ahead of the measured ones.
-        out = sort(out; by=k -> -something(key_seconds(cost, k), 0.0), alg=MergeSort)
+        # A key of unknown cost goes FIRST: it may be the longest, and it has to be started for
+        # its class to be measured at all. Sorted as the shortest it was the first to be cut.
+        out = sort(out; by=k -> -something(key_seconds(cost, k), Inf), alg=MergeSort)
     end
     sh = opts.shard
     if sh !== nothing && sh[2] > 1
@@ -2349,12 +2401,15 @@ answers something that is not a finite, non-negative number. This is the one way
 campaign and the job controller ask, so "unknown" is the same everywhere — and is never silently
 zero.
 """
-function key_seconds(f, key::DataKey)::Union{Float64,Nothing}
+function key_seconds(f, key::DataKey; failure=nothing)::Union{Float64,Nothing}
     try
         x = Float64(f(key))
         return (isfinite(x) && x >= 0) ? x : nothing
     catch e
         e isa InterruptException && rethrow()
+        # Kept for the caller that wants to say it: a hook that throws on every key was never
+        # reported.
+        failure === nothing || (failure[] = e)
         return nothing
     end
 end
@@ -2407,19 +2462,47 @@ function _say_ignored(
 end
 
 # `key -> Bool`: can this key still get somewhere before the deadline? Always, without one.
-# A key whose need is unknown is not assumed to fit when the hook is the caller's (`strict`);
-# `unknown` counts those.
-function _fits(opts::RunOpts, need; strict::Bool=false, unknown=Ref(0))
+#
+# One rule for a key whose time is NOT KNOWN (the hook has no answer, answers NaN, or throws):
+# it is neither assumed to fit nor held back for ever. One key per class per job is started
+# regardless, to be measured (`explored`, kept by the master across rounds; `on_explore` says
+# it); the others of that class are held back, counted in `unknown` with their `classes`. Held
+# back without that, a class that had never completed was held back in every job with a deadline
+# — and so never completed.
+function _fits(
+    opts::RunOpts,
+    need;
+    class=key -> "",
+    explored::AbstractDict=Dict{String,String}(),
+    unknown::AbstractSet=Set{String}(),
+    classes::AbstractSet=Set{String}(),
+    on_explore=(class, kstr) -> nothing,
+    on_error=err -> nothing,
+)
     d = opts.deadline
     d === nothing && return Returns(true)
+    said_error = Ref(false)
     return key -> begin
-        t = key_seconds(need, key)
-        if t === nothing
-            strict || return true
-            unknown[] += 1
-            return false
+        failure = Ref{Any}(nothing)
+        t = key_seconds(need, key; failure=failure)
+        if failure[] !== nothing && !said_error[]
+            # A hook that throws is not "no answer": said once, with what it threw.
+            said_error[] = true
+            on_error(_short_err(failure[]))
         end
-        return time() + t <= d
+        t === nothing || return time() + t <= d
+        c = String(class(key))
+        kstr = canonical(key)
+        chosen = get(explored, c, nothing)
+        if chosen === nothing
+            explored[c] = kstr
+            on_explore(c, kstr)
+            return true
+        end
+        chosen == kstr && return true            # asked again about the one that was chosen
+        push!(unknown, kstr)
+        push!(classes, c)
+        return false
     end
 end
 
