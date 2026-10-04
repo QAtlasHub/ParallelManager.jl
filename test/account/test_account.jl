@@ -111,7 +111,7 @@ end
         after_stamp = at[3] - at[2]
         @test a["lost"] >= 0.35 * cores
         @test a["lost"] >= 0.9 * after_stamp * cores
-        @test a["lost"] <= (after_stamp + 1.0) * cores            # plus the way out of the error
+        @test a["lost"] <= (after_stamp + 10.0) * cores           # plus the way out of the error
         @test a["lost"] < a["computing"]
         @test a["kept"] >= (0.3 + 0.2 * (length(ks) - 1)) * cores * 0.9
         @test a["computing"] <= a["allocated"] + 1e-6

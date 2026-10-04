@@ -239,21 +239,24 @@ function _next_accepted!(t::TaskTable, worker::Int, accept)
 end
 
 """
-    start_task!(table, i, owner, worker)
+    start_task!(table, i, owner, worker) -> Bool
 
-Row `i` is handed to `worker`, which will take the lock as `owner`.
+Row `i` is handed to `worker`, which will take the lock as `owner`. Only a row that is still
+`:todo` starts: between `next_task!` drawing it and this call a stop may have settled it, and
+started all the same it was a settled key running again. `false` means it was not started, and
+the caller draws the next.
 """
 function start_task!(t::TaskTable, i::Int, owner::AbstractString, worker::Int)
-    lock(t.lock) do
+    return lock(t.lock) do
         r = t.rows[i]
+        r.state === :todo || return false
         r.state = :running
         r.owner = String(owner)
         r.worker = worker
         r.since = time()
         r.outcome = nothing
-        return nothing
+        return true
     end
-    return nothing
 end
 
 # What a row can be settled with. A closed set: `run!` counts its result by these names, and one
@@ -293,6 +296,16 @@ function settle!(t::TaskTable, i::Int, outcome::Symbol)
     _check_outcome(outcome)
     lock(t.lock) do
         r = t.rows[i]
+        # A key that is done stays done: settled again as something else it was counted twice,
+        # or lost from the manifest.
+        if (r.outcome === :ok || r.outcome === :already_done) && outcome !== r.outcome
+            throw(
+                ArgumentError(
+                    "TaskTable: row $i ($(r.kstr)) is done ($(r.outcome)); it cannot be " *
+                    "settled as $(repr(outcome))",
+                ),
+            )
+        end
         r.state = :settled
         r.outcome = outcome
         r.worker = 0

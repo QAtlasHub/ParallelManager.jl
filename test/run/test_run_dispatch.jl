@@ -426,6 +426,18 @@ end
         @test Set(e.option for e in ev) == Set(["affinity", "spawn"])
     end
     _dp_vault() do v, outdir
+        # Options only a round with workers acts on, given to one that has none (#159).
+        ks = DataVault.keys(v)[1:2]
+        run!(
+            _dp_rec(String[]),
+            v,
+            ks;
+            opts=_dp_quiet(; stop_grace=30.0, min_busy_fraction=0.5),
+        )
+        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
+        @test Set(e.option for e in ev) == Set(["stop_grace", "min_busy_fraction"])
+    end
+    _dp_vault() do v, outdir
         # Nothing asked for, nothing said; and a cost makes the order real.
         ks = DataVault.keys(v)[1:2]
         run!(
@@ -522,6 +534,9 @@ write(joinpath(outdir, "result_$i"), string(r.remaining))
             sleep(0.1)
         end
         touch(go)
+        # Bounded: a master that hangs fails the test, it does not hang the suite.
+        @test timedwait(() -> !any(process_running, procs), 300.0) === :ok
+        foreach(p -> process_running(p) && kill(p, Base.SIGKILL), procs)
         foreach(wait, procs)
         for (i, p) in zip(0:1, procs)
             success(p) ||

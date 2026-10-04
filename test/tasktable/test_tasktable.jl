@@ -119,6 +119,7 @@ end
     @test t.rows[1].state === :todo                             # nothing was changed
     @test task_counts(t).todo == 3
     for o in SweepRunner.OUTCOMES
+        o in (:ok, :already_done) && continue                   # those are final: below
         settle!(t, 1, o)
         @test t.rows[1].outcome === o
     end
@@ -138,4 +139,26 @@ end
     settle!(t, 2, :worker_lost)
     SweepRunner.requeue!(t, 2)                                   # retriable: allowed
     @test t.rows[2].state === :todo
+end
+
+@testset "TaskTable: a row that is settled is not started, and one that is done stays done (#159)" begin
+    t = TaskTable(_tt_keys(3))
+    i = next_task!(t, 2)
+    # Between the draw and the start, a stop settles what is queued.
+    @test settle_queued!(t, :stop_flag) == 3
+    @test start_task!(t, i, "tok", 2) == false                  # not revived
+    @test t.rows[i].state === :settled && t.rows[i].outcome === :stop_flag
+    @test task_counts(t).running == 0
+    # A row that is still queued starts, once.
+    t = TaskTable(_tt_keys(2))
+    i = next_task!(t, 2)
+    @test start_task!(t, i, "tok", 2) == true
+    @test start_task!(t, i, "tok2", 3) == false                 # already running
+    @test t.rows[i].owner == "tok"
+    # Done is final.
+    settle!(t, i, :ok)
+    @test_throws ArgumentError settle!(t, i, :error)
+    @test_throws ArgumentError settle!(t, i, :lock_busy)
+    settle!(t, i, :ok)                                          # the same again is not a change
+    @test t.rows[i].outcome === :ok
 end
