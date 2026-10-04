@@ -533,10 +533,21 @@ function _eligible(keys, s::StageSpec, p::Union{CampaignProfile,Nothing}, cost)
         ),
     )
     # Asked the guarded way, as the run does. A key whose cost is not known is not assumed to be
-    # short enough.
-    return DataKey[
-        k for k in keys if something(key_seconds(x -> cost(s, x), k), Inf) <= p.max_key_time
-    ]
+    # short enough — but ONE of them per stage is eligible, as in `run!`: a stage none of whose
+    # keys had ever completed was otherwise nothing runnable, in every job, for ever.
+    explored = false
+    out = DataKey[]
+    for k in keys
+        t = key_seconds(x -> cost(s, x), k)
+        if t === nothing
+            explored && continue
+            explored = true
+            push!(out, k)
+        elseif t <= p.max_key_time
+            push!(out, k)
+        end
+    end
+    return out
 end
 
 # ── running ─────────────────────────────────────────────────────────────────────────────────────

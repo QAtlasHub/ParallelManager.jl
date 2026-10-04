@@ -634,7 +634,10 @@ function _pool_need(pool::SizedPool, key::DataKey, kstr::AbstractString, deadlin
     (pool.threads === :finish_by && deadline !== nothing && min_time !== nothing) ||
         return base
     left = deadline - time()
-    need = something(key_seconds(min_time, key), 0.0)
+    need = key_seconds(min_time, key)
+    # Not known how long it takes: the most cores, not the fewest — as zero seconds it was
+    # given one core, the size least likely to get it there.
+    need === nothing && return KeyReq(max(pool.max_threads, base.cores), base.mem_gb)
     s0 = max(Float64(pool.speedup(key, base.cores)), 1e-9)
     for c in base.cores:max(pool.max_threads, base.cores)
         need * s0 / max(Float64(pool.speedup(key, c)), 1e-9) <= left &&
