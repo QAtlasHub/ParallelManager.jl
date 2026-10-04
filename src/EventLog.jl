@@ -289,6 +289,22 @@ function _warnings_since(before::AbstractDict)
     return Dict(k => v - get(before, k, 0) for (k, v) in now if v > get(before, k, 0))
 end
 
+# The round's warnings in one line on the master's stderr, where a person reading the job's
+# output sees them without opening the event file.
+function _say_warnings(stage::Symbol, counts::AbstractDict)
+    isempty(counts) && return nothing
+    sink = _WARNING_IO[]
+    (sink === nothing || get(ENV, "SWEEPRUNNER_QUIET_WARNINGS", "") == "1") &&
+        return nothing
+    io = sink === :stderr ? stderr : sink
+    parts = ["$k ×$(counts[k])" for k in sort!(collect(keys(counts)))]
+    try
+        println(io, "sweeprunner: stage $stage ended with warnings: ", join(parts, ", "))
+    catch
+    end
+    return nothing
+end
+
 """
     merge_event_logs(dir; output="events_merged.jsonl") -> String
 

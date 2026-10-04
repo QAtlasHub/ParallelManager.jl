@@ -346,22 +346,6 @@ function _stop_outcome(reason::Symbol)::Symbol
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
-# The round's warnings in one line on the master's stderr, where a person reading the job's
-# output sees them without opening the event file.
-function _say_warnings(stage::Symbol, counts::AbstractDict)
-    isempty(counts) && return nothing
-    sink = _WARNING_IO[]
-    (sink === nothing || get(ENV, "SWEEPRUNNER_QUIET_WARNINGS", "") == "1") &&
-        return nothing
-    io = sink === :stderr ? stderr : sink
-    parts = ["$k ×$(counts[k])" for k in sort!(collect(keys(counts)))]
-    try
-        println(io, "sweeprunner: stage $stage ended with warnings: ", join(parts, ", "))
-    catch
-    end
-    return nothing
-end
-
 # The ticker's steps: how often a failing one is said again, and how many failures in a row end
 # the round.
 const _TICK_SAY_EVERY = 100
