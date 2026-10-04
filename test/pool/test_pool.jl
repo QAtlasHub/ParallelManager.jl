@@ -628,3 +628,43 @@ end
         end
     end
 end
+
+@testset "a tick step that keeps throwing is said once, by name, and ends the round (#135)" begin
+    _pl_vault() do v, outdir
+        armed = joinpath(outdir, "armed")
+        # The planner's hook throws once the first key is running: from then on the pool's tick
+        # fails every time, as a `key_req` that cannot answer for one key makes it.
+        req = k -> (isfile(armed) && error("no size for this key"); KeyReq(1, 1.0))
+        # Two cores for four keys: two stay queued, so every tick has a key to ask about.
+        _pl_pool(; key_req=req, cores=2) do pool
+            ks = DataVault.keys(v)
+            # Longer than the thirty failures the step is allowed take at this pool's 0.2 s.
+            work = k -> (touch(armed); sleep(20.0); Dict{String,Any}("x" => 1))
+            err = try
+                run!(work, v, ks; pool=pool)
+                nothing
+            catch e
+                e
+            end
+            ev = _pl_events(outdir)
+            failed = [e for e in ev if e.kind == "tick_failed"]
+            # Said once, and again only every hundredth time, with the step's name: a bounded
+            # number of lines however long it lasts.
+            @test 1 <= length(failed) <= 5
+            @test all(e -> e.count == 1 || e.count % 100 == 0, failed)
+            @test failed[1].step == "pool" && failed[1].count == 1
+            @test occursin("no size for this key", failed[1].err)
+            # It lasted: the round ended with an error that names the step...
+            @test err isa ErrorException
+            @test occursin("`pool` step failed", err.msg)
+            # ...after the units that were running had finished, not by dropping them.
+            started = [e.key for e in ev if e.kind == "key_acquired"]
+            @test !isempty(started)
+            @test all(
+                k -> DataVault.is_done(v, k),
+                [k for k in ks if ParamIO.canonical(k) in started],
+            )
+            @test !any(e -> e.kind == "control_failed", ev)
+        end
+    end
+end

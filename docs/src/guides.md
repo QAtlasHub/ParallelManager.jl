@@ -352,6 +352,20 @@ checkpoint over the new owner's. With the worker gone the round returns, so a
 six-hour unit cannot hold a job that was told to stop. The worker is lost for
 the rest of the job (a pool starts another when the queue needs one).
 
+**If the worker cannot be removed** (a cluster manager that keeps no handle on
+it, an `rmprocs` that timed out) the lock is *not* released: the unit is still
+computing, and a free lock would let the key run twice. The kill is tried again
+on later ticks (`key_cut` with `worker_removed = false`), and after three tries
+`run!` throws, naming the worker — the allocation holds a process nobody could
+stop, and the batch script must be able to tell. The lock stays with that
+worker (`lock_kept`).
+
+The master's periodic work is a list of named steps (requests, the pool, the
+stops, the manifest). One that fails is logged as `tick_failed step=…` — once,
+then every hundredth time — and does not switch off the others; thirty failures
+in a row of one step end the round with an error, after the running units have
+finished.
+
 The job's own stop gets the same bound with `RunOpts(stop_grace = seconds)`:
 once `stop_flag` is raised or the `deadline` has passed, units still running
 after `stop_grace` are cut. It is `Inf` by default — a deadline set hours

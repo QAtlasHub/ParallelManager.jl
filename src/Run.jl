@@ -330,6 +330,11 @@ function _stop_outcome(reason::Symbol)::Symbol
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
+# The ticker's steps: how often a failing one is said again, and how many failures in a row end
+# the round.
+const _TICK_SAY_EVERY = 100
+const _TICK_MAX_FAILS = 30
+
 # How many times a key whose worker DIED is handed to another one.
 const _WORKER_DEATH_REDISPATCHES = 2
 
@@ -1273,6 +1278,31 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
     for (i, r) in cut
         tok = r.owner
         tok === nothing && continue
+        # The worker first, as in a cut: a lock released under a worker that is still computing
+        # is a key that runs twice. One that will not go keeps its lock (its heartbeat keeps it
+        # fresh, and it ends with the worker).
+        pid = r.worker
+        if pid != 0 && pid != myid() && pid in procs()
+            try
+                something(_KILL_WORKER[], _kill_worker!)(pid)
+            catch e
+                e isa InterruptException && rethrow()
+            end
+            if pid in procs()
+                log_event(
+                    log,
+                    :lock_kept;
+                    level=:warn,
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    worker=pid,
+                    why="master_exit: the worker could not be removed and is still computing",
+                )
+                settle!(table, i, :lock_busy)
+                continue
+            end
+        end
         try
             DataVault.clear_running!(vault, r.key, tok)
             log_event(
@@ -1350,6 +1380,13 @@ function _drive_workers!(
     held_now = Ref(any(r -> r.state === :held, table.rows))
     started = Set{Int}()
     tasks = Task[]
+    task_of = Dict{Int,Task}()
+    # Set when the round has to end with an error (a unit that could not be cut, a tick step
+    # that keeps failing): no more keys are handed out, the units running finish, and the error
+    # is thrown. `abandoned` are the dispatch tasks not waited for: each is inside a call to a
+    # worker that could not be removed.
+    abort = Ref{Any}(nothing)
+    abandoned = Set{Task}()
 
     function _loop(pid::Int, host::String, ospid::Int)
         # The round's context goes to the worker once. Sent with every key, the work function,
@@ -1372,6 +1409,7 @@ function _drive_workers!(
                     stopped[] = true
                 end
             end
+            abort[] === nothing || break
             # A worker that went away while this loop was waiting must not be handed a key: the
             # call would fail at once and be counted against the key as a death.
             pid in workers() || break
@@ -1551,12 +1589,14 @@ function _drive_workers!(
             end
             push!(started, pid)
             n += 1
-            push!(tasks, @async try
+            t = @async try
                 _loop(pid, w.host, w.pid)
             finally
                 # A loop that leaves on an exception must not strand the ones waiting on it.
                 notify(idle)
-            end)
+            end
+            task_of[pid] = t
+            push!(tasks, t)
         end
         late && log_event(log, :workers_joined; stage=stage, n=n)
         return nothing
@@ -1567,6 +1607,35 @@ function _drive_workers!(
     _adopt!()
     done = Ref(false)
     idle_since = Ref(0.0)
+    # One step of the ticker, by name. A failure is logged on its first occurrence and then
+    # every `_TICK_SAY_EVERY`-th, with the count; a step that fails `_TICK_MAX_FAILS` times in a
+    # row ends the round with an error: a master whose pool tick cannot run is not doing its job.
+    fails = Dict{Symbol,Int}()
+    function step(f, name::Symbol)
+        try
+            f()
+            fails[name] = 0
+        catch e
+            e isa InterruptException && rethrow()
+            n = fails[name] = get(fails, name, 0) + 1
+            (n == 1 || n % _TICK_SAY_EVERY == 0) && log_event(
+                log,
+                :tick_failed;
+                level=:warn,
+                stage=stage,
+                step=String(name),
+                count=n,
+                err=_short_err(e),
+            )
+            if n >= _TICK_MAX_FAILS && abort[] === nothing
+                abort[] = ErrorException(
+                    "run!: the master's `$name` step failed $n times in a row " *
+                    "(last: $(_short_err(e))); see kind=\"tick_failed\" in the event log",
+                )
+            end
+        end
+        return nothing
+    end
     # `every`, not `tick`: `tick` is the caller's per-tick callback (a keyword of this function).
     every = opts.control_interval > 0 ? opts.control_interval : 10.0
     # A pool is looked at more often than requests are: a start it does not make is idle room.
@@ -1574,26 +1643,50 @@ function _drive_workers!(
     @async while true
         sleep(every)
         done[] && break
-        try
+        # Each step under its own guard: one that throws used to switch off every step after
+        # it, each tick — the cut of units past their grace, the manifest, the pool.
+        step(:control) do
             poll_control!(
                 master, table, log, opts; affinity=affinity, force=pool === nothing
             )
-            if pool !== nothing
+        end
+        if pool !== nothing
+            step(:pool) do
                 _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
+            end
+            # Whatever the tick did, the wait loop decides on what is true now.
+            step(:pool_wants) do
                 queued_now[] = _pool_wants(pool, table)
             end
-            _adopt!()
+        end
+        step(_adopt!, :adopt)
+        step(:underused) do
             _leave_if_underused!(master, table, out[], idle_since, opts, log)
-            # The job's own stop gets its grace once, when it is first seen.
-            if !graced[] && _stop_reason(opts) !== nothing
+        end
+        step(:stop_grace) do
+            # The job's own stop — its flag, its deadline, leaving an under-used allocation —
+            # gets its grace once, when it is first seen.
+            own_stop =
+                _stop_reason(opts) !== nothing || (c.stop_all && c.stop_why === :underused)
+            if !graced[] && own_stop
                 graced[] = true
                 _order_stops_all!(master, table, opts.stop_grace, "stop_grace")
             end
+        end
+        step(:enforce_stops) do
             _enforce_stops!(master, table, log)
-            tick()
+            # A unit that could not be cut: the round ends, saying which worker is still there.
+            for (kstr, o) in c.stopping
+                (o.failed && abort[] === nothing) || continue
+                abort[] = ErrorException("run!: " * o.why)
+                i = get(table.index, kstr, 0)
+                t = i == 0 ? nothing : get(task_of, table.rows[i].worker, nothing)
+                t === nothing || push!(abandoned, t)
+            end
+        end
+        step(tick, :flush)
+        step(:held) do
             held_now[] = lock(() -> any(r -> r.state === :held, table.rows), table.lock)
-        catch e
-            log_event(log, :control_failed; level=:warn, stage=stage, err=_short_err(e))
         end
         # Wakes the idle dispatch tasks: a resume, a new key or a new stop is theirs to act on.
         notify(idle)
@@ -1604,13 +1697,22 @@ function _drive_workers!(
         i = 1
         while true
             while i <= length(tasks)               # the list grows as workers are adopted
-                try
-                    wait(tasks[i])
-                catch e
-                    failure === nothing && (failure = e)
+                t = tasks[i]
+                # Woken by every dispatch task that ends and by every tick. A task whose worker
+                # could not be removed is not waited for: its call does not return.
+                while !istaskdone(t) && !(abort[] !== nothing && t in abandoned)
+                    wait(idle)
+                end
+                if istaskdone(t)
+                    try
+                        wait(t)
+                    catch e
+                        failure === nothing && (failure = e)
+                    end
                 end
                 i += 1
             end
+            abort[] === nothing || break
             # A pool may have nothing started yet, or be starting the workers the queue still
             # needs: the round is not over while it is working towards them.
             (
@@ -1638,6 +1740,7 @@ function _drive_workers!(
     end
     empty!(c.cuts)
     failure === nothing || throw(failure)
+    abort[] === nothing || throw(abort[])
     # A pool that cannot start workers is not a round that ended: said, and an error.
     if pool !== nothing && _pool_gave_up(pool) && _has_queued(table)
         log_event(
@@ -1740,6 +1843,10 @@ function _leave_if_underused!(
         control!(m.vault, :stop; master=m.id)
     catch e
         e isa InterruptException && rethrow()
+        # Without the request the running units do not hear of it: they run to their end.
+        log_event(
+            log, :underused_request_failed; level=:warn, stage=m.stage, err=_short_err(e)
+        )
     end
     return true
 end

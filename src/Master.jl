@@ -55,6 +55,16 @@ mutable struct StopOrder
     cut::Bool
     request::String
     interrupt::Bool
+    # A cut whose worker could not be removed is tried again (`next`), `tries` times; after
+    # that it has `failed`, and the round ends with an error that names the worker.
+    tries::Int
+    next::Float64
+    failed::Bool
+    why::String
+end
+
+function StopOrder(deadline::Real, cut::Bool, request::AbstractString, interrupt::Bool)
+    return StopOrder(Float64(deadline), cut, String(request), interrupt, 0, 0.0, false, "")
 end
 
 # What a worker needs to tell whether a stop request covers the unit it is on.

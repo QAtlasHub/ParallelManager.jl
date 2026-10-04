@@ -785,3 +785,84 @@ end
         @test got[][1]["op"] == "prioritise"
     end
 end
+
+# ── a cut that cannot remove its worker (#131) ───────────────────────────────────────────────────
+
+@testset "workers: a worker that cannot be removed keeps its lock, and the round ends saying so (#131)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            target = ks[1]
+            long = ParamIO.canonical(target)
+            sel = Dict(String(n) => val for (n, val) in target.params)
+            # The unit never looks at a stop, and nothing this master does removes its worker:
+            # what a cluster manager that keeps no handle on its workers gives.
+            work = k -> begin
+                sleep(ParamIO.canonical(k) == long ? 600.0 : 0.1)
+                return Dict{String,Any}("x" => 1)
+            end
+            SweepRunner._KILL_WORKER[] = pid -> nothing
+            SweepRunner._CUT_RETRY[] = 0.2
+            try
+                t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
+                t0 = time()
+                while !DataVault.is_running(v, target) && time() - t0 < 60
+                    sleep(0.05)
+                end
+                owner = DataVault.running_owner(v, target)
+                @test owner !== nothing
+                t_stop = time()
+                control!(v, :stop; select=sel, grace=0.2)
+                err = try
+                    fetch(t)
+                    nothing
+                catch e
+                    e isa TaskFailedException ? e.task.exception : e
+                end
+                # The round returned — it is not held by the unit — and as an error.
+                @test time() - t_stop < 60
+                @test err isa ErrorException
+                @test occursin("could not be removed after 3 tries", err.msg)
+                @test occursin(long, err.msg)
+                # The worker still computes, so the key is still its own: nobody else takes it.
+                @test DataVault.is_running(v, target)
+                @test DataVault.running_owner(v, target) == owner
+                @test owner in SweepRunner._out_tokens()       # and a sibling asking is told so
+                cuts = [e for e in _ct_events(outdir) if e.kind == "key_cut"]
+                @test length(cuts) == 3
+                @test all(e -> e.worker_removed == false && e.lock_released == false, cuts)
+                @test [e.tries for e in cuts] == [1, 2, 3]
+                @test cuts[end].gave_up == true
+                kept = only([e for e in _ct_events(outdir) if e.kind == "lock_kept"])
+                @test kept.key == long
+                @test DataVault.is_done(v, ks[2])              # the other key was not affected
+            finally
+                SweepRunner._KILL_WORKER[] = nothing
+                SweepRunner._CUT_RETRY[] = 5.0
+                SweepRunner._release_all_at_exit()
+            end
+        end
+    end
+end
+
+@testset "a second stop on a unit keeps the earlier deadline and a cut under way (#131)" begin
+    _ct_vault() do v, _
+        ks = DataVault.keys(v)
+        m = SweepRunner.Master()
+        table = TaskTable(ks)
+        i = SweepRunner.next_task!(table, 2)
+        SweepRunner.start_task!(table, i, "tok", 2)
+        kstr = table.rows[i].kstr
+        req = grace -> Dict{String,Any}("id" => "r", "grace" => grace)
+        @test SweepRunner._order_stops!(m, table, r -> true, req(100.0)) == 1
+        o = m.ctl.stopping[kstr]
+        first_deadline = o.deadline
+        o.cut = true                                            # the cut has begun
+        SweepRunner._order_stops!(m, table, r -> true, req(1000.0))
+        @test m.ctl.stopping[kstr] === o
+        @test o.cut
+        @test o.deadline == first_deadline
+        SweepRunner._order_stops!(m, table, r -> true, req(1.0))   # an earlier one moves it up
+        @test o.deadline < first_deadline
+    end
+end
