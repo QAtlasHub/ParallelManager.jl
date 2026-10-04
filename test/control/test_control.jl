@@ -962,6 +962,7 @@ end
         @test r.done == 1
         @test DataVault.load(v, k)["got"] == 41
     end
+end
 
 # ── requests are checked by the one who reads them (#138) ────────────────────────────────────────
 
