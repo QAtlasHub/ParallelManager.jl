@@ -585,10 +585,15 @@ function _check_ledger_row(id::AbstractString, j::AbstractDict)
     (t isa Real && !isnan(t) && t >= 0) ||
         bad("time_limit must be >= 0 and not NaN, got $(repr(t))")
     j["ended"] isa Bool || bad("ended must be true or false, got $(repr(j["ended"]))")
+    j["state"] isa AbstractString || bad("state must be a string, got $(repr(j["state"]))")
+    # One fact in two fields: they are made to agree where the row enters.
+    j["ended"] && (j["state"] = "ended")
+    (j["state"] == "ended" && !j["ended"]) && (j["ended"] = true)
     return nothing
 end
 
 function save_ledger(l::Ledger)
+    _check_ledger_held(l)
     rows = Dict(
         id => Dict{String,Any}(
             k => (v isa AbstractFloat && isinf(v) ? nothing : v) for (k, v) in j
@@ -613,7 +618,7 @@ end
 
 # How long a ledger lock may be held before it is taken as left behind by a controller that
 # died. A round holds it across `squeue` and `sbatch`, each bounded at a minute.
-const _LEDGER_LOCK_STALE = 600.0
+const _LEDGER_LOCK_STALE = Ref(600.0)
 
 """
     with_ledger(f, ledger; wait=120.0)
@@ -626,19 +631,34 @@ cannot be had within `wait` seconds.
 function with_ledger(f, l::Ledger; wait::Real=120.0)
     lockdir = l.path * ".lock"
     mkpath(dirname(l.path))
+    token = string(gethostname(), ":", getpid(), ":", string(rand(UInt64); base=16))
     t0 = time()
     while true
-        try
+        got = try
             mkdir(lockdir)
-            break
+            true
         catch e
             e isa InterruptException && rethrow()
             isdir(lockdir) || rethrow()
+            false
         end
-        # Left behind by a controller that died holding it.
-        age = time() - mtime(lockdir)
-        if age > _LEDGER_LOCK_STALE
-            rm(lockdir; force=true, recursive=true)
+        if got
+            write(joinpath(lockdir, "owner"), token)
+            break
+        end
+        # Left behind by a controller that died holding it: its holder refreshes the directory
+        # while it lives, so one this old has none. It is taken by RENAMING it — one of two
+        # waiters that both see it stale gets the rename, the other finds nothing to move, and
+        # neither removes a lock the other has just made.
+        age = time() - _lock_touched(lockdir)
+        if age > _LEDGER_LOCK_STALE[]
+            aside = string(lockdir, ".stale.", string(rand(UInt32); base=16))
+            try
+                mv(lockdir, aside)
+                rm(aside; force=true, recursive=true)
+            catch e
+                e isa InterruptException && rethrow()
+            end
             continue
         end
         time() - t0 > wait && error(
@@ -647,12 +667,61 @@ function with_ledger(f, l::Ledger; wait::Real=120.0)
         )
         sleep(0.2)
     end
+    # While it is held it is kept fresh, so that a round that is slow (an `sacct` per absent
+    # job, a campaign scan, an `sbatch` per decision) is not taken for one that died.
+    alive = Ref(true)
+    keeper = @async while alive[]
+        try
+            # Only while it is still ours: a holder that lost the lock must not keep another's
+            # fresh, nor put an owner file back.
+            _lock_token(lockdir) == token && touch(joinpath(lockdir, "owner"))
+        catch
+        end
+        timedwait(() -> !alive[], _LEDGER_LOCK_STALE[] / 10; pollint=0.05)
+    end
+    _LEDGER_HELD[l] = (lockdir, token)
     try
         reload_ledger!(l)
         return f()
     finally
-        rm(lockdir; force=true, recursive=true)
+        alive[] = false
+        delete!(_LEDGER_HELD, l)
+        # Only its owner removes it: if it was taken from us, the lock there is someone else's.
+        _lock_token(lockdir) == token && rm(lockdir; force=true, recursive=true)
     end
+end
+
+# Ledgers this process holds the lock of: the ledger object => (lock directory, token). By
+# object, not by path: two controllers in one process are two holders.
+const _LEDGER_HELD = IdDict{Any,Tuple{String,String}}()
+
+function _lock_token(lockdir::AbstractString)
+    return try
+        read(joinpath(lockdir, "owner"), String)
+    catch
+        nothing
+    end
+end
+
+# When the lock was last refreshed: the owner file if it is there, else the directory.
+function _lock_touched(lockdir::AbstractString)
+    f = joinpath(lockdir, "owner")
+    return try
+        isfile(f) ? mtime(f) : mtime(lockdir)
+    catch
+        time()
+    end
+end
+
+# Still ours? Asked before every write made under the lock: a controller that lost it (it was
+# taken as stale while this one was stuck) must not write its copy over what the other decided.
+function _check_ledger_held(l::Ledger)
+    held = get(_LEDGER_HELD, l, nothing)
+    held === nothing && return nothing             # written outside a lock (a test, a tool)
+    _lock_token(held[1]) == held[2] || error(
+        "the lock on the ledger $(l.path) was taken by another controller; not written"
+    )
+    return nothing
 end
 
 # How many polls in a row a job has to be absent from the scheduler's answer before the ledger
@@ -720,6 +789,8 @@ end
 # For how long a job has to have been absent, beside the number of polls, before absence is taken
 # as its end: three polls a second apart are one moment, not three.
 const _ENDED_MIN_ABSENT = Ref(120.0)
+# The same, for answers that list no job of the ledger at all: half an hour.
+const _ENDED_MIN_ABSENT_ALONE = Ref(1800.0)
 # How long a submission may go unlisted before it is taken as not made.
 const _SUBMIT_UNSEEN = Ref(600.0)
 
@@ -817,16 +888,26 @@ function observe!(
             evidence = "the scheduler's accounting says it ended"
         elseif g === false
             j["missing"] = 0
+            delete!(j, "absent_since")           # a later absence is measured from then
             continue
         else
-            if trusted
-                j["missing"] = Int(get(j, "missing", 0)) + 1
-                get!(j, "absent_since", Float64(now))
-                absent = Float64(now) - Float64(j["absent_since"])
-                if j["missing"] >= _ENDED_AFTER_MISSING && absent >= _ENDED_MIN_ABSENT[]
-                    evidence =
-                        "absent from $(j["missing"]) answers that listed other jobs of " *
-                        "the ledger, over $(round(Int, absent)) s"
+            # The scheduler answered and does not list it. An answer that lists other jobs of
+            # the ledger can be read for absence after a short while. One that lists NONE of
+            # them — the usual case with one job per partition, and also what the wrong
+            # cluster or a filter gives — counts too, but only over a long wall time: without
+            # that the end of the last live job could not be seen at all, and a pending job
+            # that was cancelled blocked the controller for ever.
+            j["missing"] = Int(get(j, "missing", 0)) + 1
+            get!(j, "absent_since", Float64(now))
+            absent = Float64(now) - Float64(j["absent_since"])
+            need = trusted ? _ENDED_MIN_ABSENT[] : _ENDED_MIN_ABSENT_ALONE[]
+            if j["missing"] >= _ENDED_AFTER_MISSING && absent >= need
+                evidence = if trusted
+                    "absent from $(j["missing"]) answers that listed other jobs of the " *
+                    "ledger, over $(round(Int, absent)) s"
+                else
+                    "absent from $(j["missing"]) answers over $(round(Int, absent)) s " *
+                    "(none of them listed any job of the ledger)"
                 end
             end
             # Whatever the answers are worth: a job seen running cannot outlive its limit.
@@ -901,7 +982,7 @@ function node_hours(l::Ledger)
     by = Dict{String,Tuple{Float64,Float64}}()
     for j in values(l.jobs)
         u = Float64(j["nodes"]) * Float64(j["elapsed"]) / 3600
-        c = if j["ended"] === true
+        c = if j["ended"] === true || j["nodes"] == 0     # no nodes: nothing, not 0 * Inf
             0.0
         else
             Float64(j["nodes"]) * max(Float64(j["time_limit"]) - Float64(j["elapsed"]), 0.0) / 3600
@@ -1115,15 +1196,15 @@ Call it from a job that is ending to resubmit only if work remains, or in
 [`controller_loop!`](@ref) to keep a campaign supplied.
 """
 function manage!(ctl::JobController, work)::Vector{Decision}
-    states = try
-        job_states(ctl.scheduler)
-    catch e
-        e isa InterruptException && rethrow()
-        return _refuse_all(ctl, "the scheduler could not be asked: $(_short_err(e))")
-    end
-    # A dry run looks: it decides on a copy of what is on disk and writes nothing. It used to
-    # save the ledger, so three looks at an empty answer marked every job ended.
+    # A dry run looks: it decides on a copy of what is on disk and writes no ledger. (It does
+    # log what it decided, marked `dry_run`.)
     if ctl.policy.dry_run
+        states = try
+            job_states(ctl.scheduler)
+        catch e
+            e isa InterruptException && rethrow()
+            return _refuse_all(ctl, "the scheduler could not be asked: $(_short_err(e))")
+        end
         seen = try
             Ledger(ctl.ledger.path, deepcopy(_read_ledger(ctl.ledger.path)))
         catch e
@@ -1133,16 +1214,30 @@ function manage!(ctl::JobController, work)::Vector{Decision}
         _observe_and_say!(ctl, seen, states; dry=true)
         empty!(ctl.ledger.jobs)
         merge!(ctl.ledger.jobs, seen.jobs)             # what the caller prints is what was seen
+        # The same guard as a real round: a look must not print `submit` where `--submit`
+        # would refuse.
+        why = _untrusted(seen, states)
+        why === nothing || return _refuse_all(ctl, why)
         decisions = decide(ctl.policy, work, states, seen)
         foreach(d -> _say_decision(ctl, d), decisions)
         return decisions
     end
     # Under the ledger's lock, on what is on disk now: a job's last act and a login-node loop
-    # are two controllers on one ledger. A ledger that cannot be locked or read is a refusal;
-    # an error inside the round is the round's own and is raised.
+    # are two controllers on one ledger. The scheduler is asked INSIDE the lock: asked before
+    # it, a job the other controller submitted while this one waited was in the ledger and not
+    # in the answer, and `max_jobs` could be passed. A ledger that cannot be locked or read is a
+    # refusal; an error inside the round is the round's own and is raised.
     entered = Ref(false)
     return try
         with_ledger(ctl.ledger) do
+            states = try
+                job_states(ctl.scheduler)
+            catch e
+                e isa InterruptException && rethrow()
+                return _refuse_all(
+                    ctl, "the scheduler could not be asked: $(_short_err(e))"
+                )
+            end
             entered[] = true
             return _manage_locked!(ctl, work, states)
         end
@@ -1150,6 +1245,49 @@ function manage!(ctl::JobController, work)::Vector{Decision}
         (e isa InterruptException || entered[]) && rethrow()
         _refuse_all(ctl, "the ledger could not be used: $(_short_err(e))")
     end
+end
+
+"""
+    forget_job!(controller, id) -> Bool
+
+Mark the ledger's job `id` as ended, by hand: for a job this controller cannot see the end of (a
+pending job that was cancelled, on a cluster without accounting). It is billed for what the
+ledger last knew it ran. Logged as `job_ended` with `evidence = "forgotten by hand"`. Returns
+whether there was such a live job.
+"""
+function forget_job!(ctl::JobController, id::AbstractString)
+    return with_ledger(ctl.ledger) do
+        j = get(ctl.ledger.jobs, String(id), nothing)
+        (j === nothing || j["ended"] === true) && return false
+        was = String(j["state"])
+        j["ended"] = true
+        j["state"] = "ended"
+        save_ledger(ctl.ledger)
+        log_event(
+            ctl.log,
+            :job_ended;
+            level=:warn,
+            id=String(id),
+            evidence="forgotten by hand",
+            was=was,
+            polls_missed=Int(get(j, "missing", 0)),
+            seconds_billed=Float64(j["elapsed"]),
+            dry_run=false,
+        )
+        return true
+    end
+end
+
+# Why an answer is not one to submit on, or `nothing`: it lists none of the jobs the ledger has
+# live. They are there for all this controller knows; they end on evidence (see `observe!`),
+# not on how often the same answer is repeated.
+function _untrusted(l::Ledger, states)
+    _ledger_live(l) || return nothing
+    any(j -> haskey(l.jobs, j.id) && l.jobs[j.id]["ended"] !== true, states) &&
+        return nothing
+    n = count(j -> j["ended"] !== true, values(l.jobs))
+    return "the scheduler lists none of the $n job(s) the ledger has live; not trusted, " *
+           "nothing submitted this round"
 end
 
 function _say_decision(ctl::JobController, d::Decision)
@@ -1175,6 +1313,15 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
             job_gone(ctl.scheduler, id)
         catch e
             e isa InterruptException && rethrow()
+            # The accounting could not be asked: no evidence either way, and said.
+            log_event(
+                ctl.log,
+                :job_gone_failed;
+                level=:warn,
+                id=id,
+                err=_short_err(e),
+                dry_run=dry,
+            )
             nothing
         end,
     )
@@ -1203,19 +1350,10 @@ function _manage_locked!(ctl::JobController, work, states)::Vector{Decision}
     end
     _observe_and_say!(ctl, l, states; dry=false)
     save_ledger(l)
-    # An answer that lists none of the ledger's live jobs is not one to submit on: the jobs
-    # are there for all this controller knows. They end on evidence (see `observe!`), not on
-    # how often the same answer is repeated.
-    if _ledger_live(l) &&
-        !any(j -> haskey(l.jobs, j.id) && l.jobs[j.id]["ended"] !== true, states)
-        return _refuse_all(
-            ctl,
-            "the scheduler lists none of the $(count(j -> j["ended"] !== true, values(l.jobs))) " *
-            "job(s) the ledger has live; not trusted, nothing submitted this round",
-        )
-    end
+    why = _untrusted(l, states)
+    why === nothing || return _refuse_all(ctl, why)
     decisions = decide(ctl.policy, work, states, l)
-    for d in decisions
+    for (n, d) in enumerate(decisions)
         _say_decision(ctl, d)
         d.action === :submit || continue
         # On record BEFORE the scheduler is called: a job that is queued and not in the ledger
@@ -1235,6 +1373,15 @@ function _manage_locked!(ctl::JobController, work, states)::Vector{Decision}
                 partition=d.partition,
                 err=_short_err(e),
                 ledger_row=tmp,
+            )
+            # What the caller is told is what happened: not a submission.
+            decisions[n] = Decision(
+                :refuse,
+                d.partition,
+                "the submission failed: $(_short_err(e)) (its row stays committed until " *
+                "the job is found or has gone unlisted)",
+                d.spec,
+                d.node_hours,
             )
             continue
         end
@@ -1361,4 +1508,4 @@ print_decisions(ds, l, policy) = print_decisions(stdout, ds, l, policy)
 # (`SweepRunner.decide`): names that short are not this package's to claim in a caller's namespace.
 export Scheduler, JobSpec, JobState, SlurmScheduler, MockScheduler
 export PartitionPolicy, JobPolicy, load_job_policy
-export campaign_work, JobController, controller_loop!
+export campaign_work, JobController, controller_loop!, forget_job!
