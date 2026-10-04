@@ -777,7 +777,8 @@ function _pool_death!(pool::SizedPool, row::TaskRow, pid::Int, log::EventLog, st
     return nothing
 end
 
-# Give a worker's room back and forget it. The only place room comes back for a worker.
+# Give a worker's room back and forget it. Room comes back in two places: here, for a worker
+# that was registered, and in `_pool_start!`, for the part of a batch that did not come.
 function _pool_free!(pool::SizedPool, pid::Int)
     w = pop!(pool.workers, pid, nothing)
     w === nothing && return nothing

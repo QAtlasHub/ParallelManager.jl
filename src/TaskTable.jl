@@ -331,6 +331,11 @@ Put row `i` back on the queue: behind the rest of its group, or ahead of everyth
 function requeue!(t::TaskTable, i::Int; front::Bool=false)
     lock(t.lock) do
         r = t.rows[i]
+        # A key that is done does not go back on the queue: it would be handed out, found
+        # done at the lock, and counted twice on the way.
+        (r.outcome === :ok || r.outcome === :already_done) && throw(
+            ArgumentError("TaskTable: row $i ($(r.kstr)) is done; it cannot be requeued"),
+        )
         r.state = :todo
         r.outcome = nothing
         r.owner = nothing
