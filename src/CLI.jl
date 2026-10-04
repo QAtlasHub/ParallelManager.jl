@@ -53,11 +53,13 @@ usage: sweeprunner <command> <outdir> [options]
   drain <outdir> --node HOST
   enqueue <outdir> --config FILE
       Requests to the masters running under <outdir>; see `SweepRunner.control!`. Limit them with
-      --project NAME, --run NAME, --master ID. Prints the request ids. --wait SECONDS waits for a
-      master to acknowledge and prints what it did.
-      Exit codes: 0 sent (and, with --wait, applied); 1 no sweep state there; 3 no master is
-      running, so nothing will apply it; 4 nobody acknowledged in time; 5 a master could not
-      apply it.
+      --project NAME, --run NAME, --master ID. Prints the request ids. --wait SECONDS waits for
+      every master the request is for to acknowledge, and prints what each did.
+      Exit codes: 0 sent (and, with --wait, applied by each); 1 no sweep state there; 2 usage;
+      3 no master it is for is seen running, so nothing will apply it; 4 a master did not
+      acknowledge in time (it is named); 5 a master could not apply it. `jobs` exits 6 when
+      its round was refused (scheduler, ledger or budget) and nothing was submitted, and
+      `locks --reap` exits 1 when a dead lock could not be removed.
 """
 
 """
@@ -242,12 +244,12 @@ function _cli_jobs(io::IO, rest)
         if every === nothing
             ds = manage!(ctl, work)
             print_decisions(io, ds, ctl.ledger, policy)
-            # A round in which nothing could be decided, or a submission was refused, is not
-            # a success for whoever calls this from a script.
-            any(d -> d.action === :refuse, ds) && return 6
+            return _jobs_exit(ds)
         else
-            controller_loop!(ctl, work; interval=every, io=io)
+            last = Ref(Decision[])
+            controller_loop!(ctl, work; interval=every, io=io, last=last)
             print_decisions(io, Decision[], ctl.ledger, policy)
+            return _jobs_exit(last[])
         end
     catch e
         # Only the one error this message is about: any other `ArgumentError` used to be
@@ -266,6 +268,14 @@ function _cli_jobs(io::IO, rest)
     return 0
 end
 
+# What `jobs` exits with for a round's decisions: 6 when the round did nothing because it was
+# refused (the scheduler not asked or not trusted, the ledger not usable, the budget) — not
+# when one partition was refused and another was served.
+function _jobs_exit(ds)
+    any(d -> d.action === :submit, ds) && return 0
+    return any(d -> d.action === :refuse, ds) ? 6 : 0
+end
+
 # Options that take a value, and the ones that do not.
 const _CLI_VALUED = (
     "--select",
@@ -279,7 +289,7 @@ const _CLI_VALUED = (
     "--master",
     "--wait",
 )
-const _CLI_SWITCHES = ("--running", "--interrupt")
+const _CLI_SWITCHES = ("--running",)
 
 # `32` -> 32, `0.5` -> 0.5, `true` -> true, anything else stays a string.
 function _cli_value(s::AbstractString)
@@ -308,14 +318,21 @@ function _cli_control(io::IO, op::Symbol, rest)
                 length(nv) == 2 || return _cli_usage(io, "--select takes name=v1,v2")
                 select[String(nv[1])] = Any[_cli_value(x) for x in split(nv[2], ',')]
             elseif a == "--samples"
-                kw[:samples] = [parse(Int, x) for x in split(v, ',')]
+                # A value that is not a number is a usage error, not a stack trace.
+                ss = [tryparse(Int, x) for x in split(v, ',')]
+                any(isnothing, ss) && return _cli_usage(io, "--samples takes integers: 1,2")
+                kw[:samples] = Int[x for x in ss]
             elseif a == "--grace"
-                kw[:grace] = parse(Float64, v)
+                g = tryparse(Float64, v)
+                g === nothing && return _cli_usage(io, "--grace takes seconds")
+                kw[:grace] = g
             elseif a == "--wait"
                 wait_s = tryparse(Float64, v)
                 wait_s === nothing && return _cli_usage(io, "--wait takes seconds")
             elseif a == "--n"
-                kw[:n] = parse(Int, v)
+                n = tryparse(Int, v)
+                n === nothing && return _cli_usage(io, "--n takes an integer")
+                kw[:n] = n
             else
                 kw[Symbol(a[3:end])] = String(v)
             end
@@ -344,7 +361,12 @@ function _cli_control(io::IO, op::Symbol, rest)
     # A master applies only requests made after it started. With none running, this one is
     # applied by nobody — not by the next job either — and that is not success.
     listening = masters_listening(
-        outdir; project=get(kw, :project, nothing), run=get(kw, :run, nothing)
+        outdir;
+        project=get(kw, :project, nothing),
+        run=get(kw, :run, nothing),
+        # A request addressed to one master is applied, and acknowledged, by that one only:
+        # the others listening are not "missing".
+        master=get(kw, :master, nothing),
     )
     if isempty(listening)
         println(

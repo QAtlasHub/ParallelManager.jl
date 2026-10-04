@@ -1020,6 +1020,8 @@ end
                 )
                 @test (r.done, r.err) == (0, 1)                 # the attempt failed...
                 @test !any(f -> occursin(".unreadable.", f), readdir(cpdir))
+            else
+                @test_skip "a checkpoint that cannot be opened (running as root)"
             end
         finally
             chmod(cpfile, 0o644)
@@ -1149,6 +1151,9 @@ end
                 @test occursin("reaped 0 of 1 dead lock(s)", out)
                 @test occursin("1 could not be removed", out)
                 @test occursin(".running", out)                 # which one
+            else
+                # As root nothing is unwritable: said, so a run that tested nothing shows.
+                @test_skip "locks --reap with a lock that cannot be moved (running as root)"
             end
         finally
             chmod(dir, 0o755)
@@ -1179,4 +1184,76 @@ end
     end
     @test err isa ErrorException
     @test occursin("exited with code 1", err.msg) && occursin("slurm_load_jobs", err.msg)
+end
+
+# ── third review (#157) ──────────────────────────────────────────────────────────────────────────
+
+@testset "cli: a request for one master waits for that one, and a value that is not a number is a usage error (#157)" begin
+    _ct_vault() do v, outdir
+        run!(_ct_ok, v, DataVault.keys(v))
+        real = only(read_status(v))
+        for (id, job) in (("hostA_1", "111"), ("hostB_2", "222"))
+            dir = joinpath(state_root(v), "masters", id)
+            mkpath(dir)
+            st = Dict{String,Any}(
+                k => val for (k, val) in real if !(k in ("stale", "path"))
+            )
+            st["master"] = id
+            st["job"] = job
+            st["state"] = "running"
+            st["updated"] = time() + 3600
+            write(joinpath(dir, "status.json"), JSON3.write(st))
+        end
+        @test SweepRunner.masters_listening(outdir; master="hostA_1") == ["hostA_1"]
+        @test SweepRunner.masters_listening(outdir; master="222") == ["hostB_2"]   # by job id
+        @test isempty(SweepRunner.masters_listening(outdir; master="nobody"))
+        # Addressed to hostA: it answers, and hostB — which the request is not for — is not
+        # reported missing.
+        io = IOBuffer()
+        t = @async SweepRunner.cli(
+            ["pause", outdir, "--master", "hostA_1", "--wait", "5"]; io=io
+        )
+        reqs = joinpath(state_root(v), "control", "requests")
+        @test timedwait(() -> isdir(reqs) && !isempty(readdir(reqs)), 20.0) === :ok
+        for f in readdir(reqs)
+            id = replace(f, ".json" => "")
+            dir = joinpath(state_root(v), "control", "acks", id)
+            mkpath(dir)
+            ack = Dict(
+                "master" => "hostA_1", "id" => id, "op" => "pause", "detail" => Dict()
+            )
+            write(joinpath(dir, "hostA_1.json"), JSON3.write(ack))
+        end
+        @test fetch(t) == 0
+        out = String(take!(io))
+        @test occursin("hostA_1: applied", out) && !occursin("no acknowledgement", out)
+        # Nobody it is for is listening: exit 3, although another master is.
+        @test SweepRunner.cli(["pause", outdir, "--master", "nobody"]; io=IOBuffer()) == 3
+        # Not numbers: the usage text and exit 2, not a stack trace.
+        for bad in (
+            ["resize", outdir, "--n", "many"],
+            ["stop", outdir, "--grace", "soon"],
+            ["cancel", outdir, "--select", "N=4", "--samples", "one"],
+        )
+            @test SweepRunner.cli(bad; io=IOBuffer()) == 2
+        end
+        @test SweepRunner.cli(["stop", outdir, "--interrupt"]; io=IOBuffer()) == 2   # no such option
+    end
+end
+
+@testset "wait_acks waits for every master that is listening (#157)" begin
+    _ct_vault() do v, _
+        id = "r1"
+        dir = joinpath(state_root(v), "control", "acks", id)
+        mkpath(dir)
+        write(joinpath(dir, "a.json"), JSON3.write(Dict("master" => "a", "id" => id)))
+        t0 = time()
+        acks = wait_acks(v, id; timeout=1.0, poll=0.1, masters=["a", "b"])
+        @test time() - t0 >= 1.0                                # b never answered: not at once
+        @test [x["master"] for x in acks] == ["a"]
+        write(joinpath(dir, "b.json"), JSON3.write(Dict("master" => "b", "id" => id)))
+        t0 = time()
+        acks = wait_acks(v, id; timeout=5.0, poll=0.1, masters=["a", "b"])
+        @test time() - t0 < 2.0 && length(acks) == 2
+    end
 end
