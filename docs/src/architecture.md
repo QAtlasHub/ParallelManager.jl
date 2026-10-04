@@ -154,8 +154,9 @@ master B:                                      acquire(K2)  work(K2)  release(K2
 
 Both masters iterate the same `todo`. The `.running` (POSIX `link()`) lock ensures only
 one enters `work_fn` for any given key at any time. A master that tries
-to lock a key another master already owns simply logs `:lock_busy` and
-moves on — no blocking, no waiting, no central queue.
+to lock a key another master already owns counts it as busy and moves on — no
+blocking, no waiting, no central queue. (The per-key `:lock_busy` event is
+written at `log_level = :debug` only; the totals are in `stage_done`.)
 
 Two things keep this robust against crashes:
 

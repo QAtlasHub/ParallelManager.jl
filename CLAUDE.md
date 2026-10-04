@@ -91,6 +91,10 @@ for how the three layers fit together.
   only read between keys.
 - **No per-item `println`** — structured events go through `EventLog` (JSONL)
   only. This is deliberate (the old loop generated 300 MB of per-item logs).
+  The one exception is bounded per KIND, not per item: warn-level events are
+  echoed on the master's stderr (the first of a kind, then at most one a minute;
+  errors always), because a warning nobody opens a file for is not a warning.
+  `Run.jl` itself still prints nothing (a test holds it to that).
 
 ## Where to look for usage
 
@@ -106,7 +110,8 @@ for how the three layers fit together.
 of a round's units and its queue) · `Progress` (`report_progress` / `resume_point`) · `Status`
 (the status file and its readers) · `Pool` (sized workers) · `Checkpoint` · `Account` · `Cost` · `Locks` (ask the holder's master) · `Control` (requests to a
 running master) · `Campaign` (the meta config) · `Jobs` (scheduler interface, policy, ledger) ·
-`CLI`. Each is usable
+`CLI` · `Master` (a master's identity and state) · `Liveness` (is a holder still there) ·
+`Observe` (source observations) · `Artifacts` · `Prerequisite` · `Preflight`. Each is usable
 independently. As of v0.3 the per-key advisory lock lives entirely in
 **DataVault's `.running` markers** (`acquire_running!`); `run!` calls into it
 rather than maintaining its own `locks/` tree.

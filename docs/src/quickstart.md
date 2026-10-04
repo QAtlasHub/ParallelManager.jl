@@ -64,7 +64,7 @@ result = SweepRunner.run!(work_fn, vault, keys)
 ```
 
 First run processes all 6 keys and writes a JSONL event log. The second
-run does nothing — it emits `:skip_complete` and exits in milliseconds:
+run does nothing — it emits `:skip_complete` and returns without touching the keys:
 
 ```
 ┌ Info: stage complete
@@ -98,7 +98,7 @@ path builders that leak phase1's storage layout into phase2's code.
 
 ## Parallel execution
 
-Want multi-threading inside one master?
+Want threads for the library calls inside a key (keys still run one at a time)?
 
 ```bash
 julia --project --threads=8 run.jl

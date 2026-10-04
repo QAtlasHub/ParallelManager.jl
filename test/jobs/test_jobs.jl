@@ -2,6 +2,7 @@
 
 using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed
 using SweepRunner: Ledger, node_hours, decide, manage!, print_decisions
+using SweepRunner: Decision
 using SweepRunner: submit, cancel, job_states, remaining_time, shrink
 
 const _JB_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")
@@ -1046,4 +1047,45 @@ end
     bad = copy(fields)
     bad[3] = NaN                                                 # stale_after
     @test_throws ArgumentError RunOpts(bad...)
+end
+
+# ── third review (#157) ──────────────────────────────────────────────────────────────────────────
+
+@testset "jobs: what a script learns from the exit code and the loop's output (#157)" begin
+    sub = Decision(:submit, "a", "r", nothing, 1.0)
+    ref = Decision(:refuse, "b", "budget: …", nothing, 1.0)
+    hold = Decision(:hold, "c", "nothing runnable", nothing, 0.0)
+    @test SweepRunner._jobs_exit([ref]) == 6
+    @test SweepRunner._jobs_exit([ref, hold]) == 6
+    @test SweepRunner._jobs_exit([sub, ref]) == 0               # one refused, one served
+    @test SweepRunner._jobs_exit([hold]) == 0
+    @test SweepRunner._jobs_exit(Decision[]) == 0
+
+    # With the budget spent and nothing live, the loop ends instead of polling for ever, and
+    # says each round as it happens.
+    outdir = mktempdir()
+    sched = MockScheduler()
+    ctl = JobController(sched, _jb_policy(; dry_run=false, budget_node_hours=0.5), outdir)
+    io = IOBuffer()
+    last = Ref(Decision[])
+    rounds = controller_loop!(
+        ctl, _jb_work(100, 60000); interval=0.01, max_rounds=50, io=io, last=last
+    )
+    @test rounds == 1
+    @test only(last[]).action === :refuse
+    out = String(take!(io))
+    @test occursin("round 1:", out) && occursin("refuse", out) && occursin("budget", out)
+
+    # A wrong configuration is raised, not retried every round.
+    @test_throws ArgumentError controller_loop!(
+        ctl,
+        p -> throw(ArgumentError("profile x sets max_key_time, which needs `cost`"));
+        interval=0.01,
+        max_rounds=50,
+    )
+    # An unreadable remaining time is `nothing`, not zero.
+    s = SlurmScheduler(; user="me", run=cmd -> "NOT_SET\n")
+    @test remaining_time(s, "1") === nothing
+    s = SlurmScheduler(; user="me", run=cmd -> "1:00:00\n")
+    @test remaining_time(s, "1") == 3600.0
 end

@@ -1304,10 +1304,11 @@ function pool_summary(pool::SizedPool)
 end
 
 """
-    shutdown!(pool)
+    shutdown!(pool; wait=60.0)
 
-Remove every worker the pool started and give their room back. `run!` / `run_loop!` call it when
-they return, unless the pool was made with `keep=true`.
+Remove every worker the pool started and give their room back. Starts still in flight are waited
+for, up to `wait` seconds, and remove their own workers when they land. `run!` / `run_loop!` call
+it when they return, unless the pool was made with `keep=true`.
 """
 function shutdown!(pool::SizedPool; wait::Real=60.0)
     # Starts still in flight land in a pool nobody ticks any more: each removes its own workers

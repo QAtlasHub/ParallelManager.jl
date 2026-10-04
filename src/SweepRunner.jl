@@ -31,6 +31,13 @@ independently.
 | `Cost.jl`       | [`key_costs`](@ref), [`cost_summary`](@ref), [`measured_cost`](@ref), [`note_key!`](@ref) |
 | `Campaign.jl`   | [`load_campaign`](@ref), [`plan_campaign`](@ref), [`run_campaign!`](@ref) |
 | `Jobs.jl`       | [`Scheduler`](@ref), [`JobPolicy`](@ref), [`decide`](@ref), [`manage!`](@ref) |
+| `Master.jl`     | [`state_root`](@ref): where a sweep keeps its state; a master's identity |
+| `Liveness.jl`   | [`owner_token`](@ref), [`holder_liveness`](@ref) |
+| `Observe.jl`    | the source observation each `.done` carries |
+| `Artifacts.jl`  | [`artifact_affinity`](@ref) |
+| `Prerequisite.jl` | [`Prerequisite`](@ref), [`run_prerequisite!`](@ref) |
+| `Preflight.jl`  | [`check_injective!`](@ref), [`check_opens!`](@ref), [`launchable`](@ref) |
+| `CLI.jl`        | [`cli`](@ref): the `sweeprunner` command line |
 
 # Quick start
 

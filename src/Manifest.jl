@@ -2,7 +2,7 @@
 #
 # A Manifest turns the "is this 3600-key run already done?" question from an
 # O(N) filesystem scan into an O(1) JLD2 read. FiniteTemperature.jl used to
-# stat 3600 `.done` files on every job startup (~10 minutes wall clock); a
+# stat 3600 `.done` files on every job startup (minutes, by its users' account); a
 # Manifest closes that loop: the test suite bounds the read plus `todo_keys` at 500 ms for
 # 3600 keys.
 
