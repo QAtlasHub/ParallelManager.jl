@@ -186,6 +186,13 @@ end
                     end
                     return Dict{String,Any}("x" => 1)
                 end
+            # Once through the pipeline on other keys first: a worker's first key spends
+            # seconds compiling before its first report — on a loaded runner more than the
+            # threshold — and that is no progress either, but not what this is about.
+            warm =
+                k ->
+                    (SweepRunner.report_progress(1); sleep(0.5); Dict{String,Any}("x" => 1))
+            run!(warm, v, DataVault.keys(v)[3:4])
             opts = RunOpts(; status_interval=0.2, stuck_after=5.0)
             t = @async run!(work, v, ks; opts=opts)
             flagged = nothing
@@ -254,4 +261,101 @@ end
     @test SweepRunner.cli(["status"]; io=io) == 2
     @test occursin("usage: sweeprunner", String(take!(io)))
     @test SweepRunner.cli(["--help"]; io=IOBuffer()) == 0
+end
+
+# ── the alarm for a job that uses a fraction of its cores (#134) ─────────────────────────────────
+
+@testset "warn-level events are also said where a person sees them, a bounded number of times (#134)" begin
+    dir = mktempdir()
+    log = SweepRunner.EventLog(joinpath(dir, "events_x.jsonl"))
+    io = IOBuffer()
+    SweepRunner.echo_warnings!(io)
+    try
+        before = SweepRunner.warning_counts()
+        for i in 1:250
+            SweepRunner.log_event(log, :test_warning_134; level=:warn, n=i, why="because")
+        end
+        SweepRunner.log_event(log, :test_info_134; n=1)                  # not a warning
+        out = String(take!(io))
+        lines = filter(l -> occursin("test_warning_134", l), split(out, '\n'))
+        # The first, the hundredth and the two-hundredth: three lines for 250 events.
+        @test length(lines) == 3
+        @test occursin("why=because", lines[1]) && !occursin("×", lines[1])
+        @test occursin("(×100 so far)", lines[2]) && occursin("(×200 so far)", lines[3])
+        @test !occursin("test_info_134", out)
+        @test SweepRunner._warnings_since(before)["test_warning_134"] == 250
+        # All 250 are in the file: the echo is not the log.
+        @test count(l -> occursin("test_warning_134", l), readlines(log.path)) == 250
+        SweepRunner.echo_warnings!(nothing)
+        SweepRunner.log_event(log, :test_quiet_134; level=:warn)
+        @test isempty(String(take!(io)))
+    finally
+        SweepRunner.echo_warnings!(:stderr)
+    end
+end
+
+@testset "status: cores idle with keys queued is said — in the log, on stderr, at the top of the status (#134)" begin
+    @test_throws ArgumentError RunOpts(; min_utilisation=1.5)
+    io = IOBuffer()
+    SweepRunner.echo_warnings!(io)
+    SweepRunner._LOW_UTIL_AFTER[] = 0.5
+    try
+        _st_workers(2) do
+            _st_vault() do v, outdir
+                ks = DataVault.keys(v)                           # four keys for two workers
+                gate = joinpath(outdir, "gate")
+                work = k -> begin
+                    t0 = time()
+                    while !isfile(gate) && time() - t0 < 300
+                        sleep(0.05)
+                    end
+                    return Dict{String,Any}("x" => 1)
+                end
+                # An allocation far larger than the two workers that came: the incident.
+                withenv("SLURM_JOB_CPUS_PER_NODE" => "100000(x2)") do
+                    t = @async run!(work, v, ks; opts=RunOpts(; status_interval=0.2))
+                    seen = nothing
+                    t0 = time()
+                    while !istaskdone(t) && time() - t0 < 120
+                        st = read_status(v)
+                        if !isempty(st) &&
+                            any(w -> startswith(w, "low_utilisation"), st[1]["warnings"])
+                            seen = st[1]
+                            break
+                        end
+                        sleep(0.1)
+                    end
+                    @test seen !== nothing
+                    if seen !== nothing
+                        @test seen["workers"]["cores_allocated"] == 200000
+                        text = sprint(io -> print_status(io, v))
+                        lines = split(text, '\n')
+                        # The warning is the first thing under the master's line.
+                        @test startswith(strip(lines[2]), "! low_utilisation")
+                    end
+                    touch(gate)
+                    r = fetch(t)
+                    @test r.done == length(ks)                   # said, nothing stopped
+                end
+                ev = [e for e in _st_events(outdir) if e.kind == "low_utilisation"]
+                @test length(ev) == 1                            # once, not every tick
+                @test ev[1].cores_allocated == 200000
+                @test ev[1].queued >= 1
+                @test occursin("allocated cores", ev[1].why)
+                @test occursin("sweeprunner warning: low_utilisation", String(take!(io)))
+            end
+        end
+        # An allocation that cannot be read is "not known", not 100% in use.
+        _st_vault() do v, _
+            withenv("SLURM_JOB_CPUS_PER_NODE" => "many") do
+                run!(k -> Dict{String,Any}("x" => 1), v, DataVault.keys(v))
+                st = only(read_status(v))
+                @test st["workers"]["cores_allocated"] === nothing
+                @test occursin("allocation not known", sprint(io -> print_status(io, v)))
+            end
+        end
+    finally
+        SweepRunner._LOW_UTIL_AFTER[] = 600.0
+        SweepRunner.echo_warnings!(:stderr)
+    end
 end

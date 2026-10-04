@@ -208,6 +208,32 @@ A master whose file has not been rewritten for three intervals, and which did
 not write `ended`, is shown as `GONE`: killed at the wall clock, or its node
 was lost.
 
+
+### What is wrong is said where you look
+
+A warning that exists only as a line in `events_<host>_<pid>.jsonl` is one
+somebody has to go and find. So:
+
+- **Warn-level events are also printed on the master's stderr** — the job's
+  output — rate-limited per kind: the first of a kind, then every hundredth,
+  with the count. `stage_done` carries the round's warnings by kind, and the
+  master prints one line when a stage ends (`stage … ended with warnings:
+  key_cut ×3, pool_at_limit ×1`). `SweepRunner.echo_warnings!(nothing)` or
+  `SWEEPRUNNER_QUIET_WARNINGS=1` turns the echo off; the event file always has
+  every event.
+- **`sweeprunner status` shows the open warnings first**, under each master's
+  line.
+- **Low utilisation is an alarm of its own.** When less than
+  `RunOpts(min_utilisation = 0.5)` of the *allocated* cores have a key, with
+  keys queued, for ten minutes, the master says `low_utilisation` with the
+  reason it can see: the workers cover only part of the allocation (planned /
+  launched / joined), or workers are idle with keys nobody fits. This is the
+  check `workers_short` is not — that one compares the workers that joined
+  with the ones that were planned, and a plan that is too small passes it.
+- An allocation that cannot be read (`SLURM_JOB_CPUS_PER_NODE` missing or not
+  in its usual form) is shown as **not known**, not as the cores that joined:
+  that made every such job look 100% used.
+
 ## 10. Whose locks are these?
 
 A `.running` file says a key is being computed. Whether that is still true

@@ -202,6 +202,10 @@ mutable struct Master
     advanced::Dict{String,Float64}
     # class => the key of unknown cost that was started for it in this job, to measure it.
     explored::Dict{String,String}
+    # `RunOpts.min_utilisation`; since when the job has been under it, and when that was said.
+    min_utilisation::Float64
+    low_since::Float64
+    low_said::Float64
 end
 
 function Master()
@@ -235,6 +239,9 @@ function Master()
         Set{String}(),
         Dict{String,Float64}(),
         Dict{String,String}(),
+        0.5,
+        0.0,
+        0.0,
     )
 end
 
