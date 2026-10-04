@@ -323,7 +323,10 @@ function _ready_workers!(ids::AbstractVector{<:Integer}, size::KeyReq; ready=_re
     good = Int[]
     @sync for w in ids
         @async begin
-            t = @async ready(w, size)
+            # A plain task, not `@async`: inside `@sync` that would hand its failure to the
+            # block, and one worker that cannot be readied would fail its whole batch.
+            t = Task(() -> ready(w, size))
+            schedule(t)
             ok = timedwait(() -> istaskdone(t), _READY_TIMEOUT[]; pollint=0.05) === :ok
             if ok && !istaskfailed(t)
                 push!(good, w)
@@ -1137,7 +1140,13 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
                 started=length(ids),
                 why=isempty(why) ? nothing : join(why, "; "),
             )
-            _pool_node_failed!(pool, node, log, stage)
+            # A node that brought up SOME of what was asked can start workers: it is the start
+            # that brought none that counts against the node.
+            if isempty(ids)
+                _pool_node_failed!(pool, node, log, stage)
+            else
+                pool.node_fails[node] = 0
+            end
         elseif short == 0
             pool.fails = 0
             pool.node_fails[node] = 0

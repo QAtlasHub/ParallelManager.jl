@@ -1774,11 +1774,18 @@ function _drive_workers!(
             level=:error,
             stage=stage,
             fails=pool.fails,
+            nodes_out=sort!(collect(pool.bad_nodes)),
             queued=count(r -> r.state === :todo, table.rows),
         )
+        out = if isempty(pool.bad_nodes)
+            ""
+        else
+            " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
+        end
         error(
-            "SizedPool: $(pool.fails) worker starts failed in a row with keys still queued. " *
-            "The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
+            "SizedPool: $(pool.fails) worker starts failed in a row with keys still queued." *
+            out *
+            " The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
             "\"pool_spawn_short\").",
         )
     end

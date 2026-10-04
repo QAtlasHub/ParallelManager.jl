@@ -402,7 +402,7 @@ end
     end
 end
 
-@testset "starts that fail are logged, and ten in a row is an error, not a quiet end (#101)" begin
+@testset "starts that fail are logged, and a pool with no node left is an error, not a quiet end (#101)" begin
     _pl_custom((node, size, n, flags) -> error("no such partition")) do pool
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
@@ -416,7 +416,11 @@ end
             @test occursin("worker starts failed in a row", err.msg)
             ev = _pl_events(outdir)
             failed = [e for e in ev if e.kind == "pool_spawn_failed"]
-            @test length(failed) >= 10
+            # Its one node is taken out after five failures in a row (#133), and a pool with
+            # no node left has given up: not ten more tries at the same node.
+            @test length(failed) == SweepRunner._NODE_MAX_FAILS
+            @test occursin("1 of 1 node(s) taken out", err.msg)
+            @test only([e for e in ev if e.kind == "pool_node_out"]).nodes_left == 0
             @test occursin("no such partition", failed[1].err)
             @test count(e -> e.kind == "pool_gave_up", ev) == 1
             # Nothing is left starting, and the room is all back.
