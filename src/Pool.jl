@@ -983,7 +983,11 @@ function _pool_tick!(
     )
     blocked = Set(rows[i].kstr for i in plan.blocked)
     filter!(kv -> kv[1] in blocked, pool.waiting)
-    if plan.capped && !pool.said_limit
+    # Said when the cap first applies and again whenever it applies at another value (after a
+    # `resize`, in a later stage): once for the life of the pool, a later cap went unsaid.
+    plan.capped || delete!(_SAID_CAP, pool)
+    if plan.capped && get(_SAID_CAP, pool, -1) != cap
+        _SAID_CAP[pool] = cap
         pool.said_limit = true
         log_event(
             log,
@@ -1200,6 +1204,9 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
     )
     return nothing
 end
+
+# pool => the cap `pool_at_limit` was last said for.
+const _SAID_CAP = IdDict{Any,Int}()
 
 # How many starts in a row may fail on one node before it is taken out, over at least how
 # long, and after how long a node that was taken out is tried again.

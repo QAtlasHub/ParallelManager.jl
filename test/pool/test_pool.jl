@@ -670,13 +670,16 @@ end
         # Two cores for four keys: two stay queued, so every tick has a key to ask about.
         _pl_pool(; key_req=req, cores=2) do pool
             ks = DataVault.keys(v)
-            # Longer than the thirty failures the step is allowed take at this pool's 0.2 s.
+            # Longer than the step is allowed to go on failing (four seconds, for the test).
             work = k -> (touch(armed); sleep(20.0); Dict{String,Any}("x" => 1))
+            SweepRunner._TICK_FATAL_AFTER[] = 4.0
             err = try
                 run!(work, v, ks; pool=pool)
                 nothing
             catch e
                 e
+            finally
+                SweepRunner._TICK_FATAL_AFTER[] = 300.0
             end
             ev = _pl_events(outdir)
             failed = [e for e in ev if e.kind == "tick_failed"]
@@ -688,7 +691,7 @@ end
             @test occursin("no size for this key", failed[1].err)
             # It lasted: the round ended with an error that names the step...
             @test err isa ErrorException
-            @test occursin("`pool` step failed", err.msg)
+            @test occursin("`pool` step has failed for", err.msg)
             # ...after the units that were running had finished, not by dropping them.
             started = [e.key for e in ev if e.kind == "key_acquired"]
             @test !isempty(started)

@@ -167,6 +167,76 @@ struct RunOpts
     manifest_interval::Float64
     stuck_after::Float64
     min_utilisation::Float64
+    # The checks that keep a run from spinning or deciding on NaN are here too, in the only way
+    # to make one: built positionally, the options used to skip them. (The keyword constructor
+    # below says the same things first, in more words.)
+    function RunOpts(
+        workers,
+        max_attempts,
+        stale_after,
+        heartbeat_interval,
+        stop_flag,
+        log_level,
+        deadline,
+        defer_poll,
+        status_interval,
+        control_interval,
+        min_busy_fraction,
+        idle_grace,
+        checkpoint_every,
+        stop_grace,
+        shard,
+        order,
+        manifest_interval,
+        stuck_after,
+        min_utilisation,
+    )
+        bad(msg) = throw(ArgumentError("RunOpts: $msg"))
+        workers in (:auto, :sequential) || bad("workers must be :auto or :sequential")
+        order in (:given, :longest_first) || bad("order must be :given or :longest_first")
+        max_attempts >= 1 || bad("max_attempts must be >= 1, got $max_attempts")
+        (stale_after > 0 && heartbeat_interval > 0 && defer_poll > 0) ||
+            bad("stale_after, heartbeat_interval and defer_poll must be > 0")
+        heartbeat_interval < stale_after || bad("heartbeat_interval must be < stale_after")
+        all(
+            x -> x >= 0,
+            (
+                status_interval,
+                control_interval,
+                idle_grace,
+                checkpoint_every,
+                stop_grace,
+                manifest_interval,
+                stuck_after,
+            ),
+        ) || bad("intervals and graces must be >= 0 and not NaN")
+        (0 <= min_busy_fraction <= 1 && 0 <= min_utilisation <= 1) ||
+            bad("min_busy_fraction and min_utilisation must be in [0, 1]")
+        (deadline === nothing || !isnan(deadline)) || bad("deadline is NaN")
+        (shard === nothing || (shard[2] >= 1 && 0 <= shard[1] < shard[2])) ||
+            bad("shard must be (i, m) with 0 <= i < m")
+        return new(
+            workers,
+            max_attempts,
+            stale_after,
+            heartbeat_interval,
+            stop_flag,
+            log_level,
+            deadline,
+            defer_poll,
+            status_interval,
+            control_interval,
+            min_busy_fraction,
+            idle_grace,
+            checkpoint_every,
+            stop_grace,
+            shard,
+            order,
+            manifest_interval,
+            stuck_after,
+            min_utilisation,
+        )
+    end
 end
 
 # `time()` was past this in 2001: an absolute deadline below it was meant as a duration.
@@ -352,7 +422,9 @@ const _PREPARE_TRIES = 3
 # The ticker's steps: how often a failing one is said again, and how many failures in a row end
 # the round.
 const _TICK_SAY_EVERY = 100
-const _TICK_MAX_FAILS = 30
+# The steps whose lasting failure ends the round, and after how long.
+const _TICK_FATAL_STEPS = (:pool, :adopt, :stop_grace, :enforce_stops)
+const _TICK_FATAL_AFTER = Ref(300.0)
 
 # How many times a key whose worker DIED is handed to another one.
 const _WORKER_DEATH_REDISPATCHES = 2
@@ -570,6 +642,9 @@ function run!(
     master.interval = opts.status_interval
     master.stuck_after = opts.stuck_after
     master.min_utilisation = opts.min_utilisation
+    # What this master has to fill: its pool's nodes, or its node group; else not told.
+    master.own_cores =
+        pool === nothing ? _slurm_group_cores() : sum(n.cores for n in pool.nodes)
     warned0 = warning_counts()
     spawn === nothing || (master.ctl.spawn = spawn)
     after = own ? :ended : :waiting
@@ -785,6 +860,9 @@ function run!(
         # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
         # when IT returns).
         (own && pool !== nothing && !pool.keep) && shutdown!(pool)
+        # The round's warnings in one line, however it ended: an exception, a pool that gave
+        # up, a cut that failed are the rounds whose warnings matter most.
+        _say_warnings(stage, _warnings_since(warned0))
     end
 
     # Aggregate outcomes into counters + manifest updates.
@@ -866,7 +944,6 @@ function run!(
         # The warn-level events of this round on this process, by kind.
         warnings=_warnings_since(warned0),
     )
-    _say_warnings(stage, _warnings_since(warned0))
     # Said once, with the count: the keys this job did not start because they could not get
     # anywhere before its deadline.
     n_held_back > 0 && log_event(
@@ -1321,19 +1398,27 @@ end
 # has none: this is for a master leaving through an exception.
 function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog)
     cut = [(i, r) for (i, r) in enumerate(table.rows) if r.state === :running]
+    # The workers first, as in a cut — and all at once: a busy worker takes seconds to remove,
+    # and one after another a hundred of them outlast the scheduler's SIGTERM-to-SIGKILL window,
+    # leaving their locks to `stale_after`.
+    pids = unique(r.worker for (_, r) in cut if r.owner !== nothing && r.worker != 0)
+    filter!(p -> p != myid() && p in procs(), pids)
+    remove = something(_KILL_WORKER[], _kill_worker!)
+    @sync for pid in pids
+        @async try
+            remove(pid)
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
     for (i, r) in cut
         tok = r.owner
         tok === nothing && continue
-        # The worker first, as in a cut: a lock released under a worker that is still computing
-        # is a key that runs twice. One that will not go keeps its lock (its heartbeat keeps it
-        # fresh, and it ends with the worker).
+        # A lock released under a worker that is still computing is a key that runs twice.
+        # One that would not go keeps its lock (its heartbeat keeps it fresh, and it ends with
+        # the worker).
         pid = r.worker
-        if pid != 0 && pid != myid() && pid in procs()
-            try
-                something(_KILL_WORKER[], _kill_worker!)(pid)
-            catch e
-                e isa InterruptException && rethrow()
-            end
+        if pid != 0 && pid != myid()
             if pid in procs()
                 log_event(
                     log,
@@ -1566,8 +1651,9 @@ function _drive_workers!(
                         class=_class_of(key_class, row.key),
                     )
                     ord = get(c.stopping, row.kstr, nothing)
-                    if ord !== nothing && ord.cut
-                        # Removed on purpose: not a death of the key, and not its memory.
+                    if ord !== nothing && (ord.cut || ord.tries > 0)
+                        # Removed on purpose — also when the exit comes between two tries of
+                        # the cut: not a death of the key, and not its memory.
                         :stopped
                     else
                         lock(() -> row.deaths += 1, table.lock)
@@ -1707,28 +1793,45 @@ function _drive_workers!(
     done = Ref(false)
     idle_since = Ref(0.0)
     # One step of the ticker, by name. A failure is logged on its first occurrence and then
-    # every `_TICK_SAY_EVERY`-th, with the count; a step that fails `_TICK_MAX_FAILS` times in a
-    # row ends the round with an error: a master whose pool tick cannot run is not doing its job.
+    # every `_TICK_SAY_EVERY`-th, with the count. One of `_TICK_FATAL_STEPS` that has failed
+    # for `_TICK_FATAL_AFTER` seconds ends the round with an error: a master whose pool tick
+    # cannot run is not doing its job.
     fails = Dict{Symbol,Int}()
+    failing_since = Dict{Symbol,Float64}()
     function step(f, name::Symbol)
         try
             f()
             fails[name] = 0
+            delete!(failing_since, name)
         catch e
             e isa InterruptException && rethrow()
             n = fails[name] = get(fails, name, 0) + 1
-            (n == 1 || n % _TICK_SAY_EVERY == 0) && log_event(
-                log,
-                :tick_failed;
-                level=:warn,
-                stage=stage,
-                step=String(name),
-                count=n,
-                err=_short_err(e),
-            )
-            if n >= _TICK_MAX_FAILS && abort[] === nothing
+            since = get!(failing_since, name, time())
+            try
+                (n == 1 || n % _TICK_SAY_EVERY == 0) && log_event(
+                    log,
+                    :tick_failed;
+                    level=:warn,
+                    stage=stage,
+                    step=String(name),
+                    count=n,
+                    secs=round(Int, time() - since),
+                    err=_short_err(e),
+                )
+            catch e2
+                # The log is what failed. The ticker must outlive that: it is what cuts,
+                # flushes and plans.
+                e2 isa InterruptException && rethrow()
+            end
+            # By time, not by ticks (with a pool a tick is a second), and only for the steps a
+            # round cannot do without: a pool that cannot plan, stops that cannot be enforced.
+            # A flush or a request poll that cannot reach the file system is said and retried.
+            if name in _TICK_FATAL_STEPS &&
+                time() - since >= _TICK_FATAL_AFTER[] &&
+                abort[] === nothing
                 abort[] = ErrorException(
-                    "run!: the master's `$name` step failed $n times in a row " *
+                    "run!: the master's `$name` step has failed for " *
+                    "$(round(Int, time() - since)) s, $n times in a row " *
                     "(last: $(_short_err(e))); see kind=\"tick_failed\" in the event log",
                 )
             end
@@ -1753,7 +1856,8 @@ function _drive_workers!(
             )
         end
         if pool !== nothing
-            step(:pool) do
+            # Not for a round that is ending with an error: nothing more is started for it.
+            abort[] === nothing && step(:pool) do
                 _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
             end
             # Whatever the tick did, the wait loop decides on what is true now.
@@ -1778,9 +1882,12 @@ function _drive_workers!(
         step(:enforce_stops) do
             _enforce_stops!(master, table, log)
             # A unit that could not be cut: the round ends, saying which worker is still there.
+            # EVERY such unit's dispatch task stops being waited for; only the error is the
+            # first one's. With two workers that could not be removed, the second used to be
+            # waited for, and `run!` still did not return.
             for (kstr, o) in c.stopping
-                (o.failed && abort[] === nothing) || continue
-                abort[] = ErrorException("run!: " * o.why)
+                o.failed || continue
+                abort[] === nothing && (abort[] = ErrorException("run!: " * o.why))
                 i = get(table.index, kstr, 0)
                 t = i == 0 ? nothing : get(task_of, table.rows[i].worker, nothing)
                 t === nothing || push!(abandoned, t)
@@ -1854,14 +1961,14 @@ function _drive_workers!(
             nodes_out=sort!(collect(pool.bad_nodes)),
             queued=count(r -> r.state === :todo, table.rows),
         )
-        out = if isempty(pool.bad_nodes)
+        nodes_out = if isempty(pool.bad_nodes)
             ""
         else
             " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
         end
         error(
             "SizedPool: $(max(pool.fails, pool.rejects)) worker starts failed in a row with keys still queued." *
-            out *
+            nodes_out *
             " The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
             "\"pool_spawn_short\").",
         )

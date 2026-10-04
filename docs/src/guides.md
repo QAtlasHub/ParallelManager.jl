@@ -220,8 +220,9 @@ A warning that exists only as a line in `events_<host>_<pid>.jsonl` is one
 somebody has to go and find. So:
 
 - **Warn-level events are also printed on the master's stderr** — the job's
-  output — rate-limited per kind: the first of a kind, then every hundredth,
-  with the count. `stage_done` carries the round's warnings by kind, and the
+  output — rate-limited per kind: the first of a kind, then at most one a
+  minute, with the count; an *error* is always printed. Warnings logged on a
+  worker are in the event file only. `stage_done` carries the round's warnings by kind, and the
   master prints one line when a stage ends (`stage … ended with warnings:
   key_cut ×3, pool_at_limit ×1`). `SweepRunner.echo_warnings!(nothing)` or
   `SWEEPRUNNER_QUIET_WARNINGS=1` turns the echo off; the event file always has
@@ -232,7 +233,11 @@ somebody has to go and find. So:
   `RunOpts(min_utilisation = 0.5)` of the *allocated* cores have a key, with
   keys queued, for ten minutes, the master says `low_utilisation` with the
   reason it can see: the workers cover only part of the allocation (planned /
-  launched / joined), or workers are idle with keys nobody fits. This is the
+  launched / joined), or workers are idle with keys nobody fits. "Allocated"
+  is the master's own share: its pool's nodes, its node group
+  (`SWEEPRUNNER_NODELIST`), or the job's cores less what the other masters of
+  the job report as theirs — so four masters each filling a quarter are each
+  at 100%. This is the
   check `workers_short` is not — that one compares the workers that joined
   with the ones that were planned, and a plan that is too small passes it.
 - An allocation that cannot be read (`SLURM_JOB_CPUS_PER_NODE` missing or not
@@ -401,9 +406,11 @@ worker (`lock_kept`).
 
 The master's periodic work is a list of named steps (requests, the pool, the
 stops, the manifest). One that fails is logged as `tick_failed step=…` — once,
-then every hundredth time — and does not switch off the others; thirty failures
-in a row of one step end the round with an error, after the running units have
-finished.
+then every hundredth time — and does not switch off the others. A step the
+round cannot do without (the pool's planning, adopting workers, enforcing
+stops) that has failed for five minutes on end ends the round with an error,
+after the running units have finished; a flush or a request poll that cannot
+reach the file system is said and tried again, and never ends it.
 
 The job's own stop gets the same bound with `RunOpts(stop_grace = seconds)`:
 once `stop_flag` is raised or the `deadline` has passed, units still running
@@ -611,8 +618,11 @@ What keeps that check from passing on an under-count:
   (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
   live again.
 - An answer that lists none of the ledger's live jobs — empty, another
-  cluster, a filter — is not counted as an absence, however often it comes,
-  and nothing is submitted on it. (Three of those used to empty the ledger.)
+  cluster, a filter — submits nothing, however often it comes. It ends a job
+  only over wall time: three such answers spread over **half an hour** (three
+  in a row used to empty the ledger). That is what lets the end of the *last*
+  live job be seen at all on a cluster without accounting; for the job nobody
+  can see the end of there is `sweeprunner jobs <meta.toml> --forget <id>`.
 - `squeue` failing, or a line or an elapsed time that cannot be read, refuses
   the round. A time *limit* printed as a word (`NOT_SET`, `Partition_Limit`)
   is "no limit": it commits without bound if the job is ours.
@@ -620,9 +630,14 @@ What keeps that check from passing on an under-count:
   **adopted** at its limit (`job_adopted`). "Our jobs" are the ledger's ids
   plus the exact names `<name>-<partition>`; a policy named `ft` does not
   claim `ft2-…`.
-- The ledger is read again, under a lock, before every decision: a job's last
-  act and a login-node loop are two controllers on one file. A **dry run
-  writes nothing** — not the ledger either.
+- The ledger is read again, under a lock, before every decision, and the
+  scheduler is asked inside that lock: a job's last act and a login-node loop
+  are two controllers on one file. The lock has an owner: it is refreshed while
+  held, taken from a holder that died by one waiter only, released only by its
+  owner, and a controller that lost it does not write. A **dry run writes no
+  ledger** (it does log its decisions, marked `dry_run`), and refuses where a
+  real round would.
+- A submission that failed is reported as refused, not as made.
 - The numbers are checked where they enter: the policy (also when built
   positionally), each job the scheduler reports, each ledger row. A ledger
   with a NaN or a negative number in it refuses the round.

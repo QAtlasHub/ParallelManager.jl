@@ -217,7 +217,7 @@ function log_event(log::EventLog, kind::Symbol; level::Symbol=:info, kwargs...)
     # decision); it is NOT written into the JSON — the `kind` already implies it.
     _level_value(level) < log.min_level && return nothing
     rec = (; ts=string(now()), kind=String(kind), kwargs...)
-    _level_value(level) >= 30 && _note_warning(kind, rec)
+    _level_value(level) >= 30 && _note_warning(kind, rec, level)
     # Build the full line with newline so a single `write` is one atomic
     # append on POSIX (given `O_APPEND` and size < PIPE_BUF).
     line = string(JSON3.write(rec), '\n')
@@ -246,6 +246,9 @@ end
 # kind => how many warn-level (or worse) events this process has logged.
 const _WARNINGS = Dict{String,Int}()
 const _WARNINGS_LOCK = ReentrantLock()
+# kind => when it was last echoed, and how long a kind stays quiet after it was.
+const _WARNING_SAID = Dict{String,Float64}()
+const _WARNING_EVERY = Ref(60.0)
 # Where they are echoed: the master's stderr by default; `nothing` turns the echo off.
 const _WARNING_IO = Ref{Any}(:stderr)
 
@@ -253,17 +256,28 @@ const _WARNING_IO = Ref{Any}(:stderr)
     echo_warnings!(io_or_nothing)
 
 Where warn-level events are also printed, beside the event file: an `IO`, `:stderr` (the default)
-or `nothing` for nowhere. Rate-limited per kind — the first of a kind, then every hundredth, with
-the count — so it is a line a person sees in the job's output, not a second log. Only the master
-process echoes (`SWEEPRUNNER_QUIET_WARNINGS=1` turns it off from the environment).
+or `nothing` for nowhere. Rate-limited per kind — the first of a kind, then at most one a minute,
+with the count; an error-level event is always printed — so it is a line a person sees in the
+job's output, not a second log. Only the master process echoes: a warning logged on a WORKER
+(`lock_lost`, `checkpoint_unreadable`) is in the event file and not here.
+`SWEEPRUNNER_QUIET_WARNINGS=1` turns the echo off from the environment.
 """
 echo_warnings!(io) = (_WARNING_IO[]=io; nothing)
 
-function _note_warning(kind::Symbol, rec)
-    n = lock(_WARNINGS_LOCK) do
-        return _WARNINGS[String(kind)] = get(_WARNINGS, String(kind), 0) + 1
+function _note_warning(kind::Symbol, rec, level::Symbol=:warn)
+    # By time, per kind: the first, then at most one a minute, with how many there have been.
+    # (First-and-every-hundredth for the life of the process left the second node taken out,
+    # and a warning that comes back every ten minutes, unsaid.) An ERROR is always said: "the
+    # cut gave up" has the same kind as "the cut began", and is the line that matters.
+    n, due = lock(_WARNINGS_LOCK) do
+        k = String(kind)
+        c = _WARNINGS[k] = get(_WARNINGS, k, 0) + 1
+        now = time()
+        d = level === :error || now - get(_WARNING_SAID, k, -Inf) >= _WARNING_EVERY[]
+        d && (_WARNING_SAID[k] = now)
+        return c, d
     end
-    (n == 1 || n % 100 == 0) || return nothing
+    due || return nothing
     sink = _WARNING_IO[]
     sink === nothing && return nothing
     (Distributed.myid() == 1 && get(ENV, "SWEEPRUNNER_QUIET_WARNINGS", "") != "1") ||
@@ -276,8 +290,10 @@ function _note_warning(kind::Symbol, rec)
         )
         text = length(fields) > 300 ? first(fields, 300) * " …" : fields
         times = n == 1 ? "" : " (×$n so far)"
-        println(io, "sweeprunner warning: ", kind, times, "  ", text)
+        word = level === :error ? "error" : "warning"
+        println(io, "sweeprunner ", word, ": ", kind, times, "  ", text)
     catch
+        # Nowhere to say that the echo failed; the event is in the file.
     end
     return nothing
 end

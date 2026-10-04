@@ -122,13 +122,17 @@ function account_snapshot(m; now::Float64=time())
     njoined = length(a.cores)
     mean_cores = njoined == 0 ? 1.0 : joined_cores / njoined
     never = max(planned - njoined, 0) * mean_cores * elapsed
-    alloc_cores = _slurm_alloc_cores()
-    alloc_cores == 0 && (alloc_cores = joined_cores)
+    # This master's share of the job. Where the allocation cannot be read the cores that
+    # joined are the only figure there is; `allocated_known` says which it was.
+    alloc_cores = _master_alloc_cores(m)
+    allocated_known = alloc_cores > 0
+    allocated_known || (alloc_cores = joined_cores)
     allocated = alloc_cores * elapsed
     idle = sum(values(a.idle); init=0.0)
     return Dict{String,Any}(
         "elapsed" => elapsed,
         "allocated" => allocated,
+        "allocated_known" => allocated_known,
         "computing" => a.busy,
         "kept" => a.kept,
         "lost" => a.lost,
