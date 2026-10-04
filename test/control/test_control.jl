@@ -636,7 +636,12 @@ end
         end
         r = run!(work, v, [k]; opts=_ct_opts())
         @test said == [false]
-        @test (r.done, r.stop, r.err) == (0, 1, 0)             # it left, as at a stop
+        # It left — as a lost lock: nobody asked it to stop (#137).
+        @test (r.done, r.stop, r.err) == (0, 0, 0)
+        @test (r.busy, r.collisions) == (1, 1)
+        @test r.stopped_by === nothing
+        lost = only([e for e in _ct_events(outdir) if e.kind == "lock_lost"])
+        @test lost.holder == sib                                # whose key it is now
         @test read(cpfile, String) == "the new owner's checkpoint"
         @test read_progress(v)[ParamIO.canonical(k)].step == 1  # not 7
         @test DataVault.running_owner(v, k) == sib
@@ -874,6 +879,89 @@ end
         @test o.deadline < first_deadline
     end
 end
+
+@testset "a lock that cannot be read is not a lock that was lost (#137)" begin
+    _ct_vault() do v, _
+        k = DataVault.keys(v)[1]
+        tok = owner_token()
+        state = (args...) -> SweepRunner._lock_state(v, k, tok; tries=2).state
+        @test state() === :lost                                 # no lock at all
+        @test DataVault.acquire_running!(v, k, tok) === :ok
+        @test state() === :mine
+        path = DataVault._running_file(v, k)
+        good = read(path)
+        # The file is there and holds no owner line: what a read cut short gives.
+        write(path, "")
+        r = SweepRunner._lock_state(v, k, tok; tries=2)
+        @test r.state === :unknown
+        write(path, good)
+        other = owner_token()
+        DataVault.clear_running!(v, k, tok)
+        @test DataVault.acquire_running!(v, k, other) === :ok
+        r = SweepRunner._lock_state(v, k, tok; tries=2)
+        @test (r.state, r.holder) == (:lost, other)
+        DataVault.clear_running!(v, k, other)
+    end
+    # A unit whose lock is unreadable goes on, saves, and its result is kept.
+    _ct_vault() do v, outdir
+        k = DataVault.keys(v)[1]
+        saved = Ref(false)
+        work =
+            key -> begin
+                path = DataVault._running_file(v, key)
+                good = read(path)
+                write(path, "")
+                saved[] = save_checkpoint!(SweepRunner.checkpoint(), "state"; step=1)
+                write(path, good)
+                return Dict{String,Any}("x" => 1)
+            end
+        r = run!(work, v, [k]; opts=_ct_opts())
+        @test saved[]
+        @test (r.done, r.stop, r.busy) == (1, 0, 0)
+        @test count(e -> e.kind == "lock_unreadable", _ct_events(outdir)) == 1
+    end
+end
+
+@testset "a checkpoint that cannot be opened is not set aside as damaged (#137)" begin
+    _ct_vault() do v, outdir
+        k = DataVault.keys(v)[1]
+        cpdir = SweepRunner.checkpoint_dir(v)
+        cpfile = joinpath(cpdir, SweepRunner._key_hash(ParamIO.canonical(k)) * ".jld2")
+        # A real checkpoint, left by a unit that was cut after its first step.
+        run!(
+            key -> (save_checkpoint!(SweepRunner.checkpoint(), 41; step=1); error("cut")),
+            v,
+            [k];
+            opts=_ct_opts(; max_attempts=1),
+        )
+        good = read(cpfile)
+        chmod(cpfile, 0o000)
+        try
+            if !SweepRunner._can_read(cpfile; tries=1)          # not as root
+                r = run!(
+                    key -> Dict{String,Any}(
+                        "got" => load_checkpoint(SweepRunner.checkpoint())
+                    ),
+                    v,
+                    [k];
+                    opts=_ct_opts(; max_attempts=1),
+                )
+                @test (r.done, r.err) == (0, 1)                 # the attempt failed...
+                @test !any(f -> occursin(".unreadable.", f), readdir(cpdir))
+            end
+        finally
+            chmod(cpfile, 0o644)
+        end
+        @test read(cpfile) == good                              # ...and the file is intact
+        r = run!(
+            key -> Dict{String,Any}("got" => load_checkpoint(SweepRunner.checkpoint())),
+            v,
+            [k];
+            opts=_ct_opts(),
+        )
+        @test r.done == 1
+        @test DataVault.load(v, k)["got"] == 41
+    end
 
 # ── requests are checked by the one who reads them (#138) ────────────────────────────────────────
 

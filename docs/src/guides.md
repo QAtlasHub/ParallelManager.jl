@@ -387,7 +387,11 @@ lead your scheduler gives before it kills the job.
 
 Independently of any cut, a unit that no longer holds its key cannot write
 over the one who does: `report_progress` returns `false` and
-`save_checkpoint!` throws `StopRequested`, so the unit leaves.
+`save_checkpoint!` throws `LockLost`, so the unit leaves. That is a collision
+(`lock_busy`, counted in `collisions`, with `lock_lost` naming who holds the
+key now), not a stop: nobody asked for one. Only a positive answer counts — a
+lock file that could not be *read* is tried again, and if it stays unreadable
+the unit goes on (`lock_unreadable`); the commit's own owner check decides.
 
 ### Workers that arrive late
 
@@ -571,24 +575,36 @@ What keeps that check from passing on an under-count:
 
 - A submission is written to the ledger, and the ledger saved, **before**
   `sbatch` is called. If `sbatch` fails or times out, the row stays committed
-  until a later poll finds a job of that name or it has been absent three
-  polls: a job that was queued but not recorded is one a budget cannot see.
-- A job counts as ended only after it has been absent from the scheduler's
-  answer **three polls in a row**, and is then billed for what it can have run
-  since it was last seen (up to its time limit), not for the last elapsed time
-  read. A job in any listed state (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …)
-  exists. A job that reappears is live again.
-- A scheduler answer that cannot be trusted submits nothing: `squeue` failing,
-  a line or a time that cannot be read, or an empty answer while the ledger
-  holds live jobs. The refusal says why.
-- The policy constructors reject values that would switch the check off (a NaN
-  budget or time limit, zero or negative nodes).
-- "Our jobs" are the ledger's ids plus the exact names `<name>-<partition>`;
-  a policy named `ft` does not claim `ft2-…`.
+  and holds its place under `max_jobs` until a later poll finds a job of that
+  name, or it has gone unlisted for three polls and ten minutes.
+- A job ends **on evidence**, logged as `job_ended` with what the evidence was:
+  the scheduler's accounting says so (`sacct`), or it has been absent for three
+  polls and two minutes from answers that list *other* jobs of the ledger, or
+  it was last seen running and its time limit has passed. It is then billed for
+  what it can have run since it was last seen. A job in any listed state
+  (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
+  live again.
+- An answer that lists none of the ledger's live jobs — empty, another
+  cluster, a filter — is not counted as an absence, however often it comes,
+  and nothing is submitted on it. (Three of those used to empty the ledger.)
+- `squeue` failing, or a line or an elapsed time that cannot be read, refuses
+  the round. A time *limit* printed as a word (`NOT_SET`, `Partition_Limit`)
+  is "no limit": it commits without bound if the job is ours.
+- A listed job with the policy's name that the ledger does not know is
+  **adopted** at its limit (`job_adopted`). "Our jobs" are the ledger's ids
+  plus the exact names `<name>-<partition>`; a policy named `ft` does not
+  claim `ft2-…`.
+- The ledger is read again, under a lock, before every decision: a job's last
+  act and a login-node loop are two controllers on one file. A **dry run
+  writes nothing** — not the ledger either.
+- The numbers are checked where they enter: the policy (also when built
+  positionally), each job the scheduler reports, each ledger row. A ledger
+  with a NaN or a negative number in it refuses the round.
 
-What it still cannot see: jobs submitted outside the controller, and a ledger
-file that was deleted (it reads as nothing used). Nothing reconciles with
-`sacct`.
+What it still cannot see: jobs submitted outside the controller under another
+name, and a ledger file that was deleted (it reads as nothing used; the
+controller logs `ledger_new` when it starts one). The `sacct` call has been
+read against stubs only, like the rest of the Slurm backend.
 
 The batch script is yours; it receives `SWEEPRUNNER_PROFILE` and whatever the
 partition's `env` names.

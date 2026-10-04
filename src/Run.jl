@@ -1952,10 +1952,21 @@ function _run_one_with_retry!(
                 "work_fn must return a Dict (got $(typeof(payload))). " *
                 "Wrap scalars as e.g. Dict(\"value\" => x).",
             )
-            if DataVault.running_owner(vault, key) != tok
+            held = _lock_state(vault, key, tok)
+            if held.state === :lost
                 # A sibling master reclaimed our lock while work_fn ran; it now
                 # owns this key. Discard our result rather than double-committing.
-                log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                # (A lock that could not be READ is not this case: the commit below is
+                # owner-checked, and writes nothing if the key has changed hands.)
+                log_event(
+                    log,
+                    :lock_lost;
+                    level=:warn,
+                    stage=stage,
+                    key=kstr,
+                    attempt=attempt,
+                    holder=held.holder,
+                )
                 spent(:lock_lost)
                 return :lock_busy
             end
@@ -2004,6 +2015,22 @@ function _run_one_with_retry!(
                 log_event(log, :artifact_busy; stage=stage, key=kstr, artifact=e.name)
                 return :deferred
             end
+            # Not a failure, and not a stop: the key changed hands under the unit (a sibling
+            # reclaimed it, or the unit was cut), and it left rather than write over the new
+            # owner. A collision, with whose token is on the lock now.
+            if e isa LockLost
+                log_event(
+                    log,
+                    :lock_lost;
+                    level=:warn,
+                    stage=stage,
+                    key=kstr,
+                    attempt=attempt,
+                    holder=e.holder,
+                )
+                spent(:lock_lost)
+                return :lock_busy
+            end
             # Not a failure either: the unit was told to stop and left at a safe point.
             if e isa StopRequested
                 log_event(log, :key_stopped; stage=stage, key=kstr, attempt=attempt)
@@ -2017,8 +2044,17 @@ function _run_one_with_retry!(
             last_err = _short_err(e)
             log_event(log, :error; stage=stage, key=kstr, attempt=attempt, err=last_err)
             spent(:error)
-            if DataVault.running_owner(vault, key) != tok
-                log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+            held = _lock_state(vault, key, tok)
+            if held.state === :lost
+                log_event(
+                    log,
+                    :lock_lost;
+                    level=:warn,
+                    stage=stage,
+                    key=kstr,
+                    attempt=attempt,
+                    holder=held.holder,
+                )
                 return :lock_busy
             end
             if attempt < opts.max_attempts

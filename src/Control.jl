@@ -867,6 +867,23 @@ function Base.showerror(io::IO, ::StopRequested)
     return print(io, "StopRequested: the unit was asked to stop")
 end
 
+"""
+    LockLost(holder)
+
+What [`save_checkpoint!`](@ref) throws when the key's lock is no longer this unit's: another
+token is on it (`holder`), or it is gone (`holder === nothing`). Nobody asked the unit to stop —
+a sibling reclaimed the key, or the unit was cut — so `run!` takes it as a collision (`lock_busy`,
+counted in `collisions`), not as a stop.
+"""
+struct LockLost <: Exception
+    holder::Union{String,Nothing}
+end
+
+function Base.showerror(io::IO, e::LockLost)
+    who = e.holder === nothing ? "the lock is gone" : "the lock is held by $(e.holder)"
+    return print(io, "LockLost: this unit no longer holds its key (", who, ")")
+end
+
 # Does a request written since the master started tell THIS unit to stop? Reads only the request
 # files not seen before.
 function _stop_requested!(w::StopWatch, vault::Vault, key::DataKey)::Bool
@@ -1001,4 +1018,4 @@ function masters_listening(outdir::AbstractString; project=nothing, run=nothing)
 end
 
 export control!, read_requests, read_acks, wait_acks, masters_listening
-export KeyFilter, should_stop, stop_point, StopRequested
+export KeyFilter, should_stop, stop_point, StopRequested, LockLost
