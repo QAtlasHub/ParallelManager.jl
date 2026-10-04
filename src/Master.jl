@@ -200,6 +200,8 @@ mutable struct Master
     # key => when it was last seen to advance in this attempt. Kept here because the stamp it
     # comes from is removed as the key finishes, a moment before its row is settled.
     advanced::Dict{String,Float64}
+    # class => the key of unknown cost that was started for it in this job, to measure it.
+    explored::Dict{String,String}
 end
 
 function Master()
@@ -232,6 +234,7 @@ function Master()
         0.0,
         Set{String}(),
         Dict{String,Float64}(),
+        Dict{String,String}(),
     )
 end
 

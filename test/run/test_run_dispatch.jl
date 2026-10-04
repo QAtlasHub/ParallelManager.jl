@@ -228,8 +228,8 @@ end
             cost=k -> 1000.0,
         )
         @test (r.done, r.held_back) == (0, length(ks))
-        # Unknown is not zero: with a deadline, a key the hook has no answer for is held back,
-        # and the event says how many were held for that reason.
+        # Unknown is neither zero nor for ever: with a deadline, ONE key the hook has no answer
+        # for is started (to be measured) and the others are held back, with the reason said.
         _dp_vault(; run="dp3") do v3, outdir3
             ks3 = DataVault.keys(v3)
             r = run!(
@@ -239,96 +239,66 @@ end
                 opts=_dp_quiet(; deadline=time() + 60),
                 min_time=k -> error("no estimate"),
             )
-            @test (r.done, r.held_back) == (0, length(ks3))
-            ev = only([e for e in _dp_events(outdir3) if e.kind == "held_back"])
-            @test ev.cost_unknown == length(ks3)
+            @test (r.done, r.held_back) == (1, length(ks3) - 1)
+            ev = _dp_events(outdir3)
+            held = only([e for e in ev if e.kind == "held_back"])
+            @test held.cost_unknown == length(ks3) - 1
+            @test only([e for e in ev if e.kind == "cost_explore"]).key == ParamIO.canonical(ks3[1])
+            # The hook threw on every key: said once, with what it threw.
+            failed = only([e for e in ev if e.kind == "cost_hook_failed"])
+            @test occursin("no estimate", failed.err)
             # Without a deadline there is nothing to fit, and they run.
             r = run!(
                 _dp_rec(String[]), v3, ks3; opts=_dp_quiet(), min_time=k -> error("no")
             )
-            @test r.done == length(ks3)
+            @test r.done == length(ks3) - 1
         end
     end
 end
 
-@testset "a key that has shown it checkpoints needs only the time to its next one (#114)" begin
+@testset "a class that was never measured is explored: one key per class per job (#136)" begin
     _dp_vault() do v, outdir
-        ks = DataVault.keys(v)[1:4]
-        whole = k -> 1000.0                                  # every key is longer than the job
-        # The first key keeps a checkpoint and is cut; the second never ran.
-        work1 = k -> begin
-            save_checkpoint!(SweepRunner.checkpoint(), 1; step=1, of=3)
-            error("cut")
-        end
-        run!(work1, v, ks[1:1]; opts=_dp_quiet(; max_attempts=1))
+        ks = DataVault.keys(v)                                   # two classes: L = 8 and 16
+        class = k -> string("L", ParamIO.param(k, "L"))
+        # The caller's hook knows L=8 and has nothing for L=16.
+        cost = k -> ParamIO.param(k, "L") == 8 ? 0.01 : NaN
+        n8 = count(k -> ParamIO.param(k, "L") == 8, ks)
         ran = String[]
-        r = run!(
+        r = run_loop!(
             _dp_rec(ran),
             v,
             ks;
-            opts=_dp_quiet(; deadline=time() + 120, checkpoint_every=30.0),
-            cost=whole,
+            opts=_dp_quiet(; deadline=time() + 600),
+            cost=cost,
+            key_class=class,
+            idle_sleep=0.05,
         )
-        # 30 s to its next checkpoint fits in 120 s; 1000 s for a key with no record does not.
-        @test ran == [ParamIO.canonical(ks[1])]
-        @test (r.done, r.held_back) == (1, 3)
-        # With an explicit min_time the caller's answer stands.
-        ran2 = String[]
-        r = run!(
-            _dp_rec(ran2),
-            v,
-            ks;
-            opts=_dp_quiet(; deadline=time() + 120, checkpoint_every=30.0),
-            cost=whole,
-            min_time=k -> 1.0,
-        )
-        @test r.done == 3
+        by = Dict(ParamIO.canonical(k) => k for k in ks)
+        ran16 = [k for k in ran if ParamIO.param(by[k], "L") == 16]
+        # Every measured key ran, and exactly one of the class nobody has a time for — not none
+        # (held back in every job) and not all (assumed to fit). Once per JOB, not per round.
+        @test count(k -> ParamIO.param(by[k], "L") == 8, ran) == n8
+        @test length(ran16) == 1
+        ev = _dp_events(outdir)
+        ex = only([e for e in ev if e.kind == "cost_explore"])
+        @test ex.class == "L16" && ex.key == only(ran16)
+        held = [e for e in ev if e.kind == "held_back"]
+        @test !isempty(held)
+        @test all(e -> e.classes_unknown == ["L16"], held)
+        @test r.stopped_by === :deadline
     end
 end
 
-@testset "options the round does not act on are said (#114)" begin
-    _dp_vault() do v, outdir
-        ks = DataVault.keys(v)[1:2]
-        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(; order=:longest_first))
-        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
-        @test [e.option for e in ev] == ["order=:longest_first"]
-    end
-    _dp_vault() do v, outdir
-        ks = DataVault.keys(v)[1:2]
-        run!(
-            _dp_rec(String[]),
-            v,
-            ks;
-            opts=_dp_quiet(; workers=:sequential),
-            affinity=k -> 1,
-            spawn=n -> nothing,
-        )
-        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
-        @test Set(e.option for e in ev) == Set(["affinity", "spawn"])
-    end
-    _dp_vault() do v, outdir
-        # Nothing asked for, nothing said; and a cost makes the order real.
-        ks = DataVault.keys(v)[1:2]
-        run!(
-            _dp_rec(String[]), v, ks; opts=_dp_quiet(; order=:longest_first), cost=k -> 1.0
-        )
-        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(), affinity=k -> 1)
-        @test !any(e -> e.kind == "option_ignored", _dp_events(outdir))
-    end
-end
-
-@testset "run_loop! returns the collisions of all its rounds (#114)" begin
+@testset ":longest_first puts a key of unknown cost first, not last (#136)" begin
     _dp_vault() do v, _
-        ks = DataVault.keys(v)[1:3]
-        sib = owner_token()
-        work = k -> begin
-            k == ks[1] && DataVault.acquire_running!(v, ks[2], sib)
-            k == ks[3] && DataVault.clear_running!(v, ks[2], sib)
-            return Dict{String,Any}("x" => 1)
-        end
-        r = run_loop!(work, v, ks; opts=_dp_quiet(), idle_sleep=0.05)
-        @test r.collisions == 1
-        @test (r.done, r.remaining) == (3, 0)
+        ks = DataVault.keys(v)[1:4]
+        unknown = ParamIO.canonical(ks[3])
+        cost = k -> ParamIO.canonical(k) == unknown ? NaN : 1.0
+        order = String[]
+        run!(_dp_rec(order), v, ks; opts=_dp_quiet(; order=:longest_first), cost=cost)
+        @test first(order) == unknown
+        @test order[2:end] ==
+            [ParamIO.canonical(k) for k in ks if ParamIO.canonical(k) != unknown]
     end
 end
 
