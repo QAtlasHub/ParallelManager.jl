@@ -101,7 +101,11 @@ end
     # that is not charged.
     answers["squeue"] = "4242|short|RUNNING|2|30:00\n"
     @test_throws ErrorException job_states(s)
-    answers["squeue"] = "4242|short|RUNNING|2|soon|10:00|t-short\n"
+    # A limit printed as a word is "not known": no limit, which commits without bound if the
+    # job is ours — not a reason to refuse every round while any such job exists (#132).
+    answers["squeue"] = "4242|short|RUNNING|2|NOT_SET|10:00|t-short\n"
+    @test only(job_states(s)).time_limit == Inf
+    answers["squeue"] = "4242|short|RUNNING|2|30:00|soon|t-short\n"
     @test_throws ErrorException job_states(s)
     answers["squeue"] = "4242|short|RUNNING|two|30:00|10:00|t-short\n"
     @test_throws ErrorException job_states(s)
@@ -198,14 +202,16 @@ end
     @test !haskey(l.jobs, tmp)
     @test l.jobs["78"]["state"] == "pending"
     @test !haskey(l.jobs, "90")                              # not ours: not adopted
-    # One that never reached the queue stops counting after it has been absent long enough.
+    # One that never reached the queue stops counting once it has gone unlisted for three
+    # polls and ten minutes.
     tmp = SweepRunner.record_intent!(l, spec; now=400.0)
-    for t in (500.0, 600.0)
+    for t in (500.0, 600.0, 700.0, 800.0)
         SweepRunner.observe!(l, listed; now=t)
         @test l.jobs[tmp]["ended"] == false
     end
-    SweepRunner.observe!(l, listed; now=700.0)
+    ch = SweepRunner.observe!(l, listed; now=1100.0)
     @test l.jobs[tmp]["ended"] == true
+    @test only(ch).what === :ended && occursin("never listed", only(ch).evidence)
     @test l.jobs[tmp]["elapsed"] == 0.0                      # it never ran
 end
 
@@ -366,16 +372,15 @@ end
     # A new controller on the same outdir starts from the ledger on disk.
     ctl2 = JobController(sched, _jb_policy(; dry_run=false, budget_node_hours=5.5), outdir)
     @test length(ctl2.ledger.jobs) == 5
+    first_five = collect(keys(ctl2.ledger.jobs))
     empty!(sched.jobs)                                         # they all ended, unused
-    # The scheduler lists nothing while the ledger has live jobs: not trusted at once. Nothing
-    # is submitted on it, and it takes three such answers for the jobs to count as ended.
-    for _ in 1:3
-        ds = manage!(ctl2, _jb_work(100, 60000))
-        @test all(d -> d.action === :refuse && occursin("not trusted", d.reason), ds)
-    end
-    @test length(sched.submitted) == 5
-    @test all(j -> j["ended"] == true, values(ctl2.ledger.jobs))
+    # The queue no longer lists them and the scheduler's accounting says they ended: that is
+    # evidence, and it is logged with each job.
     ds = manage!(ctl2, _jb_work(100, 60000))
+    @test all(id -> ctl2.ledger.jobs[id]["ended"] == true, first_five)
+    ended = [e for e in _jb_events(outdir) if e.kind == "job_ended"]
+    @test length(ended) == 5
+    @test all(e -> occursin("accounting", e.evidence), ended)
     @test count(d -> d.action === :submit, ds) == 5            # next to nothing was used
 end
 
@@ -394,9 +399,9 @@ end
         return w
     end
     rounds = controller_loop!(ctl, work; interval=0.01, max_rounds=10)
-    # submit; held while it runs; three rounds for its absence to count as ended; then nothing
-    # left and none live.
-    @test rounds == 6
+    # submit; held while it runs; gone from the queue and ended by the scheduler's accounting,
+    # with nothing left and none live.
+    @test rounds == 3
     @test length(sched.submitted) == 1
 end
 
@@ -540,10 +545,19 @@ end
     @test all(j -> j["state"] == "submitting", values(ctl.ledger.jobs))
     @test node_hours(ctl.ledger).committed == 2.0
     @test node_hours(Ledger(ctl.ledger.path)).committed == 2.0     # and on disk
-    # ...until they have been absent from the queue long enough.
-    quiet = _jb_work(0)
-    for _ in 1:3
-        manage!(ctl, quiet)
+    # ...and hold their places: nothing more is submitted on top of them.
+    ds = manage!(ctl, _jb_work(100, 60000))
+    @test !any(d -> d.action === :submit, ds)
+    @test length(ctl.ledger.jobs) == 2
+    # ...until they have gone unlisted long enough (ten minutes; none, here).
+    SweepRunner._SUBMIT_UNSEEN[] = 0.0
+    try
+        quiet = _jb_work(0)
+        for _ in 1:3
+            manage!(ctl, quiet)
+        end
+    finally
+        SweepRunner._SUBMIT_UNSEEN[] = 600.0
     end
     @test node_hours(ctl.ledger).committed == 0.0
     @test node_hours(ctl.ledger).used == 0.0
@@ -700,4 +714,145 @@ end
     finally
         rm(dir; recursive=true, force=true)
     end
+end
+
+# ── the sequences in which the budget could be passed (#132) ─────────────────────────────────────
+
+# A scheduler with no accounting to ask: absence from its answers is all there is.
+struct _JbBlind <: SweepRunner.Scheduler
+    inner::MockScheduler
+end
+SweepRunner.submit(s::_JbBlind, spec::JobSpec) = SweepRunner.submit(s.inner, spec)
+SweepRunner.job_states(s::_JbBlind) = SweepRunner.job_states(s.inner)
+
+@testset "an answer that lists none of the ledger's jobs never ends them, however often it comes (#132 A)" begin
+    outdir = mktempdir()
+    sched = _JbBlind(MockScheduler())
+    ctl = JobController(sched, _jb_policy(; dry_run=false, budget_node_hours=5.5), outdir)
+    manage!(ctl, _jb_work(100, 60000))
+    @test length(sched.inner.submitted) == 5
+    kept = copy(sched.inner.jobs)
+    empty!(sched.inner.jobs)                    # the wrong cluster, a wrapper, a filter
+    for _ in 1:10
+        ds = manage!(ctl, _jb_work(100, 60000))
+        @test all(d -> d.action === :refuse && occursin("not trusted", d.reason), ds)
+    end
+    @test length(sched.inner.submitted) == 5                    # the fourth round did not submit
+    @test all(j -> j["ended"] == false, values(ctl.ledger.jobs))
+    @test node_hours(ctl.ledger).committed == 5.0
+    @test !any(e -> e.kind == "job_ended", _jb_events(outdir))
+
+    # An answer that lists some of them is one absence can be read from — over polls AND time.
+    append!(sched.inner.jobs, kept[1:4])
+    gone = kept[5].id
+    SweepRunner._ENDED_MIN_ABSENT[] = 0.0
+    try
+        for i in 1:3
+            manage!(ctl, _jb_work(100, 60000))
+            @test ctl.ledger.jobs[gone]["ended"] == (i == 3)
+        end
+    finally
+        SweepRunner._ENDED_MIN_ABSENT[] = 120.0
+    end
+    ended = only([e for e in _jb_events(outdir) if e.kind == "job_ended"])
+    @test ended.id == gone && ended.polls_missed == 3
+end
+
+@testset "a dry run reads the ledger and writes nothing (#132 B)" begin
+    outdir = mktempdir()
+    sched = _JbBlind(MockScheduler())
+    live = JobController(sched, _jb_policy(; dry_run=false), outdir)
+    manage!(live, _jb_work(100, 60000))
+    before = read(live.ledger.path)
+    empty!(sched.inner.jobs)
+    looker = JobController(sched, _jb_policy(; dry_run=true), outdir)
+    for _ in 1:5
+        manage!(looker, _jb_work(100, 60000))
+    end
+    @test read(live.ledger.path) == before
+    @test !isdir(live.ledger.path * ".lock")
+    # And with no ledger at all, a look creates none.
+    fresh = mktempdir()
+    manage!(JobController(MockScheduler(), _jb_policy(; dry_run=true), fresh), _jb_work(10))
+    @test !isfile(joinpath(fresh, "sweeprunner", "jobs", "ledger.json"))
+end
+
+@testset "two controllers on one ledger decide one after the other, on what the other wrote (#132 C)" begin
+    outdir = mktempdir()
+    sched = MockScheduler()
+    a = JobController(sched, _jb_policy([_jb_part(; max_jobs=3)]; dry_run=false), outdir)
+    b = JobController(sched, _jb_policy([_jb_part(; max_jobs=3)]; dry_run=false), outdir)
+    @test isempty(b.ledger.jobs)                                # read before `a` did anything
+    manage!(a, _jb_work(100, 60000))
+    @test length(sched.submitted) == 3
+    ds = manage!(b, _jb_work(100, 60000))                       # its copy was stale: re-read
+    @test !any(d -> d.action === :submit, ds)
+    @test length(sched.submitted) == 3
+    @test length(Ledger(a.ledger.path).jobs) == 3               # nobody's rows were overwritten
+    # While one holds the ledger the other waits, and says so rather than deciding blind.
+    mkdir(a.ledger.path * ".lock")
+    err = try
+        SweepRunner.with_ledger(() -> nothing, b.ledger; wait=0.5)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException && occursin("locked by another controller", err.msg)
+    rm(a.ledger.path * ".lock")
+    @test SweepRunner.with_ledger(() -> 1, b.ledger; wait=0.5) == 1
+    @test !isdir(a.ledger.path * ".lock")
+end
+
+@testset "numbers are checked where they enter: states, specs, ledger rows, policies (#132 D, E)" begin
+    @test_throws ArgumentError JobState("1", "t-a", "a", :running, 2, 3600.0, NaN)
+    @test_throws ArgumentError JobState("1", "t-a", "a", :running, -2, 3600.0, 0.0)
+    @test_throws ArgumentError JobState("1", "t-a", "a", :running, 2, NaN, 0.0)
+    @test JobState("1", "t-a", "a", :running, 2, Inf, 0.0).time_limit == Inf
+    @test_throws ArgumentError JobSpec(;
+        name="x", partition="a", nodes=0, time_limit=60.0, script="s"
+    )
+    @test_throws ArgumentError JobSpec(;
+        name="x", partition="a", nodes=1, time_limit=NaN, script="s"
+    )
+    # Positionally too: there is no way to build one that skips the checks.
+    @test_throws ArgumentError JobPolicy("x", PartitionPolicy[], NaN, 10, false, 600.0)
+    @test_throws ArgumentError PartitionPolicy(
+        "a", 0, 60.0, "s", nothing, 1, 1, nothing, Dict{String,String}()
+    )
+    parts = [_jb_part()]
+    p = JobPolicy(; name="t", partitions=parts, budget_node_hours=10)
+    push!(parts, _jb_part(; name="long"))                       # the caller's vector, not its
+    @test length(p.partitions) == 1
+
+    # A ledger row with a number the budget check would pass on is an error, not an account.
+    outdir = mktempdir()
+    sched = MockScheduler()
+    ctl = JobController(sched, _jb_policy(; dry_run=false), outdir)
+    manage!(ctl, _jb_work(100, 60000))
+    n = length(sched.submitted)
+    text = read(ctl.ledger.path, String)
+    @test occursin("\"elapsed\":0.0", text)
+    write(ctl.ledger.path, replace(text, "\"elapsed\":0.0" => "\"elapsed\":-5.0"; count=1))
+    @test_throws ArgumentError Ledger(ctl.ledger.path)
+    ds = manage!(ctl, _jb_work(100, 60000))
+    @test all(
+        d -> d.action === :refuse && occursin("ledger could not be used", d.reason), ds
+    )
+    @test length(sched.submitted) == n
+end
+
+@testset "a job of ours the ledger does not know is adopted at its limit, and said (#132 F)" begin
+    outdir = mktempdir()
+    sched = MockScheduler()
+    ctl = JobController(sched, _jb_policy(; dry_run=false, budget_node_hours=1.5), outdir)
+    # Submitted by hand, or by a controller whose ledger was lost: it has the policy's name.
+    push!(sched.jobs, JobState("7", "t-short", "short", :running, 2, 1800.0, 60.0))
+    ds = manage!(ctl, _jb_work(100, 60000))
+    @test haskey(ctl.ledger.jobs, "7")
+    adopted = only([e for e in _jb_events(outdir) if e.kind == "job_adopted"])
+    @test adopted.id == "7"
+    # It is charged: 2 nodes for half an hour, so the budget of 1.5 has room for nothing more.
+    @test node_hours(ctl.ledger).used + node_hours(ctl.ledger).committed == 1.0
+    @test !any(d -> d.action === :submit, ds)
+    @test count(e -> e.kind == "ledger_new", _jb_events(outdir)) == 1
 end
