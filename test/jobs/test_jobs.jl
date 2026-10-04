@@ -538,7 +538,9 @@ end
         failing, _jb_policy([_jb_part(; max_jobs=2)]; dry_run=false), outdir
     )
     ds = manage!(ctl, _jb_work(100, 60000))
-    @test count(d -> d.action === :submit, ds) == 2
+    # Said as what happened: the submissions failed, they are not reported as made.
+    @test count(d -> d.action === :refuse && occursin("submission failed", d.reason), ds) ==
+        2
     @test count(e -> e.kind == "job_submit_failed", _jb_events(outdir)) == 2
     # Whether the scheduler took them is not known, so they stay on record and committed...
     @test length(ctl.ledger.jobs) == 2
@@ -742,20 +744,23 @@ SweepRunner.job_states(s::_JbBlind) = SweepRunner.job_states(s.inner)
     @test node_hours(ctl.ledger).committed == 5.0
     @test !any(e -> e.kind == "job_ended", _jb_events(outdir))
 
-    # An answer that lists some of them is one absence can be read from — over polls AND time.
+    # An answer that lists some of them is one absence can be read from — over polls AND time:
+    # not yet, with two minutes required and seconds gone...
     append!(sched.inner.jobs, kept[1:4])
     gone = kept[5].id
+    manage!(ctl, _jb_work(100, 60000))
+    @test ctl.ledger.jobs[gone]["ended"] == false
+    # ...and then, once it has been absent that long (none, here).
     SweepRunner._ENDED_MIN_ABSENT[] = 0.0
     try
-        for i in 1:3
-            manage!(ctl, _jb_work(100, 60000))
-            @test ctl.ledger.jobs[gone]["ended"] == (i == 3)
-        end
+        manage!(ctl, _jb_work(100, 60000))
     finally
         SweepRunner._ENDED_MIN_ABSENT[] = 120.0
     end
+    @test ctl.ledger.jobs[gone]["ended"] == true
     ended = only([e for e in _jb_events(outdir) if e.kind == "job_ended"])
-    @test ended.id == gone && ended.polls_missed == 3
+    @test ended.id == gone && ended.polls_missed >= 3
+    @test occursin("listed other jobs", ended.evidence)
 end
 
 @testset "a dry run reads the ledger and writes nothing (#132 B)" begin
@@ -855,4 +860,190 @@ end
     @test node_hours(ctl.ledger).used + node_hours(ctl.ledger).committed == 1.0
     @test !any(d -> d.action === :submit, ds)
     @test count(e -> e.kind == "ledger_new", _jb_events(outdir)) == 1
+end
+
+# ── third review (#153) ──────────────────────────────────────────────────────────────────────────
+
+@testset "the ledger lock has an owner: only it releases, a stale one is taken once, a lost one is not written under (#153)" begin
+    outdir = mktempdir()
+    l = Ledger(joinpath(outdir, "ledger.json"))
+    lockdir = l.path * ".lock"
+    # Held: the owner file is there, and it goes with the holder.
+    SweepRunner.with_ledger(l) do
+        @test isfile(joinpath(lockdir, "owner"))
+        @test_throws ErrorException SweepRunner.with_ledger(
+            () -> 1, Ledger(l.path); wait=0.3
+        )
+    end
+    @test !isdir(lockdir)
+
+    # Taken from a holder that was stuck: the holder does not write its copy over what the
+    # other decided, and does not remove the other's lock on its way out.
+    SweepRunner._LEDGER_LOCK_STALE[] = 0.5
+    try
+        other = Ledger(l.path)
+        err = try
+            SweepRunner.with_ledger(l) do
+                # This holder is stuck in a call that does not yield, so nothing refreshes
+                # its lock for longer than a lock may go unrefreshed...
+                t_stuck = time()
+                while time() - t_stuck < 0.8
+                end
+                # ...and another controller, asking at that moment, takes it as stale, decides,
+                # writes and leaves.
+                SweepRunner.with_ledger(other; wait=5.0) do
+                    @test SweepRunner._lock_token(lockdir) != nothing
+                    SweepRunner.record_submit!(
+                        other,
+                        "900",
+                        JobSpec(;
+                            name="t-short",
+                            partition="short",
+                            nodes=2,
+                            time_limit=60.0,
+                            script="s",
+                        ),
+                    )
+                    SweepRunner.save_ledger(other)
+                end
+                # A third holds it now; the first, coming back, must not write its stale copy
+                # and must not remove a lock that is not its own.
+                mkdir(lockdir)
+                write(joinpath(lockdir, "owner"), "somebody:1:else")
+                SweepRunner.save_ledger(l)                          # must refuse
+                return nothing
+            end
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("taken by another controller", err.msg)
+        # The other's row survived, and the third's lock is still there: not removed by the
+        # first on its way out.
+        @test haskey(Ledger(l.path).jobs, "900")
+        @test SweepRunner._lock_token(lockdir) == "somebody:1:else"
+        rm(lockdir; recursive=true)
+    finally
+        SweepRunner._LEDGER_LOCK_STALE[] = 600.0
+    end
+end
+
+@testset "the end of the only live job is seen: over wall time, or by hand (#153)" begin
+    outdir = mktempdir()
+    sched = _JbBlind(MockScheduler())                            # no accounting to ask
+    ctl = JobController(sched, _jb_policy([_jb_part(; max_jobs=1)]; dry_run=false), outdir)
+    manage!(ctl, _jb_work(100, 60000))
+    id = only(keys(ctl.ledger.jobs))
+    empty!(sched.inner.jobs)                                     # it ended; nothing else is ours
+    # Not at once, and not on the number of polls alone...
+    for _ in 1:5
+        ds = manage!(ctl, _jb_work(100, 60000))
+        @test all(d -> d.action === :refuse, ds)
+    end
+    @test ctl.ledger.jobs[id]["ended"] == false
+    # ...but after it has been absent long enough (half an hour; none, here).
+    SweepRunner._ENDED_MIN_ABSENT_ALONE[] = 0.0
+    try
+        manage!(ctl, _jb_work(100, 60000))
+    finally
+        SweepRunner._ENDED_MIN_ABSENT_ALONE[] = 1800.0
+    end
+    @test ctl.ledger.jobs[id]["ended"] == true
+    ended = only([e for e in _jb_events(outdir) if e.kind == "job_ended"])
+    @test occursin("none of them listed any job of the ledger", ended.evidence)
+
+    # By hand, for the job nobody can see the end of.
+    manage!(ctl, _jb_work(100, 60000))
+    live = only([k for (k, j) in ctl.ledger.jobs if j["ended"] == false])
+    empty!(sched.inner.jobs)
+    @test forget_job!(ctl, live)
+    @test !forget_job!(ctl, live)                                # already ended
+    @test Ledger(ctl.ledger.path).jobs[live]["ended"] == true
+    @test any(
+        e -> e.kind == "job_ended" && e.evidence == "forgotten by hand", _jb_events(outdir)
+    )
+end
+
+@testset "an absence is measured from when it began, and a row's two fields agree (#153)" begin
+    l = _jb_ledger()
+    spec = JobSpec(; name="t-a", partition="a", nodes=2, time_limit=3600.0, script="s")
+    SweepRunner.record_submit!(l, "1", spec; now=0.0)
+    SweepRunner.record_submit!(l, "2", spec; now=0.0)
+    two = [
+        JobState("1", "t-a", "a", :running, 2, 3600.0, 10.0),
+        JobState("2", "t-a", "a", :running, 2, 3600.0, 10.0),
+    ]
+    SweepRunner.observe!(l, two; now=10.0)
+    SweepRunner.observe!(l, two[2:2]; now=20.0)                  # 1 is absent since 20
+    @test l.jobs["1"]["absent_since"] == 20.0
+    SweepRunner.observe!(l, two[2:2]; now=30.0, gone=id -> id == "1" ? false : nothing)
+    @test !haskey(l.jobs["1"], "absent_since")                   # the accounting says it exists
+    SweepRunner.observe!(l, two[2:2]; now=1000.0)                # absent again, from now
+    @test l.jobs["1"]["absent_since"] == 1000.0
+    @test l.jobs["1"]["ended"] == false                          # not 980 s of absence
+    # `state` and `ended` are one fact.
+    row = Dict{String,Any}(
+        "name" => "x",
+        "partition" => "a",
+        "nodes" => 0,
+        "time_limit" => nothing,
+        "elapsed" => 0.0,
+        "state" => "running",
+        "ended" => true,
+    )
+    SweepRunner._check_ledger_row("9", row)
+    @test row["state"] == "ended"
+    l.jobs["9"] = merge(row, Dict{String,Any}("ended" => false, "state" => "running"))
+    @test isfinite(node_hours(l).committed)                      # no nodes: not 0 * Inf
+end
+
+@testset "SlurmScheduler: what the accounting says about a job the queue no longer lists (#153)" begin
+    answers = Dict{String,Any}()
+    seen = Cmd[]
+    s = SlurmScheduler(; user="me", run=cmd -> (push!(seen, cmd); answers[cmd.exec[1]]))
+    answers["sacct"] = "COMPLETED\n"
+    @test SweepRunner.job_gone(s, "42") === true
+    @test last(seen).exec == ["sacct", "-n", "-X", "-P", "-j", "42", "-o", "State"]
+    for st in ("FAILED", "CANCELLED by 1234", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL")
+        answers["sacct"] = st * "\n"
+        @test SweepRunner.job_gone(s, "42") === true
+    end
+    for st in ("RUNNING", "PENDING", "COMPLETING")
+        answers["sacct"] = st * "\n"
+        @test SweepRunner.job_gone(s, "42") === false
+    end
+    # No evidence either way: accounting off, the job not in it yet, the command failing.
+    for out in ("", "\n", "SOMETHING_NEW\n", nothing)
+        answers["sacct"] = out
+        @test SweepRunner.job_gone(s, "42") === nothing
+    end
+end
+
+@testset "a submission that failed is not reported as one, and a dry run refuses where a real one would (#153)" begin
+    outdir = mktempdir()
+    failing = SlurmScheduler(; user="me", run=cmd -> cmd.exec[1] == "squeue" ? "" : nothing)
+    ctl = JobController(
+        failing, _jb_policy([_jb_part(; max_jobs=1)]; dry_run=false), outdir
+    )
+    ds = manage!(ctl, _jb_work(100, 60000))
+    @test only(ds).action === :refuse
+    @test occursin("the submission failed", only(ds).reason)
+    # A look at the same state says what a real round would: refused, not `submit`.
+    looker = JobController(
+        failing, _jb_policy([_jb_part(; max_jobs=1)]; dry_run=true), outdir
+    )
+    ds = manage!(looker, _jb_work(100, 60000))
+    @test all(d -> d.action === :refuse && occursin("not trusted", d.reason), ds)
+end
+
+@testset "RunOpts built positionally is checked too (#153)" begin
+    o = RunOpts()
+    fields = Any[getfield(o, f) for f in fieldnames(RunOpts)]
+    @test RunOpts(fields...) == o || RunOpts(fields...) isa RunOpts
+    bad = copy(fields)
+    bad[2] = 0                                                   # max_attempts
+    @test_throws ArgumentError RunOpts(bad...)
+    bad = copy(fields)
+    bad[3] = NaN                                                 # stale_after
+    @test_throws ArgumentError RunOpts(bad...)
 end

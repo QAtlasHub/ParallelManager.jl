@@ -167,6 +167,76 @@ struct RunOpts
     manifest_interval::Float64
     stuck_after::Float64
     min_utilisation::Float64
+    # The checks that keep a run from spinning or deciding on NaN are here too, in the only way
+    # to make one: built positionally, the options used to skip them. (The keyword constructor
+    # below says the same things first, in more words.)
+    function RunOpts(
+        workers,
+        max_attempts,
+        stale_after,
+        heartbeat_interval,
+        stop_flag,
+        log_level,
+        deadline,
+        defer_poll,
+        status_interval,
+        control_interval,
+        min_busy_fraction,
+        idle_grace,
+        checkpoint_every,
+        stop_grace,
+        shard,
+        order,
+        manifest_interval,
+        stuck_after,
+        min_utilisation,
+    )
+        bad(msg) = throw(ArgumentError("RunOpts: $msg"))
+        workers in (:auto, :sequential) || bad("workers must be :auto or :sequential")
+        order in (:given, :longest_first) || bad("order must be :given or :longest_first")
+        max_attempts >= 1 || bad("max_attempts must be >= 1, got $max_attempts")
+        (stale_after > 0 && heartbeat_interval > 0 && defer_poll > 0) ||
+            bad("stale_after, heartbeat_interval and defer_poll must be > 0")
+        heartbeat_interval < stale_after || bad("heartbeat_interval must be < stale_after")
+        all(
+            x -> x >= 0,
+            (
+                status_interval,
+                control_interval,
+                idle_grace,
+                checkpoint_every,
+                stop_grace,
+                manifest_interval,
+                stuck_after,
+            ),
+        ) || bad("intervals and graces must be >= 0 and not NaN")
+        (0 <= min_busy_fraction <= 1 && 0 <= min_utilisation <= 1) ||
+            bad("min_busy_fraction and min_utilisation must be in [0, 1]")
+        (deadline === nothing || !isnan(deadline)) || bad("deadline is NaN")
+        (shard === nothing || (shard[2] >= 1 && 0 <= shard[1] < shard[2])) ||
+            bad("shard must be (i, m) with 0 <= i < m")
+        return new(
+            workers,
+            max_attempts,
+            stale_after,
+            heartbeat_interval,
+            stop_flag,
+            log_level,
+            deadline,
+            defer_poll,
+            status_interval,
+            control_interval,
+            min_busy_fraction,
+            idle_grace,
+            checkpoint_every,
+            stop_grace,
+            shard,
+            order,
+            manifest_interval,
+            stuck_after,
+            min_utilisation,
+        )
+    end
 end
 
 # `time()` was past this in 2001: an absolute deadline below it was meant as a duration.

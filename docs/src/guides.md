@@ -611,8 +611,11 @@ What keeps that check from passing on an under-count:
   (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
   live again.
 - An answer that lists none of the ledger's live jobs — empty, another
-  cluster, a filter — is not counted as an absence, however often it comes,
-  and nothing is submitted on it. (Three of those used to empty the ledger.)
+  cluster, a filter — submits nothing, however often it comes. It ends a job
+  only over wall time: three such answers spread over **half an hour** (three
+  in a row used to empty the ledger). That is what lets the end of the *last*
+  live job be seen at all on a cluster without accounting; for the job nobody
+  can see the end of there is `sweeprunner jobs <meta.toml> --forget <id>`.
 - `squeue` failing, or a line or an elapsed time that cannot be read, refuses
   the round. A time *limit* printed as a word (`NOT_SET`, `Partition_Limit`)
   is "no limit": it commits without bound if the job is ours.
@@ -620,9 +623,14 @@ What keeps that check from passing on an under-count:
   **adopted** at its limit (`job_adopted`). "Our jobs" are the ledger's ids
   plus the exact names `<name>-<partition>`; a policy named `ft` does not
   claim `ft2-…`.
-- The ledger is read again, under a lock, before every decision: a job's last
-  act and a login-node loop are two controllers on one file. A **dry run
-  writes nothing** — not the ledger either.
+- The ledger is read again, under a lock, before every decision, and the
+  scheduler is asked inside that lock: a job's last act and a login-node loop
+  are two controllers on one file. The lock has an owner: it is refreshed while
+  held, taken from a holder that died by one waiter only, released only by its
+  owner, and a controller that lost it does not write. A **dry run writes no
+  ledger** (it does log its decisions, marked `dry_run`), and refuses where a
+  real round would.
+- A submission that failed is reported as refused, not as made.
 - The numbers are checked where they enter: the policy (also when built
   positionally), each job the scheduler reports, each ledger row. A ledger
   with a NaN or a negative number in it refuses the round.

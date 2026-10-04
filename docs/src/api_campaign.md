@@ -64,6 +64,7 @@ SweepRunner.campaign_work
 SweepRunner.JobController
 SweepRunner.manage!
 SweepRunner.controller_loop!
+SweepRunner.forget_job!
 SweepRunner.print_decisions
 ```
 

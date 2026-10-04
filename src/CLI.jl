@@ -5,7 +5,7 @@
 #     sweeprunner account <outdir>
 #     sweeprunner costs <outdir>
 #     sweeprunner campaign <meta.toml> [--profile NAME] [--studies a,b]
-#     sweeprunner jobs <meta.toml> [--submit] [--loop SECONDS]
+#     sweeprunner jobs <meta.toml> [--submit] [--loop SECONDS] [--forget JOBID]
 #     sweeprunner pause|resume|stop|cancel|prioritise|resize|drain|enqueue <outdir> [options]
 #
 # `bin/sweeprunner` is the wrapper; `julia -e 'using SweepRunner; SweepRunner.cli(ARGS)' -- …` is
@@ -38,11 +38,12 @@ usage: sweeprunner <command> <outdir> [options]
       Validate a meta config and print the stages a job would run, in order. Exit code 1 when
       it is not launchable.
 
-  jobs <meta.toml> [--submit] [--loop SECONDS]
+  jobs <meta.toml> [--submit] [--loop SECONDS] [--forget JOBID]
       Decide what to submit for the campaign in <meta.toml> from its [jobs] table, what is left
       and what the scheduler lists, and print each decision with its reason and the node-hour
       account. Nothing is submitted without --submit AND `dry_run = false` in the file.
-      --loop repeats every SECONDS until nothing is left.
+      --loop repeats every SECONDS until nothing is left. --forget marks one job of the ledger
+      as ended, by hand: for a job whose end the controller cannot see.
 
   pause | resume <outdir>
   stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS]
@@ -180,11 +181,15 @@ function _cli_jobs(io::IO, rest)
     meta = nothing
     go = false
     every = nothing
+    forget = nothing
     i = 1
     while i <= length(rest)
         a = rest[i]
         if a == "--submit"
             go = true
+        elseif a == "--forget"
+            i < length(rest) || return _cli_usage(io, "--forget needs a job id")
+            forget = rest[i += 1]
         elseif a == "--loop"
             i < length(rest) || return _cli_usage(io, "--loop needs a value")
             every = tryparse(Float64, rest[i += 1])
@@ -224,6 +229,14 @@ function _cli_jobs(io::IO, rest)
         )
     end
     ctl = JobController(_CLI_SCHEDULER[](), policy, c.outdir)
+    if forget !== nothing
+        if forget_job!(ctl, forget)
+            println(io, "job $forget is marked ended in the ledger")
+            return 0
+        end
+        println(io, "the ledger has no live job $forget")
+        return 1
+    end
     work = campaign_work(s -> (;), c)
     try
         if every === nothing
