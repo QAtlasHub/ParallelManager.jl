@@ -150,6 +150,8 @@ end
         @test starts == [0]
         @test !any(e -> e.kind == "checkpoint_unreadable", _ck_events(outdir))
         @test !isfile(_ck_file(v, k))                         # the key's own is cleaned up
+        @test !isfile(orphan)                                 # and the orphan with it
+        @test isempty(readdir(checkpoint_dir(v)))
     end
 end
 
@@ -172,23 +174,39 @@ end
 
 @testset "checkpoint_due: every checkpoint_every seconds" begin
     _ck_vault() do v, _
-        k = DataVault.keys(v)[1]
-        saved_at = Int[]
+        ks = DataVault.keys(v)
+        # What is promised is in seconds, so that is what is measured: a loaded runner makes a
+        # step longer, which only lengthens the gaps.
+        saved = Float64[]
+        span = Ref((0.0, 0.0))
         work = key -> begin
             cp = checkpoint()
+            t0 = time()
             for s in 1:12
                 sleep(0.1)
                 if checkpoint_due(cp)
                     save_checkpoint!(cp, s)
-                    push!(saved_at, s)
+                    push!(saved, time())
                 end
             end
+            span[] = (t0, time())
             return Dict{String,Any}("x" => 1)
         end
-        run!(work, v, [k]; opts=RunOpts(; checkpoint_every=0.35))
-        # 1.2 s of work with a save every 0.35 s: three saves, not twelve and not none.
-        @test 2 <= length(saved_at) <= 4
-        @test all(d -> d >= 3, diff(saved_at))
+        every = 0.35
+        run!(work, v, ks[1:1]; opts=RunOpts(; checkpoint_every=every))
+        elapsed = span[][2] - span[][1]
+        @test 1 <= length(saved) <= ceil(Int, elapsed / every) + 1
+        # `saved` is stamped after the save returned, the interval starts when it finished.
+        @test all(d -> d >= every - 0.05, diff(saved))
+        @test first(saved) - span[][1] >= every - 0.05
+
+        # The two ends, which do not depend on the clock: every step, and never.
+        empty!(saved)
+        run!(work, v, ks[2:2]; opts=RunOpts(; checkpoint_every=1e-9))
+        @test length(saved) == 12
+        empty!(saved)
+        run!(work, v, ks[3:3]; opts=RunOpts(; checkpoint_every=3600.0))
+        @test isempty(saved)
     end
 end
 

@@ -1462,8 +1462,11 @@ function _drive_workers!(
                         # Removed on purpose: not a death of the key, and not its memory.
                         :stopped
                     else
-                        pool === nothing || _pool_death!(pool, row, pid, log, stage)
                         row.deaths += 1
+                        # More memory for the next hand-out, when there is one: a key that is
+                        # given up on now is not "retried with more".
+                        (pool === nothing || row.deaths > _WORKER_DEATH_REDISPATCHES) ||
+                            _pool_death!(pool, row, pid, log, stage)
                         _after_death(row, log, stage)
                     end
                 else

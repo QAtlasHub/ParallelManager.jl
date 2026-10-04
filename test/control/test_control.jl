@@ -298,8 +298,15 @@ end
             ks = DataVault.keys(v)
             first_key = ks[1]
             sel = Dict(String(n) => val for (n, val) in first_key.params)
-            # Never looks at should_stop: only the cut can free the key before it finishes.
-            work = k -> (sleep(5.0); Dict{String,Any}("x" => 1))
+            # Never looks at should_stop: only the cut can free the key before it finishes. The
+            # unit runs for a minute, so "before it finishes" has a wide margin; the other keys
+            # are short.
+            long = ParamIO.canonical(first_key)
+            work = k -> begin
+                sleep(ParamIO.canonical(k) == long ? 60.0 : 0.1)
+                return Dict{String,Any}("x" => 1)
+            end
+            started = time()
             t = @async run!(
                 work, v, ks; opts=RunOpts(; control_interval=0.2, status_interval=0.2)
             )
@@ -318,8 +325,9 @@ end
                 sleep(0.05)
             end
             @test freed_at !== nothing
-            @test !istaskdone(t)                          # freed while the unit was still running
             r = fetch(t)
+            # Freed, and the round returned, while the unit would still have been running.
+            @test time() - started < 45
             @test !DataVault.is_done(v, first_key)        # its late result was refused
             @test r.stop == 1
             @test r.done == length(ks) - 1

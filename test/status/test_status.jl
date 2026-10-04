@@ -170,34 +170,38 @@ end
         _st_vault() do v, outdir
             ks = DataVault.keys(v)[1:2]
             advancing = ParamIO.canonical(ks[1])
+            gate = joinpath(outdir, "gate")
+            # Both keys run until the test opens the gate. One keeps reporting; the other is
+            # alive and says nothing. The threshold is 25 reports wide, so a runner that stalls
+            # for a second or two does not make the healthy key look stuck.
             work =
                 k -> begin
-                    for step in 1:10
-                        # One key keeps reporting; the other is alive and says nothing.
+                    step = 0
+                    t0 = time()
+                    while !isfile(gate) && time() - t0 < 300
+                        step += 1
                         ParamIO.canonical(k) == advancing &&
-                            SweepRunner.report_progress(step; of=10)
-                        sleep(0.3)
+                            SweepRunner.report_progress(step)
+                        sleep(0.2)
                     end
                     return Dict{String,Any}("x" => 1)
                 end
-            # Once through on other keys first: a worker's first key spends seconds compiling,
-            # which is no progress either, and not what this is about.
-            run!(work, v, DataVault.keys(v)[3:4])
-            opts = RunOpts(; status_interval=0.2, stuck_after=1.5)
+            opts = RunOpts(; status_interval=0.2, stuck_after=5.0)
             t = @async run!(work, v, ks; opts=opts)
             flagged = nothing
             t0 = time()
-            while !istaskdone(t) && time() - t0 < 120
+            while !istaskdone(t) && time() - t0 < 240
                 st = read_status(v)
                 if !isempty(st)
                     rows = [r for r in st[1]["worker_table"] if haskey(r, "stuck")]
-                    if !isempty(rows)
+                    if any(r -> r["key"] == ParamIO.canonical(ks[2]), rows)
                         flagged = (rows, st[1]["warnings"])
                         break
                     end
                 end
                 sleep(0.1)
             end
+            touch(gate)
             r = fetch(t)
             @test r.done == 2                                 # said, not cut
             @test flagged !== nothing
@@ -207,8 +211,8 @@ end
             end
             ev = [e for e in _st_events(outdir) if e.kind == "key_stuck"]
             @test [e.key for e in ev] == [ParamIO.canonical(ks[2])]   # once, and not ks[1]
-            @test only(ev).secs >= 1
-            @test only(ev).stuck_after == 1.5
+            @test only(ev).secs >= 5
+            @test only(ev).stuck_after == 5.0
             # When it ended, nothing is stuck any more.
             @test !any(w -> startswith(w, "stuck"), only(read_status(v))["warnings"])
         end

@@ -366,6 +366,10 @@ work = k -> begin
     sleep(0.2)
     return Dict{String,Any}("pid" => getpid())
 end
+# Once through the whole pipeline on a vault of its own first, so that when the gate opens
+# neither master is still compiling while the other is already in the first one's share.
+warm = DataVault.Vault(cfg; run="warm_$i", outdir=joinpath(outdir, "warm_$i"))
+run!(k -> Dict{String,Any}("x" => 1), warm, DataVault.keys(warm)[1:2]; opts=RunOpts(; control_interval=0))
 touch(joinpath(outdir, "ready_$i"))
 while !isfile(go)                       # both start their rounds together
     sleep(0.02)
@@ -394,7 +398,7 @@ write(joinpath(outdir, "result_$i"), string(r.remaining))
             ) for i in 0:1
         ]
         t0 = time()
-        while !all(i -> isfile(joinpath(outdir, "ready_$i")), 0:1) && time() - t0 < 300
+        while !all(i -> isfile(joinpath(outdir, "ready_$i")), 0:1) && time() - t0 < 180
             all(process_running, procs) || break
             sleep(0.1)
         end

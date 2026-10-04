@@ -35,6 +35,19 @@ end
 
 _pl_node(c=127, m=223.0) = PoolNode("n1", c, m)
 
+# The room a pool has left on this host once it has settled: a worker's room comes back from an
+# `@async` task after the worker is gone, so a read right after `run!` can be a moment early.
+function _pl_room(pool, cores; secs=60)
+    host = gethostname()
+    want() = cores - sum((w.size.cores for w in values(pool.workers)); init=0)
+    t0 = time()
+    while time() - t0 < secs
+        (isempty(pool.starting) && pool.free_c[host] == want()) && break
+        sleep(0.05)
+    end
+    return (; free=pool.free_c[host], want=want())
+end
+
 @testset "worker_size: threads follow the memory, or the policy" begin
     n = _pl_node()
     # 9 GB is the share of ~5 cores on a 127-core / 223 GB node: a 1-core worker would strand 4.
@@ -200,8 +213,8 @@ end
             sizes = pool_summary(pool)
             @test !isempty(sizes) && all(s -> s.workers >= 1, sizes)
             # The room in use is what the workers hold.
-            used = sum(w.size.cores for w in values(pool.workers))
-            @test pool.free_c[gethostname()] == 4 - used
+            room = _pl_room(pool, 4)
+            @test room.free == room.want
         end
     end
     @test nprocs() == 1                                           # shutdown! removed them
@@ -408,7 +421,7 @@ end
             @test count(e -> e.kind == "pool_gave_up", ev) == 1
             # Nothing is left starting, and the room is all back.
             @test isempty(pool.starting)
-            @test pool.free_c[gethostname()] == 4
+            @test _pl_room(pool, 4).free == 4
             @test all(k -> !DataVault.is_done(v, k), ks)
         end
     end
@@ -425,8 +438,8 @@ end
             @test !isempty(ev)
             @test all(e -> e.started == 1 && e.asked > 1, ev)
             # The room of the workers that did not come is back: used == what the workers hold.
-            used = sum(w.size.cores for w in values(pool.workers); init=0)
-            @test pool.free_c[gethostname()] == 4 - used
+            room = _pl_room(pool, 4)
+            @test room.free == room.want
         end
     end
 end
@@ -498,8 +511,9 @@ end
     try
         _pl_vault() do v, _
             k = DataVault.keys(v)[1]
-            # 150 s at one core, 120 s left: it only fits at two cores or more.
-            need = key -> 150.0
+            # 3000 s at one core, 2400 s left: it only fits at two cores or more. In minutes,
+            # so the time the worker takes to start and compile does not decide it.
+            need = key -> 3000.0
             work =
                 key -> Dict{String,Any}("threads" => LinearAlgebra.BLAS.get_num_threads())
             r = run!(
@@ -509,11 +523,11 @@ end
                 pool=pool,
                 load=:LinearAlgebra,
                 min_time=need,
-                opts=RunOpts(; deadline=time() + 120),
+                opts=RunOpts(; deadline=time() + 2400),
             )
             @test (r.done, r.held_back) == (1, 0)
             @test DataVault.load(v, k)["threads"] >= 2
-            @test SweepRunner._pool_min_time(pool, k, time() + 120, need) <= 75.0
+            @test SweepRunner._pool_min_time(pool, k, time() + 2400, need) <= 1500.0
         end
     finally
         shutdown!(pool)
@@ -534,7 +548,7 @@ end
             @test r.done == length(ks)
             @test isempty(pool.workers)
             @test nprocs() == 1
-            @test pool.free_c[gethostname()] == 2
+            @test _pl_room(pool, 2).free == 2
         end
     finally
         shutdown!(pool)
@@ -559,12 +573,16 @@ end
             # Both sizes ran, which the node cannot hold at once.
             spawned = [e for e in ev if e.kind == "pool_spawn"]
             @test Set(e.cores for e in spawned) == Set([1, 4])
-            # No key was running on a worker when it was retired.
-            lost = [e for e in ev if e.kind in ("worker_lost", "key_requeued")]
-            @test isempty(lost)
+            # No key was running on a worker when it was retired: a key whose worker goes is
+            # recorded as an attempt spent (`worker_died`) and handed out again, so it would
+            # have been acquired twice.
+            @test !any(e -> e.kind == "key_spent", ev)
+            @test !any(e -> e.kind == "worker_lost", ev)
+            acquired = [e.key for e in ev if e.kind == "key_acquired"]
+            @test sort(acquired) == sort(ParamIO.canonical.(ks))
             # The room is what the remaining workers hold: retiring gave it back.
-            used = sum((w.size.cores for w in values(pool.workers)); init=0)
-            @test pool.free_c[gethostname()] == 4 - used
+            room = _pl_room(pool, 4)
+            @test room.free == room.want
         end
     end
 end
@@ -574,13 +592,15 @@ end
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
             nbig = count(k -> k.params["N"] == 8, ks)
-            need = k -> k.params["N"] == 8 ? 1000.0 : 0.01
+            # Far apart, so that the time workers take to start on a loaded runner decides
+            # nothing: a day needed, fifteen minutes left.
+            need = k -> k.params["N"] == 8 ? 86400.0 : 0.01
             r = run!(
                 k -> Dict{String,Any}("x" => 1),
                 v,
                 ks;
                 pool=pool,
-                opts=RunOpts(; deadline_in=60),
+                opts=RunOpts(; deadline_in=900),
                 min_time=need,
             )
             @test r.held_back == nbig
@@ -594,8 +614,9 @@ end
 end
 
 @testset "a key that always kills its worker is given up on, in bounded starts and memory (#111)" begin
-    # One node of 4 cores and 8 GB; the key asks for 1 GB and doubles after each death.
-    _pl_pool(; key_req=k -> KeyReq(1, 1.0), mem_growth=2.0) do pool
+    # One node of 4 cores and 8 GB; the key asks for 3 GB and doubles after each death: 3, 6,
+    # and then the 8 the node has, not 12.
+    _pl_pool(; key_req=k -> KeyReq(1, 3.0), mem_growth=2.0) do pool
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)[1:2]
             bad = ParamIO.canonical(ks[1])
@@ -612,17 +633,21 @@ end
             @test !DataVault.is_running(v, ks[1])               # its lock did not stay behind
             ev = _pl_events(outdir)
             # It took down a bounded number of workers...
-            deaths = SweepRunner._WORKER_DEATH_REDISPATCHES + 1
-            started = sum(e.n for e in ev if e.kind == "pool_spawn")
-            @test started <= deaths + 2                         # and one for the good key
-            # ...and what it was given never passed what the node has.
+            again = SweepRunner._WORKER_DEATH_REDISPATCHES
+            died = [e for e in ev if e.kind == "key_spent" && e.outcome == "worker_died"]
+            @test length(died) == again + 1
+            @test all(e -> e.key == bad, died)
+            # ...was given more memory each time it was handed out again, up to what the node
+            # has and not past it.
             retries = [e for e in ev if e.kind == "pool_retry_mem"]
-            @test length(retries) <= deaths
-            @test all(e -> e.next_gb <= 8.0, retries)
+            @test length(retries) == again
+            @test [e.had_gb for e in retries] == [3.0, 6.0]
+            @test [e.next_gb for e in retries] == [6.0, 8.0]
             @test all(e -> e.mem_gb <= 8.0, [e for e in ev if e.kind == "pool_spawn"])
+            @test sum(e.n for e in ev if e.kind == "pool_spawn") <= again + 3
             # The room of every worker that died came back.
-            used = sum((w.size.cores for w in values(pool.workers)); init=0)
-            @test pool.free_c[gethostname()] == 4 - used
+            room = _pl_room(pool, 4)
+            @test room.free == room.want
             @test pool.free_m[gethostname()] ≈
                 8.0 - sum((w.size.mem_gb for w in values(pool.workers)); init=0.0)
         end
