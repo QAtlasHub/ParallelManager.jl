@@ -68,15 +68,27 @@ function load_checkpoint(cp::Checkpoint)
     ctx === nothing && return nothing
     path = _checkpoint_file(ctx.vault, ctx.kstr)
     isfile(path) || return nothing
+    # A file that cannot be OPENED is not a file that is damaged: a read that fails on a network
+    # file system would otherwise set a good checkpoint aside. It is tried again, and if it
+    # stays unreadable the attempt fails (and is retried) rather than starting over on top of it.
+    _can_read(path) || error(
+        "the checkpoint of $(ctx.kstr) is there and cannot be opened ($path); " *
+        "not starting over on top of it",
+    )
     try
         # `jldopen` rather than `load`: the latter prints its own error report before throwing.
         return JLD2.jldopen(f -> f["state"], path, "r")
     catch e
         e isa InterruptException && rethrow()
-        # Starting over is correct; saying nothing and letting the next save overwrite a file
-        # that might have been recoverable is not. It is kept aside and reported.
+        # It opens and does not parse. Starting over is correct; saying nothing and letting the
+        # next save overwrite a file that might have been recoverable is not. It is kept aside
+        # and reported — one such file per key: an older one is replaced.
         aside = string(path, ".unreadable.", round(Int, time()))
         kept = try
+            for f in readdir(dirname(path))
+                startswith(f, basename(path) * ".unreadable.") &&
+                    rm(joinpath(dirname(path), f); force=true)
+            end
             mv(path, aside; force=true)
             aside
         catch
@@ -107,7 +119,7 @@ status, the lock listing and the account read: "alive and advancing", and how mu
 kept when it was cut. Without `step` the stamp counts the saves.
 
 A unit that no longer holds its key (cut after a stop's grace, or reclaimed) does not save: the
-call throws [`StopRequested`](@ref), so the unit leaves and the checkpoint of whoever holds the
+call throws [`LockLost`](@ref), so the unit leaves and the checkpoint of whoever holds the
 key now is not replaced by older state.
 
 Returns `false` and does nothing outside a `run!`. A save that fails throws: a `work_fn` that
@@ -120,8 +132,10 @@ function save_checkpoint!(
     ctx === nothing && return false
     c = ctx.cp
     # The key is no longer this unit's: its state must not replace the new owner's checkpoint,
-    # and it has nothing left to compute for. It leaves here, as at a stop.
-    _still_owner(ctx) || throw(StopRequested())
+    # and it has nothing left to compute for. It leaves here — as a lost lock, which is what it
+    # is, not as a stop nobody asked for. Only on a positive answer (see `_lock_state`).
+    own = _ownership(ctx)
+    own.state === :lost && throw(LockLost(own.holder))
     path = _checkpoint_file(ctx.vault, ctx.kstr)
     mkpath(dirname(path))
     # The extension stays `.jld2`: JLD2 picks its format from it.
@@ -168,6 +182,21 @@ function checkpoint_due(cp::Checkpoint)::Bool
     if d !== nothing && now >= d - min(every > 0 ? every : 60.0, 60.0)
         c.near = true
         c.near_saved || return true
+    end
+    return false
+end
+
+# Can the first bytes of `path` be read? Tried a few times: the question is whether the file can
+# be opened at all, not what is in it.
+function _can_read(path::AbstractString; tries::Int=3)
+    for i in 1:tries
+        try
+            open(io -> read(io, 8), path, "r")
+            return true
+        catch e
+            e isa InterruptException && rethrow()
+            i < tries && sleep(0.05 * i)
+        end
     end
     return false
 end
