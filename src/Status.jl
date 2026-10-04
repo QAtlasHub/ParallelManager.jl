@@ -255,7 +255,9 @@ function status_snapshot(m::Master)
             "idle" => length(joined) - busy,
             "cores_busy" => cores_busy,
             "cores_joined" => cores_joined,
-            "cores_allocated" => alloc_cores == 0 ? cores_joined : alloc_cores,
+            # `nothing`: the allocation could not be read. Shown as the joined cores it was a
+            # job at 100% whatever it was using.
+            "cores_allocated" => alloc_cores == 0 ? nothing : alloc_cores,
         ),
         "nodes" => nodelist,
         "nodes_without_workers" => empty_nodes,
@@ -396,6 +398,65 @@ function _check_short!(m::Master, log::EventLog)
     return nothing
 end
 
+# How long cores may sit unused, with keys queued, before it is said.
+const _LOW_UTIL_AFTER = Ref(600.0)
+
+# The failure this status exists for: a job using a fraction of the cores it is charged for,
+# with work waiting, and no message. Busy cores against ALLOCATED cores — not against the
+# workers that happened to start, which is what `workers_short` compares.
+function _check_utilisation!(m::Master, log::EventLog)
+    filter!(w -> !startswith(w, "low_utilisation"), m.warnings)
+    (m.min_utilisation > 0 && m.table !== nothing && m.multi) || return nothing
+    alloc = _slurm_alloc_cores()
+    alloc == 0 && return nothing                    # not known: nothing to compare with
+    table = m.table
+    queued, on = lock(table.lock) do
+        q = count(r -> r.state === :todo, table.rows)
+        return q, Set(r.worker for r in table.rows if r.state === :running)
+    end
+    who = lock(() -> copy(m.who), m.lock)
+    joined = [p for p in workers() if haskey(who, p)]
+    cores_joined = sum((who[p].cores for p in joined); init=0)
+    cores_busy = sum((who[p].cores for p in joined if p in on); init=0)
+    if queued == 0 || cores_busy >= m.min_utilisation * alloc
+        m.low_since = 0.0
+        return nothing
+    end
+    m.low_since == 0.0 && (m.low_since = time())
+    lasted = time() - m.low_since
+    lasted >= _LOW_UTIL_AFTER[] || return nothing
+    planned, launched, _ = lock(() -> _SPAWN[], _SPAWN_LOCK)
+    why = if cores_joined < m.min_utilisation * alloc
+        "workers cover $cores_joined of $alloc allocated cores " *
+        "(planned $planned, launched $launched, joined $(length(joined)))"
+    else
+        "$(cores_joined - cores_busy) cores have a worker with no key, while $queued keys " *
+        "are queued (no worker fits them, or they are held)"
+    end
+    push!(
+        m.warnings,
+        "low_utilisation: $cores_busy of $alloc allocated cores busy for " *
+        "$(round(Int, lasted)) s with $queued keys queued — $why",
+    )
+    # Said when it starts and again every ten minutes it lasts.
+    if time() - m.low_said >= 600
+        m.low_said = time()
+        log_event(
+            log,
+            :low_utilisation;
+            level=:warn,
+            stage=m.stage,
+            cores_busy=cores_busy,
+            cores_joined=cores_joined,
+            cores_allocated=alloc,
+            queued=queued,
+            secs=round(Int, lasted),
+            why=why,
+        )
+    end
+    return nothing
+end
+
 # A key that is running and has not advanced for `stuck_after` is said, once per key: the event,
 # and a line in the status warnings for as long as it lasts. Nothing is cut.
 function _check_stuck!(m::Master, log::EventLog)
@@ -467,6 +528,7 @@ function status_tick!(m::Master, log::EventLog)
             return lock(() -> (empty!(m.progress); merge!(m.progress, p)), m.lock)
         end,
         () -> _check_stuck!(m, log),
+        () -> _check_utilisation!(m, log),
         () -> _check_short!(m, log),
     )
     for step in steps
@@ -568,7 +630,7 @@ Works from any process that can read the directory, while the job runs or after 
 read_status(vault::Vault) = _read_status_files(_vault_status_files(vault))
 read_status(outdir::AbstractString) = _read_status_files(_status_files(outdir))
 
-_pct(a, b) = b == 0 ? "-" : string(round(Int, 100 * a / b), "%")
+_pct(a, b) = (b === nothing || b == 0) ? "-" : string(round(Int, 100 * a / b), "%")
 
 """
     print_status([io], vault_or_outdir; workers=false)
@@ -590,6 +652,10 @@ function print_status(io::IO, x; workers::Bool=false)
         job = isempty(d["job"]) ? "" : " job $(d["job"])"
         age = round(Int, d["age"])
         println(io, d["stage"], "  ", d["master"], job, "  ", state, "  updated $age s ago")
+        # What is wrong goes first, not after the tables.
+        for msg in d["warnings"]
+            println(io, "  ! ", msg)
+        end
         t = d["tasks"]
         println(
             io,
@@ -604,7 +670,13 @@ function print_status(io::IO, x; workers::Bool=false)
         )
         println(
             io,
-            "  cores    busy $(w["cores_busy"]) of $(w["cores_allocated"]) allocated ",
+            "  cores    busy $(w["cores_busy"]) of ",
+            if w["cores_allocated"] === nothing
+                "? (allocation not known)"
+            else
+                w["cores_allocated"]
+            end,
+            " allocated, $(w["cores_joined"]) with a worker ",
             "($(_pct(w["cores_busy"], w["cores_allocated"])))",
         )
         lk = get(d, "locks", Dict{String,Any}())
@@ -631,9 +703,6 @@ function print_status(io::IO, x; workers::Bool=false)
         isempty(none) || println(
             io, "  nodes    $(length(none)) allocated with no worker: ", join(none, " ")
         )
-        for msg in d["warnings"]
-            println(io, "  ! ", msg)
-        end
         if !isempty(d["nodes"])
             println(io, "  node                 workers  busy  cores   cpu")
             for n in d["nodes"]

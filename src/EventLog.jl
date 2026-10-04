@@ -217,6 +217,7 @@ function log_event(log::EventLog, kind::Symbol; level::Symbol=:info, kwargs...)
     # decision); it is NOT written into the JSON — the `kind` already implies it.
     _level_value(level) < log.min_level && return nothing
     rec = (; ts=string(now()), kind=String(kind), kwargs...)
+    _level_value(level) >= 30 && _note_warning(kind, rec)
     # Build the full line with newline so a single `write` is one atomic
     # append on POSIX (given `O_APPEND` and size < PIPE_BUF).
     line = string(JSON3.write(rec), '\n')
@@ -238,6 +239,54 @@ function log_event(log::EventLog, kind::Symbol; level::Symbol=:info, kwargs...)
         end
     end
     return nothing
+end
+
+# ── warnings a person sees without opening the file ─────────────────────────────────────────────
+
+# kind => how many warn-level (or worse) events this process has logged.
+const _WARNINGS = Dict{String,Int}()
+const _WARNINGS_LOCK = ReentrantLock()
+# Where they are echoed: the master's stderr by default; `nothing` turns the echo off.
+const _WARNING_IO = Ref{Any}(:stderr)
+
+"""
+    echo_warnings!(io_or_nothing)
+
+Where warn-level events are also printed, beside the event file: an `IO`, `:stderr` (the default)
+or `nothing` for nowhere. Rate-limited per kind — the first of a kind, then every hundredth, with
+the count — so it is a line a person sees in the job's output, not a second log. Only the master
+process echoes (`SWEEPRUNNER_QUIET_WARNINGS=1` turns it off from the environment).
+"""
+echo_warnings!(io) = (_WARNING_IO[]=io; nothing)
+
+function _note_warning(kind::Symbol, rec)
+    n = lock(_WARNINGS_LOCK) do
+        return _WARNINGS[String(kind)] = get(_WARNINGS, String(kind), 0) + 1
+    end
+    (n == 1 || n % 100 == 0) || return nothing
+    sink = _WARNING_IO[]
+    sink === nothing && return nothing
+    (Distributed.myid() == 1 && get(ENV, "SWEEPRUNNER_QUIET_WARNINGS", "") != "1") ||
+        return nothing
+    io = sink === :stderr ? stderr : sink
+    try
+        fields = join(
+            ("$(k)=$(v)" for (k, v) in pairs(rec) if !(k in (:ts, :kind)) && v !== nothing),
+            " ",
+        )
+        text = length(fields) > 300 ? first(fields, 300) * " …" : fields
+        times = n == 1 ? "" : " (×$n so far)"
+        println(io, "sweeprunner warning: ", kind, times, "  ", text)
+    catch
+    end
+    return nothing
+end
+
+# A copy of the counts, and what was added since `before`: for a round's summary.
+warning_counts() = lock(() -> copy(_WARNINGS), _WARNINGS_LOCK)
+function _warnings_since(before::AbstractDict)
+    now = warning_counts()
+    return Dict(k => v - get(before, k, 0) for (k, v) in now if v > get(before, k, 0))
 end
 
 """

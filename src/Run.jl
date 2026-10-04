@@ -23,7 +23,7 @@ using ParamIO: DataKey, canonical
              defer_poll=30.0, status_interval=60.0, control_interval=10.0,
              min_busy_fraction=0.0, idle_grace=600.0, checkpoint_every=600.0,
              stop_grace=Inf, shard=<env>, order=:given, manifest_interval=300.0,
-             stuck_after=0.0)
+             stuck_after=0.0, min_utilisation=0.5)
 
 Execution options for [`run!`](@ref).
 
@@ -131,6 +131,13 @@ The numbers are checked when the options are built: `max_attempts >= 1`; `stale_
   is cut — a heartbeat only shows the process is alive, and this is the missing half, "alive
   and not advancing", left for a person or a [`control!`](@ref) request to act on. Set it above
   the longest step your `work_fn` takes between two reports. `0` (the default) never says it.
+- `min_utilisation::Float64 = 0.5` — the alarm for a job that uses a fraction of what it is
+  charged for. When fewer than this fraction of the ALLOCATED cores (`SLURM_JOB_CPUS_PER_NODE`)
+  have a key, with keys queued, for ten minutes, the master says so: a `low_utilisation` warning
+  in the event log and on its stderr, and a line at the top of the status, with the reason it
+  can see (workers cover only part of the allocation; or workers idle with keys nobody fits).
+  Nothing is stopped. `0` turns it off; outside a Slurm job the allocation is not known and
+  nothing is compared.
 
 # Example
 
@@ -159,6 +166,7 @@ struct RunOpts
     order::Symbol
     manifest_interval::Float64
     stuck_after::Float64
+    min_utilisation::Float64
 end
 
 # `time()` was past this in 2001: an absolute deadline below it was meant as a duration.
@@ -184,6 +192,7 @@ function RunOpts(;
     order::Symbol=:given,
     manifest_interval::Real=300.0,
     stuck_after::Real=0.0,
+    min_utilisation::Real=0.5,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -229,6 +238,12 @@ function RunOpts(;
         x >= 0 ||
             throw(ArgumentError("RunOpts: $name must be >= 0 seconds (0: off), got $x"))
     end
+    0 <= min_utilisation <= 1 || throw(
+        ArgumentError(
+            "RunOpts: min_utilisation is a fraction of the allocated cores, in [0, 1]; got " *
+            "$min_utilisation",
+        ),
+    )
     0 <= min_busy_fraction <= 1 || throw(
         ArgumentError(
             "RunOpts: min_busy_fraction is a fraction of the workers, in [0, 1]; got " *
@@ -281,6 +296,7 @@ function RunOpts(;
         order,
         Float64(manifest_interval),
         Float64(stuck_after),
+        Float64(min_utilisation),
     )
 end
 
@@ -328,6 +344,22 @@ function _stop_outcome(reason::Symbol)::Symbol
     reason === :request && return :stop_request
     reason === :underused && return :stop_request      # the master asked, of itself
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
+end
+
+# The round's warnings in one line on the master's stderr, where a person reading the job's
+# output sees them without opening the event file.
+function _say_warnings(stage::Symbol, counts::AbstractDict)
+    isempty(counts) && return nothing
+    sink = _WARNING_IO[]
+    (sink === nothing || get(ENV, "SWEEPRUNNER_QUIET_WARNINGS", "") == "1") &&
+        return nothing
+    io = sink === :stderr ? stderr : sink
+    parts = ["$k ×$(counts[k])" for k in sort!(collect(keys(counts)))]
+    try
+        println(io, "sweeprunner: stage $stage ended with warnings: ", join(parts, ", "))
+    catch
+    end
+    return nothing
 end
 
 # The ticker's steps: how often a failing one is said again, and how many failures in a row end
@@ -550,6 +582,8 @@ function run!(
     master.multi = multi
     master.interval = opts.status_interval
     master.stuck_after = opts.stuck_after
+    master.min_utilisation = opts.min_utilisation
+    warned0 = warning_counts()
     spawn === nothing || (master.ctl.spawn = spawn)
     after = own ? :ended : :waiting
     # Requests made while no round was running (between rounds, or just before this call), and
@@ -842,7 +876,10 @@ function run!(
         manifest_secs=round(manifest_secs[] + (time() - t_manifest); digits=3),
         dispatch_secs=round(t_manifest - t_dispatch; digits=3),
         total_secs=round(time() - t_run; digits=3),
+        # The warn-level events of this round on this process, by kind.
+        warnings=_warnings_since(warned0),
     )
+    _say_warnings(stage, _warnings_since(warned0))
     # Said once, with the count: the keys this job did not start because they could not get
     # anywhere before its deadline.
     n_held_back > 0 && log_event(
