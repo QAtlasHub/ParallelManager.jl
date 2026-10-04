@@ -513,8 +513,8 @@ function remaining_work(
                 eligible=length(elig),
                 cost=cost === nothing ? NaN : sum(costs; init=0.0),
                 longest=cost === nothing ? NaN : maximum(costs; init=0.0),
-                # Keys the cost hook has no answer for: in `eligible` only when no limit applies,
-                # and not in `cost`.
+                # Keys the cost hook has no answer for: not in `cost`. Under `max_key_time` one
+                # of them per stage is in `eligible` (to be measured); without a limit, all.
                 unknown=cost === nothing ? 0 : length(elig) - length(costs),
                 blocked_by=String[n for n in s.needs if !isempty(look(n))],
             ),
@@ -569,7 +569,8 @@ Per stage:
   started and the result says which; running it would spend the allocation on keys whose inputs
   are known to be missing;
 - with a profile that sets `max_key_time`, only the keys with `cost(stage, key) <= max_key_time`
-  are run (`cost` returns seconds);
+  are run (`cost` returns seconds), plus one key per stage whose cost is not known, so that a
+  stage nobody has measured is not "nothing to run" in every job;
 - `loop` is passed to `run_loop!` as keyword arguments (`max_empty_rounds`, `idle_sleep`, …).
 
 With `reload=true` the meta file is re-read between stages when it has changed, so an edit to
@@ -726,7 +727,9 @@ function run_campaign!(
                 result=r,
             ),
         )
-        if r.stopped_by !== nothing
+        # `:cost_unknown` is this stage's affair (keys nobody could give a time for): the job
+        # has time left, and the stages after it run.
+        if r.stopped_by !== nothing && r.stopped_by !== :cost_unknown
             stopped = r.stopped_by
             break
         end

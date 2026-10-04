@@ -575,7 +575,7 @@ total, remaining, stopped_by)`. `cancelled` counts the keys a request took out o
 `collisions` the keys that were handed to a worker and came back because another master took
 them first; `total` includes the
 keys a request added; `remaining` is how many keys are not done after the round (`0`: the sweep
-is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, `:underused`, or `nothing`: a stage that finished every key reports `nothing` even if the
+is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, `:underused`, or `nothing` (`run_loop!` adds `:cost_unknown`: the keys left were all held back because nobody could say how long they take): a stage that finished every key reports `nothing` even if the
 deadline passed while its last key ran, since no key was ever held back by it.
 The full-done early exit returns the same field set rather than a shorter one.
 
@@ -666,6 +666,8 @@ function run!(
             stop=0,
             cancelled=0,
             held_back=0,
+            cost_unknown=0,
+            explore_again=0,
             collisions=0,
             skipped=length(keys),
             total=length(keys),
@@ -719,6 +721,9 @@ function run!(
     # it has no answer for is treated one way: see `_fits`.
     cost = _default_cost(vault, cost, key_class, todo, log, stage)
     _say_ignored(log, stage, opts, cost; pool=pool, affinity=affinity, spawn=spawn)
+    # A hook that throws is said — here, whatever the options: the ordering, the pool's sizing
+    # and the campaign's filter ask it too, and there its error only read as "unknown".
+    _say_hook_error(log, stage, something(min_time, cost, Some(nothing)), todo)
     todo = _ordered(todo, opts, cost)
     t_scan = time()
     # Whether a key can still get somewhere before the deadline; asked at each hand-out.
@@ -744,6 +749,7 @@ function run!(
         need_time;
         class=k -> _class_of(key_class, k),
         explored=master.explored,
+        avoid=master.explore_failed,
         unknown=unknown_keys,
         classes=unknown_classes,
         on_explore=(class, kstr) -> log_event(
@@ -755,8 +761,15 @@ function run!(
             key=kstr,
             why="its time is not known; one key of the class is started to measure it",
         ),
-        on_error=err ->
-            log_event(log, :cost_hook_failed; level=:warn, stage=stage, err=err),
+        # A hook that throws was said by `_say_hook_error` before the queue was ordered.
+        on_cap=n -> log_event(
+            log,
+            :cost_explore_capped;
+            level=:warn,
+            stage=stage,
+            max=n,
+            why="more classes of unknown cost than are explored in one round; the rest wait",
+        ),
     )
     table = TaskTable(todo; affinity=multi ? affinity : nothing)
     table_ref[] = table
@@ -908,6 +921,16 @@ function run!(
     t_manifest = time()
     merge_and_save_manifest!(m)
 
+    explore_again = _unexplore!(master.explored, table, master.explore_failed)
+    # The cost table at the end of EVERY round, not only on the manifest's timer: the next
+    # round reads it, and a class explored in this one has to be known to that one — else the
+    # siblings were held back again and the loop took it for the deadline.
+    try
+        write_cost_table(vault)
+    catch e
+        e isa InterruptException && rethrow()
+        log_event(log, :cost_table_failed; level=:warn, stage=stage, err=_short_err(e))
+    end
     # From what the round actually did, so a stage that finished every key is not attributed to a
     # deadline that passed while the last one ran.
     stopped_by = stop_seen
@@ -963,6 +986,9 @@ function run!(
         stop=n_stop,
         cancelled=n_cancelled,
         held_back=n_held_back,
+        cost_unknown=length(unknown_keys),
+        # Classes whose explored key did not finish: the next round explores them again.
+        explore_again=explore_again,
         collisions=master.collisions - collisions0,
         skipped=length(keys) - length(todo),
         # What the manifest already had, plus every row of the table: the keys a request added
@@ -2421,8 +2447,14 @@ function _run_loop!(
         result.remaining == 0 && break
         # Nothing was done, nobody else holds anything, and what is left was held back: no key
         # that remains can get anywhere before the deadline. Idle rounds would not change that.
-        if result.done == 0 && result.busy == 0 && result.held_back > 0
-            stopped = :deadline
+        if result.done == 0 &&
+            result.busy == 0 &&
+            result.held_back > 0 &&
+            result.explore_again == 0
+            # Held for the deadline, or held because nobody knows how long they take: two
+            # things. The second is not the job running out of time, and a campaign goes on to
+            # its next stage after it.
+            stopped = result.cost_unknown == result.held_back ? :cost_unknown : :deadline
             break
         end
         if result.done > 0
@@ -2430,6 +2462,9 @@ function _run_loop!(
             busy_waited = 0.0
             continue
         end
+        # A class is to be explored again with another key: not an empty round. (Bounded: a
+        # key that failed its exploration is not chosen again.)
+        result.explore_again > 0 && continue
         # A round that completed nothing but found keys held by a SIBLING is not an empty round:
         # either that sibling finishes them, or it is dead and `acquire_running!` reclaims them
         # once its heartbeat passes `stale_after`. Counting it as empty is what made a follow-on
@@ -2587,6 +2622,39 @@ function _say_ignored(
     return nothing
 end
 
+# How many classes of unknown cost are explored in one round.
+const _EXPLORE_MAX = Ref(8)
+
+# Ask the cost hook about the first queued key, to say an error it throws: once, with what it
+# threw. (Later calls go through `key_seconds`, which turns a throw into "unknown".)
+function _say_hook_error(log::EventLog, stage::Symbol, hook, todo)
+    (hook === nothing || isempty(todo)) && return nothing
+    failure = Ref{Any}(nothing)
+    key_seconds(hook, first(todo); failure=failure)
+    failure[] === nothing || log_event(
+        log, :cost_hook_failed; level=:warn, stage=stage, err=_short_err(failure[])
+    )
+    return nothing
+end
+
+# After a round: a class whose explored key did not finish — it was busy elsewhere, cancelled,
+# failed, lost its worker — has not been measured, and is explored again with another key.
+# (Set when the key was ASKED about, the mark stayed for the rest of the job, and every other
+# key of the class was held back in every later round.)
+function _unexplore!(explored::AbstractDict, table::TaskTable, failed::AbstractSet)
+    freed = 0
+    for (class, kstr) in collect(explored)
+        i = get(table.index, kstr, 0)
+        i == 0 && continue                       # not of this round's keys: left as it is
+        o = table.rows[i].outcome
+        (o === :ok || o === :already_done) && continue
+        delete!(explored, class)
+        push!(failed, kstr)                     # another key of the class next time, not this
+        freed += 1
+    end
+    return freed
+end
+
 # `key -> Bool`: can this key still get somewhere before the deadline? Always, without one.
 #
 # One rule for a key whose time is NOT KNOWN (the hook has no answer, answers NaN, or throws):
@@ -2600,14 +2668,18 @@ function _fits(
     need;
     class=key -> "",
     explored::AbstractDict=Dict{String,String}(),
+    avoid::AbstractSet=Set{String}(),
     unknown::AbstractSet=Set{String}(),
     classes::AbstractSet=Set{String}(),
     on_explore=(class, kstr) -> nothing,
     on_error=err -> nothing,
+    on_cap=n -> nothing,
 )
     d = opts.deadline
     d === nothing && return Returns(true)
     said_error = Ref(false)
+    explored_now = Ref(0)
+    capped = Ref(false)
     return key -> begin
         failure = Ref{Any}(nothing)
         t = key_seconds(need, key; failure=failure)
@@ -2620,10 +2692,17 @@ function _fits(
         c = String(class(key))
         kstr = canonical(key)
         chosen = get(explored, c, nothing)
-        if chosen === nothing
-            explored[c] = kstr
-            on_explore(c, kstr)
-            return true
+        if chosen === nothing && !(kstr in avoid)
+            # A bound per round: with a `key_class` so fine that nearly every key is the first
+            # of its class, exploring would be the deadline check switched off.
+            if explored_now[] >= _EXPLORE_MAX[]
+                capped[] || (capped[]=true; on_cap(_EXPLORE_MAX[]))
+            else
+                explored_now[] += 1
+                explored[c] = kstr
+                on_explore(c, kstr)
+                return true
+            end
         end
         chosen == kstr && return true            # asked again about the one that was chosen
         push!(unknown, kstr)

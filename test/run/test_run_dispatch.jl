@@ -256,13 +256,14 @@ end
     end
 end
 
-@testset "a class that was never measured is explored: one key per class per job (#136)" begin
+@testset "a class that was never measured is explored with one key, and its siblings run once it is known (#136, #156)" begin
     _dp_vault() do v, outdir
         ks = DataVault.keys(v)                                   # two classes: L = 8 and 16
         class = k -> string("L", ParamIO.param(k, "L"))
-        # The caller's hook knows L=8 and has nothing for L=16.
+        # The caller's hook knows L=8 and has nothing for L=16; the table this package measures
+        # fills in what has run.
         cost = k -> ParamIO.param(k, "L") == 8 ? 0.01 : NaN
-        n8 = count(k -> ParamIO.param(k, "L") == 8, ks)
+        n16 = count(k -> ParamIO.param(k, "L") == 16, ks)
         ran = String[]
         r = run_loop!(
             _dp_rec(ran),
@@ -275,17 +276,84 @@ end
         )
         by = Dict(ParamIO.canonical(k) => k for k in ks)
         ran16 = [k for k in ran if ParamIO.param(by[k], "L") == 16]
-        # Every measured key ran, and exactly one of the class nobody has a time for — not none
-        # (held back in every job) and not all (assumed to fit). Once per JOB, not per round.
-        @test count(k -> ParamIO.param(by[k], "L") == 8, ran) == n8
-        @test length(ran16) == 1
         ev = _dp_events(outdir)
+        # One key of the unknown class was started to measure it, in the first round...
         ex = only([e for e in ev if e.kind == "cost_explore"])
-        @test ex.class == "L16" && ex.key == only(ran16)
-        held = [e for e in ev if e.kind == "held_back"]
-        @test !isempty(held)
-        @test all(e -> e.classes_unknown == ["L16"], held)
-        @test r.stopped_by === :deadline
+        @test ex.class == "L16" && ex.key == first(ran16)
+        first_round = first([e for e in ev if e.kind == "stage_done"])
+        @test first_round.held_back == n16 - 1
+        # ...the table was written when that round ended, so the next one knew the class and
+        # ran its siblings: not held back again and taken for the deadline (#156).
+        @test length(ran16) == n16
+        @test (r.done, r.remaining) == (length(ks), 0)
+        @test r.stopped_by === nothing
+    end
+end
+
+@testset "a class whose explored key did not finish is explored again; what is left is not a deadline stop (#156)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:3]
+        first_key = ParamIO.canonical(ks[1])
+        ran = String[]
+        work = k -> begin
+            push!(ran, ParamIO.canonical(k))
+            ParamIO.canonical(k) == first_key && error("the explored key fails")
+            return Dict{String,Any}("x" => 1)
+        end
+        # A hook with no answer for any key, and no table to learn from: one class, unknown.
+        r = run_loop!(
+            work,
+            v,
+            ks;
+            opts=_dp_quiet(; deadline=time() + 600, max_attempts=1),
+            min_time=k -> NaN,
+            idle_sleep=0.05,
+            max_empty_rounds=1,
+        )
+        ev = _dp_events(outdir)
+        explored = [e.key for e in ev if e.kind == "cost_explore"]
+        # The first choice failed, so another key of the class was chosen — not every other
+        # key held back for the rest of the job.
+        @test explored[1] == first_key
+        @test length(explored) >= 2 && explored[2] != first_key
+        @test r.done >= 1
+        # What remains was held back for want of a cost, and that is what the loop says.
+        @test r.stopped_by === :cost_unknown
+        last_round = last([e for e in ev if e.kind == "stage_done"])
+        @test last_round.held_back >= 1
+    end
+end
+
+@testset "a cost hook that throws is said whatever the options, and exploring is bounded per round (#156)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:2]
+        # No deadline: the fit check is not even built.
+        run!(
+            _dp_rec(String[]),
+            v,
+            ks;
+            opts=_dp_quiet(; order=:longest_first),
+            cost=k -> error("no model"),
+        )
+        failed = only([e for e in _dp_events(outdir) if e.kind == "cost_hook_failed"])
+        @test occursin("no model", failed.err)
+    end
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)
+        # Every key its own class, none of them known: at most `_EXPLORE_MAX` are started.
+        ran = String[]
+        r = run!(
+            _dp_rec(ran),
+            v,
+            ks;
+            opts=_dp_quiet(; deadline=time() + 600),
+            cost=k -> NaN,
+            key_class=k -> ParamIO.canonical(k),
+        )
+        @test length(ran) == SweepRunner._EXPLORE_MAX[]
+        @test r.held_back == length(ks) - SweepRunner._EXPLORE_MAX[]
+        @test r.cost_unknown == r.held_back
+        @test count(e -> e.kind == "cost_explore_capped", _dp_events(outdir)) == 1
     end
 end
 
@@ -299,6 +367,87 @@ end
         @test first(order) == unknown
         @test order[2:end] ==
             [ParamIO.canonical(k) for k in ks if ParamIO.canonical(k) != unknown]
+    end
+end
+
+@testset "a key that has shown it checkpoints needs only the time to its next one (#114)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:4]
+        whole = k -> 1000.0                                  # every key is longer than the job
+        # The first key keeps a checkpoint and is cut; the second never ran.
+        work1 = k -> begin
+            save_checkpoint!(SweepRunner.checkpoint(), 1; step=1, of=3)
+            error("cut")
+        end
+        run!(work1, v, ks[1:1]; opts=_dp_quiet(; max_attempts=1))
+        ran = String[]
+        r = run!(
+            _dp_rec(ran),
+            v,
+            ks;
+            opts=_dp_quiet(; deadline=time() + 120, checkpoint_every=30.0),
+            cost=whole,
+        )
+        # 30 s to its next checkpoint fits in 120 s; 1000 s for a key with no record does not.
+        @test ran == [ParamIO.canonical(ks[1])]
+        @test (r.done, r.held_back) == (1, 3)
+        # With an explicit min_time the caller's answer stands.
+        ran2 = String[]
+        r = run!(
+            _dp_rec(ran2),
+            v,
+            ks;
+            opts=_dp_quiet(; deadline=time() + 120, checkpoint_every=30.0),
+            cost=whole,
+            min_time=k -> 1.0,
+        )
+        @test r.done == 3
+    end
+end
+
+@testset "options the round does not act on are said (#114)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:2]
+        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(; order=:longest_first))
+        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
+        @test [e.option for e in ev] == ["order=:longest_first"]
+    end
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:2]
+        run!(
+            _dp_rec(String[]),
+            v,
+            ks;
+            opts=_dp_quiet(; workers=:sequential),
+            affinity=k -> 1,
+            spawn=n -> nothing,
+        )
+        ev = [e for e in _dp_events(outdir) if e.kind == "option_ignored"]
+        @test Set(e.option for e in ev) == Set(["affinity", "spawn"])
+    end
+    _dp_vault() do v, outdir
+        # Nothing asked for, nothing said; and a cost makes the order real.
+        ks = DataVault.keys(v)[1:2]
+        run!(
+            _dp_rec(String[]), v, ks; opts=_dp_quiet(; order=:longest_first), cost=k -> 1.0
+        )
+        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(), affinity=k -> 1)
+        @test !any(e -> e.kind == "option_ignored", _dp_events(outdir))
+    end
+end
+
+@testset "run_loop! returns the collisions of all its rounds (#114)" begin
+    _dp_vault() do v, _
+        ks = DataVault.keys(v)[1:3]
+        sib = owner_token()
+        work = k -> begin
+            k == ks[1] && DataVault.acquire_running!(v, ks[2], sib)
+            k == ks[3] && DataVault.clear_running!(v, ks[2], sib)
+            return Dict{String,Any}("x" => 1)
+        end
+        r = run_loop!(work, v, ks; opts=_dp_quiet(), idle_sleep=0.05)
+        @test r.collisions == 1
+        @test (r.done, r.remaining) == (3, 0)
     end
 end
 
