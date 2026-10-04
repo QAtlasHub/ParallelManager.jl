@@ -757,9 +757,17 @@ With a `deadline` there is one rule for such a key, whoever the cost comes from
   class.) Held back instead, a class that had never completed was held back in
   every job with a deadline, and so never completed.
 - **the others of that class are held back**, counted in `held_back` with
-  `cost_unknown` and `classes_unknown`.
-- a hook that **throws** is reported once (`cost_hook_failed`) with what it
-  threw.
+  `cost_unknown` and `classes_unknown`. The cost table is written when a round
+  ends, so in a `run_loop!` the next round knows the class and runs them.
+- if the explored key does not finish (it failed, was cancelled, lost its
+  worker), **another key of the class is explored** in the next round; that
+  key is not chosen again.
+- at most eight classes are explored in one round (`cost_explore_capped`).
+- a `run_loop!` whose remaining keys are all held back for want of a cost
+  returns `stopped_by = :cost_unknown`, not `:deadline`; a campaign goes on to
+  its next stage after it.
+- a hook that **throws** is reported once per round (`cost_hook_failed`) with
+  what it threw — with or without a deadline.
 
 `order = :longest_first` puts a key of unknown cost first; `:finish_by` gives
 it the most cores. Under a profile's `max_key_time`, one key of unknown cost
