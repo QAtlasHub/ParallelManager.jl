@@ -755,9 +755,10 @@ end
 Write a ledger row for a submission that is ABOUT to be made, save the ledger, and return the
 row's provisional id. The row commits the job's node-hours from this moment. If `sbatch` then
 succeeds, [`confirm_submit!`](@ref) gives the row its real id; if it fails or the controller dies
-in between, the row stays, and is either matched to the job by name on a later poll or dropped
-after the job has been absent for $(_ENDED_AFTER_MISSING) polls. A job that was queued but never
-recorded is the one a budget cannot see.
+in between, the row stays — committed, and holding its place under `max_jobs` — and is either
+matched to the job by name on a later poll or dropped once it has gone unlisted for
+$(_ENDED_AFTER_MISSING) polls AND ten minutes. A job that was queued but never recorded is the one
+a budget cannot see.
 """
 function record_intent!(l::Ledger, spec::JobSpec; now::Real=time())
     tmp = string("submitting-", round(Int, now * 1000), "-", string(rand(UInt32); base=16))
@@ -1190,7 +1191,9 @@ end
 One round: ask the scheduler which jobs exist, bring the ledger up to date, [`decide`](@ref), and
 carry the decisions out — unless the policy is `dry_run`, in which case they are only logged.
 Every decision goes to the event log (`job_decision`, with its reason; `job_submitted` with the
-id), and the ledger is saved.
+id), and the ledger is saved under its lock. A `dry_run` round writes no ledger; it does write
+its events, marked `dry_run`. A round that could not ask the scheduler, could not trust its
+answer, or could not use the ledger returns `:refuse` for every partition.
 
 Call it from a job that is ending to resubmit only if work remains, or in
 [`controller_loop!`](@ref) to keep a campaign supplied.

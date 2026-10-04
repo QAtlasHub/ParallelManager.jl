@@ -135,14 +135,16 @@ SweepRunner.init_workers!(mode=:sequential, verbose=false)
 SweepRunner.run!(work_fn, vault, keys)
 ```
 
-or with multi-threading:
+or with threads for the library calls inside one key:
 
 ```bash
 julia --project --threads=8 run.jl
 ```
 
 `init_workers!(mode=:auto)` will pick `:threads` based on
-`Threads.nthreads() > 1`.
+`Threads.nthreads() > 1`. That gives a key's own code threads to use; it does
+**not** run keys in parallel — `run!` dispatches over processes, and under
+`:threads` the keys run on the master one at a time.
 
 ## 8. Cleaning a corrupted manifest
 
@@ -356,8 +358,12 @@ waited for: whether it is applied is then not known. A master run with
 A request is checked by the master that reads it, not only by the sender: a
 hand-written `resize` with `n = -1` or a `grace` of NaN is refused, changes
 nothing, and is acknowledged with the reason. From Julia, `wait_acks(vault, id)`
-does the same and `masters_listening(vault)` says who would read a request
-sent now.
+waits for every master that is listening (or the ones you name with
+`masters=`), and `masters_listening(vault)` says who would read a request sent
+now. A request sent with `--master X` is waited for from that master only.
+`sweeprunner jobs` exits **6** when its round was refused — the scheduler could
+not be asked or trusted, the ledger could not be used, the budget was reached —
+and nothing was submitted.
 
 A request file that cannot be read is tried again on the next polls and, if it
 stays unreadable, reported (`control_bad_request`) and acknowledged with the
@@ -402,7 +408,8 @@ computing, and a free lock would let the key run twice. The kill is tried again
 on later ticks (`key_cut` with `worker_removed = false`), and after three tries
 `run!` throws, naming the worker — the allocation holds a process nobody could
 stop, and the batch script must be able to tell. The lock stays with that
-worker (`lock_kept`).
+worker: the last `key_cut` says `lock_released = false, gave_up = true`, and
+`lock_kept` is logged for it as the master leaves.
 
 The master's periodic work is a list of named steps (requests, the pool, the
 stops, the manifest). One that fails is logged as `tick_failed step=…` — once,

@@ -233,7 +233,7 @@ Built from direct experience with the old-style HPC loop pattern used in
 
 | Pain | This package's answer |
 | --- | --- |
-| `.done` files rescanned every job (3600 files, ~10 min) | `Manifest` rollup, one JLD2 read (milliseconds) |
+| `.done` files rescanned every job (one stat per key, on a network file system) | `Manifest` rollup, one JLD2 read (milliseconds) |
 | 300 MB of per-item `println` logs | `EventLog` (JSONL), per-item `println` is not part of the API |
 | Killed samples silently wedge the queue | Heartbeat in `.running`; the next job asks who holds each lock (`judge_lock`) and reaps the dead ones, `stale_after` as the last resort |
 | Multiple masters double-execute the same key | `DataVault.acquire_running!` (POSIX `link()`) + post-lock `is_done` re-check |

@@ -138,10 +138,19 @@ end
         )
             for m in eachmatch(r"\.kind == \"([a-z_]+)\"", block)
                 kind = m.captures[1]
-                sites = collect(eachmatch(Regex(":$kind;\\s*(level=:[a-z]+)?"), src))
-                isempty(sites) && @error "no such event" page kind
-                @test !isempty(sites)
-                written = any(s -> s.captures[1] != "level=:debug", sites)
+                # Each place the kind is logged, with the level it is logged at: `level=`
+                # wherever it stands among the call's keywords (none: info).
+                levels = String[]
+                for r in findall(":$kind;", src)
+                    call = first(
+                        split(src[last(r):min(last(r) + 400, lastindex(src))], ")\n")
+                    )
+                    m2 = match(r"level=:([a-z]+)", call)
+                    push!(levels, m2 === nothing ? "info" : m2.captures[1])
+                end
+                isempty(levels) && @error "no such event" page kind
+                @test !isempty(levels)
+                written = any(!=("debug"), levels)
                 # Emitted only at debug: the recipe has to say that it needs the debug level.
                 written || @test occursin("log_level", block)
             end
@@ -161,6 +170,16 @@ end
             @test occursin("src/$f", text)
         end
     end
+    # The table in the package's own docstring, and the list in CLAUDE.md (by module name).
+    mod = read(joinpath(_DOC_SRC, "SweepRunner.jl"), String)
+    claude = read(joinpath(_DOC_ROOT, "CLAUDE.md"), String)
+    for f in files
+        occursin("`$f`", mod) || @error "not in the module docstring" f
+        @test occursin("`$f`", mod)
+        name = replace(f, ".jl" => "")
+        occursin("`$name`", claude) || @error "not in CLAUDE.md's module layout" name
+        @test occursin("`$name`", claude)
+    end
 end
 
 @testset "the exit codes the CLI documents are the ones it returns" begin
@@ -174,4 +193,14 @@ end
     union!(returned, parse(Int, m.captures[1]) for m in eachmatch(r"code = (\d)\b", cli))
     @test returned ⊆ documented
     @test documented ⊆ union(returned, Set([0]))
+    # The usage text a person reads names them too.
+    usage = match(r"const _CLI_USAGE = \"\"\"(.*?)\"\"\""s, cli)
+    @test usage !== nothing
+    if usage !== nothing
+        for code in setdiff(documented, Set([0]))
+            occursin(Regex("\\b$code\\b"), usage.captures[1]) ||
+                @error "exit code not in the usage text" code
+            @test occursin(Regex("\\b$code\\b"), usage.captures[1])
+        end
+    end
 end

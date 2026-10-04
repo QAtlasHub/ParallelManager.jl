@@ -50,13 +50,13 @@ SweepRunner.run!(work_fn, vault, keys)
 ```
 
 Re-running the same script after completion emits `:skip_complete` and
-exits in milliseconds regardless of `length(keys)`.
+returns after one manifest read, whatever `length(keys)` is.
 
 ## Pain points it answers
 
 | Pain | Answer |
 | :--- | :--- |
-| `.done` files rescanned every job (3600 files, ~10 min) | [`Manifest`](@ref SweepRunner.Manifest) rollup, one JLD2 read |
+| `.done` files rescanned every job (one stat per key, on a network file system) | [`Manifest`](@ref SweepRunner.Manifest) rollup, one JLD2 read |
 | 300 MB of per-item `println` logs | [`EventLog`](@ref SweepRunner.EventLog) (JSONL); per-item `println` is not part of the API |
 | Killed samples silently wedge the queue | Heartbeat + stale-lock reclaim (DataVault `.running`) auto-recover |
 | Multiple masters double-execute the same key | Per-key `.running` advisory lock (`acquire_running!`) + post-lock `is_done` re-check |
