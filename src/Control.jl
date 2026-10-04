@@ -979,17 +979,28 @@ end
 # qualified (`SweepRunner.matches`): a name that short or that common is not this package's to put in
 # a caller's namespace.
 """
-    wait_acks(vault, id; timeout=30.0, poll=0.5) -> Vector{Dict{String,Any}}
+    wait_acks(vault, id; timeout=30.0, poll=0.5, masters=masters_listening(vault))
+        -> Vector{Dict{String,Any}}
 
-Wait until at least one master has acknowledged request `id`, up to `timeout` seconds, and return
-the acknowledgements ([`read_acks`](@ref)). Empty means nobody took it in that time: no master is
-running on this `(project, run)`, or none has polled yet.
+Wait until every master in `masters` — by default the ones listening when this is called — has
+acknowledged request `id`, up to `timeout` seconds, and return the acknowledgements
+([`read_acks`](@ref)). Fewer than `masters` means some did not take it in that time; with
+`masters` empty (nobody listening) it waits for the first acknowledgement, as before.
 """
-function wait_acks(vault::Vault, id::AbstractString; timeout::Real=30.0, poll::Real=0.5)
+function wait_acks(
+    vault::Vault,
+    id::AbstractString;
+    timeout::Real=30.0,
+    poll::Real=0.5,
+    masters=masters_listening(vault),
+)
     t0 = time()
+    want = Set(String.(masters))
     while true
         acks = read_acks(vault, id)
-        (!isempty(acks) || time() - t0 >= timeout) && return acks
+        got = Set(String(get(a, "master", "")) for a in acks)
+        done = isempty(want) ? !isempty(acks) : issubset(want, got)
+        (done || time() - t0 >= timeout) && return acks
         sleep(poll)
     end
 end
@@ -1011,8 +1022,16 @@ end
 
 masters_listening(vault::Vault) = masters_listening(read_status(vault))
 
-function masters_listening(outdir::AbstractString; project=nothing, run=nothing)
+function masters_listening(
+    outdir::AbstractString; project=nothing, run=nothing, master=nothing
+)
     all = read_status(outdir)
+    # `master`: only the one a request with that target is for — its id, or its job id.
+    master === nothing || filter!(
+        d ->
+            d["master"] == master || (!isempty(get(d, "job", "")) && d["job"] == master),
+        all,
+    )
     keep =
         d -> begin
             parts = splitpath(d["path"])

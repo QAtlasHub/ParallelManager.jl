@@ -296,7 +296,8 @@ end
 function remaining_time(s::SlurmScheduler, id::AbstractString)
     out = s.run(`squeue -h -j $id -o %L`)
     (out === nothing || isempty(strip(out))) && return nothing
-    return _slurm_seconds(out)
+    # `nothing` for a time that cannot be read (`NOT_SET`, `INVALID`), as documented: not 0.
+    return _slurm_time(out)
 end
 
 function shrink(s::SlurmScheduler, id::AbstractString, nodes::Integer)
@@ -1435,6 +1436,7 @@ function controller_loop!(
     stop=() -> false,
     max_rounds::Union{Integer,Nothing}=nothing,
     io::Union{IO,Nothing}=nothing,
+    last::Union{Base.RefValue,Nothing}=nothing,
 )
     rounds = 0
     while !stop()
@@ -1453,6 +1455,9 @@ function controller_loop!(
                 err=_short_err(e),
             )
             io === nothing || println(io, "round $rounds failed: ", _short_err(e))
+            # A wrong configuration is not a round to try again: it fails the same way for ever
+            # (a `max_key_time` profile with no cost model was "round N failed", every round).
+            e isa ArgumentError && rethrow()
             (max_rounds !== nothing && rounds >= max_rounds) && break
             ctl.policy.dry_run && rethrow()
             sleep(interval)
@@ -1467,11 +1472,18 @@ function controller_loop!(
             end
             flush(io)
         end
+        last === nothing || (last[] = decisions)
         live = _ledger_live(ctl.ledger)
         idle = all(
             d -> d.action === :hold && startswith(d.reason, "nothing runnable"), decisions
         )
         (idle && !live) && break
+        # The budget is spent and nothing of ours is live: no later round can submit either.
+        # (It polled for ever, each round a refusal.)
+        spent =
+            !isempty(decisions) &&
+            all(d -> d.action === :refuse && startswith(d.reason, "budget"), decisions)
+        (spent && !live) && break
         # A dry run submits nothing, so a second round would decide the same thing forever.
         ctl.policy.dry_run && break
         (max_rounds !== nothing && rounds >= max_rounds) && break
