@@ -374,7 +374,11 @@ lead your scheduler gives before it kills the job.
 
 Independently of any cut, a unit that no longer holds its key cannot write
 over the one who does: `report_progress` returns `false` and
-`save_checkpoint!` throws `StopRequested`, so the unit leaves.
+`save_checkpoint!` throws `LockLost`, so the unit leaves. That is a collision
+(`lock_busy`, counted in `collisions`, with `lock_lost` naming who holds the
+key now), not a stop: nobody asked for one. Only a positive answer counts — a
+lock file that could not be *read* is tried again, and if it stays unreadable
+the unit goes on (`lock_unreadable`); the commit's own owner check decides.
 
 ### Workers that arrive late
 

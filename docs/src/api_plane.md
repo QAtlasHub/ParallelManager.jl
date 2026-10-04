@@ -70,6 +70,7 @@ SweepRunner.control!
 SweepRunner.should_stop
 SweepRunner.stop_point
 SweepRunner.StopRequested
+SweepRunner.LockLost
 SweepRunner.KeyFilter
 SweepRunner.matches
 SweepRunner.read_requests
