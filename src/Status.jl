@@ -235,7 +235,8 @@ function status_snapshot(m::Master)
     empty_nodes = [h for h in allocated if !haskey(nodes, h)]
 
     planned, launched, _ = lock(() -> _SPAWN[], _SPAWN_LOCK)
-    alloc_cores = _slurm_alloc_cores()
+    # This master's share of the job, not the whole job (see `_master_alloc_cores`).
+    alloc_cores = _master_alloc_cores(m)
     return Dict{String,Any}(
         "master" => m.id,
         "host" => m.host,
@@ -401,14 +402,63 @@ end
 # How long cores may sit unused, with keys queued, before it is said.
 const _LOW_UTIL_AFTER = Ref(600.0)
 
+# The cores of the job that are THIS master's to fill, or 0 when the allocation is not known.
+# A master on a node group, or one of several in a job, is not responsible for the whole
+# `SLURM_JOB_CPUS_PER_NODE`: four masters each filling their quarter were each "at 25%".
+#   - told (`own_cores`: the pool's nodes, or the node group) → that;
+#   - else the job's cores less the cores the OTHER masters of this job report as joined.
+function _master_alloc_cores(m::Master)
+    m.own_cores > 0 && return m.own_cores
+    alloc = _slurm_alloc_cores()
+    (alloc == 0 || m.vault === nothing || isempty(m.job)) && return alloc
+    others = 0
+    try
+        for d in read_status(m.vault)
+            (d["master"] == m.id || d["stale"] || get(d, "job", "") != m.job) && continue
+            d["state"] in ("running", "waiting") || continue
+            others += Int(get(d["workers"], "cores_joined", 0))
+        end
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return max(alloc - others, 0)
+end
+
+# The cores of a node group (`SWEEPRUNNER_NODELIST`) out of the job's allocation, or 0 when the
+# environment does not say.
+function _slurm_group_cores()
+    group = get(ENV, "SWEEPRUNNER_NODELIST", "")
+    isempty(group) && return 0
+    names = expand_nodelist(get(ENV, "SLURM_JOB_NODELIST", ""))
+    counts = _slurm_cpus_per_node(get(ENV, "SLURM_JOB_CPUS_PER_NODE", ""))
+    (counts === nothing || length(counts) != length(names)) && return 0
+    mine = Set(expand_nodelist(group))
+    return sum((c for (n, c) in zip(names, counts) if n in mine); init=0)
+end
+
 # The failure this status exists for: a job using a fraction of the cores it is charged for,
 # with work waiting, and no message. Busy cores against ALLOCATED cores — not against the
 # workers that happened to start, which is what `workers_short` compares.
 function _check_utilisation!(m::Master, log::EventLog)
     filter!(w -> !startswith(w, "low_utilisation"), m.warnings)
     (m.min_utilisation > 0 && m.table !== nothing && m.multi) || return nothing
-    alloc = _slurm_alloc_cores()
-    alloc == 0 && return nothing                    # not known: nothing to compare with
+    alloc = _master_alloc_cores(m)
+    if alloc == 0
+        # Not known: nothing to compare with — said once, so that an alarm that is not
+        # running is not taken for a job that is fine.
+        if !m.util_unknown_said && haskey(ENV, "SLURM_JOB_ID")
+            m.util_unknown_said = true
+            log_event(
+                log,
+                :utilisation_unknown;
+                level=:warn,
+                stage=m.stage,
+                why="the allocation's cores could not be read (SLURM_JOB_CPUS_PER_NODE); " *
+                    "the low-utilisation check is not running",
+            )
+        end
+        return nothing
+    end
     table = m.table
     queued, on = lock(table.lock) do
         q = count(r -> r.state === :todo, table.rows)
@@ -509,6 +559,11 @@ function _check_stuck!(m::Master, log::EventLog)
     return nothing
 end
 
+# One more step, for a test to stand in a check that throws.
+const _STATUS_EXTRA = Ref{Any}(nothing)
+# (master id, step) => failures in a row of a step of `status_tick!`.
+const _STATUS_FAILS = Dict{Tuple{String,Symbol},Int}()
+
 """
     status_tick!(master, log)
 
@@ -520,22 +575,41 @@ function status_tick!(m::Master, log::EventLog)
     # Each step by itself: one that fails must not take the others with it (the check for
     # workers that did not join is the last, and the one that matters most).
     steps = (
-        () -> _probe_workers!(m),
-        () -> begin
-            v = m.vault
-            v === nothing && return nothing
-            p = read_progress(v)
-            return lock(() -> (empty!(m.progress); merge!(m.progress, p)), m.lock)
-        end,
-        () -> _check_stuck!(m, log),
-        () -> _check_utilisation!(m, log),
-        () -> _check_short!(m, log),
+        :probe => () -> _probe_workers!(m),
+        :progress =>
+            () -> begin
+                v = m.vault
+                v === nothing && return nothing
+                p = read_progress(v)
+                return lock(() -> (empty!(m.progress); merge!(m.progress, p)), m.lock)
+            end,
+        :stuck => () -> _check_stuck!(m, log),
+        :utilisation => () -> _check_utilisation!(m, log),
+        :workers_short => () -> _check_short!(m, log),
+        :extra => () -> (f=_STATUS_EXTRA[]; f === nothing ? nothing : f(m)),
     )
-    for step in steps
+    for (name, step) in steps
         try
             step()
+            delete!(_STATUS_FAILS, (m.id, name))
         catch e
             e isa InterruptException && rethrow()
+            # A watchdog that throws every tick is a watchdog that is off: said on the first
+            # failure and every hundredth, by name.
+            n = _STATUS_FAILS[(m.id, name)] = get(_STATUS_FAILS, (m.id, name), 0) + 1
+            try
+                (n == 1 || n % 100 == 0) && log_event(
+                    log,
+                    :status_tick_failed;
+                    level=:warn,
+                    stage=m.stage,
+                    step=String(name),
+                    count=n,
+                    err=_short_err(e),
+                )
+            catch e2
+                e2 isa InterruptException && rethrow()
+            end
         end
     end
     return write_status(m; log=log)
