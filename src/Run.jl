@@ -567,6 +567,9 @@ function run!(
     master.interval = opts.status_interval
     master.stuck_after = opts.stuck_after
     master.min_utilisation = opts.min_utilisation
+    # What this master has to fill: its pool's nodes, or its node group; else not told.
+    master.own_cores =
+        pool === nothing ? _slurm_group_cores() : sum(n.cores for n in pool.nodes)
     warned0 = warning_counts()
     spawn === nothing || (master.ctl.spawn = spawn)
     after = own ? :ended : :waiting
@@ -782,6 +785,9 @@ function run!(
         # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
         # when IT returns).
         (own && pool !== nothing && !pool.keep) && shutdown!(pool)
+        # The round's warnings in one line, however it ended: an exception, a pool that gave
+        # up, a cut that failed are the rounds whose warnings matter most.
+        _say_warnings(stage, _warnings_since(warned0))
     end
 
     # Aggregate outcomes into counters + manifest updates.
@@ -863,7 +869,6 @@ function run!(
         # The warn-level events of this round on this process, by kind.
         warnings=_warnings_since(warned0),
     )
-    _say_warnings(stage, _warnings_since(warned0))
     # Said once, with the count: the keys this job did not start because they could not get
     # anywhere before its deadline.
     n_held_back > 0 && log_event(

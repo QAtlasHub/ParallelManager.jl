@@ -278,14 +278,26 @@ end
         SweepRunner.log_event(log, :test_info_134; n=1)                  # not a warning
         out = String(take!(io))
         lines = filter(l -> occursin("test_warning_134", l), split(out, '\n'))
-        # The first, the hundredth and the two-hundredth: three lines for 250 events.
-        @test length(lines) == 3
+        # One line for 250 events in the same minute: the first.
+        @test length(lines) == 1
         @test occursin("why=because", lines[1]) && !occursin("×", lines[1])
-        @test occursin("(×100 so far)", lines[2]) && occursin("(×200 so far)", lines[3])
         @test !occursin("test_info_134", out)
-        @test SweepRunner._warnings_since(before)["test_warning_134"] == 250
-        # All 250 are in the file: the echo is not the log.
-        @test count(l -> occursin("test_warning_134", l), readlines(log.path)) == 250
+        # After the quiet minute (none, here) the kind is said again, with the count...
+        SweepRunner._WARNING_EVERY[] = 0.0
+        SweepRunner.log_event(log, :test_warning_134; level=:warn, n=251)
+        SweepRunner._WARNING_EVERY[] = 60.0
+        @test occursin("test_warning_134 (×251 so far)", String(take!(io)))
+        # ...and an ERROR of a kind that was just said is said at once (#155): "the cut gave
+        # up" must not be swallowed by "the cut began".
+        SweepRunner.log_event(log, :test_warning_134; level=:error, n=252, gave_up=true)
+        said = String(take!(io))
+        @test occursin("sweeprunner error: test_warning_134", said)
+        @test occursin("gave_up=true", said)
+        SweepRunner.log_event(log, :test_warning_134; level=:warn, n=253)   # a warning: not yet
+        @test isempty(String(take!(io)))
+        @test SweepRunner._warnings_since(before)["test_warning_134"] == 253
+        # All of them are in the file: the echo is not the log.
+        @test count(l -> occursin("test_warning_134", l), readlines(log.path)) == 253
         SweepRunner.echo_warnings!(nothing)
         SweepRunner.log_event(log, :test_quiet_134; level=:warn)
         @test isempty(String(take!(io)))
@@ -357,5 +369,101 @@ end
     finally
         SweepRunner._LOW_UTIL_AFTER[] = 600.0
         SweepRunner.echo_warnings!(:stderr)
+    end
+end
+
+# ── third review (#155) ──────────────────────────────────────────────────────────────────────────
+
+@testset "a master is measured against the cores that are its own, not the whole job's (#155)" begin
+    # A node group out of the job's allocation.
+    env = (
+        "SLURM_JOB_NODELIST" => "c[001-004]",
+        "SLURM_JOB_CPUS_PER_NODE" => "128(x4)",
+        "SWEEPRUNNER_NODELIST" => "c[001-002]",
+    )
+    withenv(env...) do
+        @test SweepRunner._slurm_alloc_cores() == 512
+        @test SweepRunner._slurm_group_cores() == 256
+    end
+    withenv("SWEEPRUNNER_NODELIST" => nothing) do
+        @test SweepRunner._slurm_group_cores() == 0
+    end
+    _st_vault() do v, _
+        m = withenv(
+            "SLURM_JOB_ID" => "777",
+            "SLURM_ARRAY_JOB_ID" => nothing,
+            "SLURM_ARRAY_TASK_ID" => nothing,
+        ) do
+            return SweepRunner.Master()
+        end
+        @test m.job == "777"
+        m.vault = v
+        withenv("SLURM_JOB_CPUS_PER_NODE" => "128(x4)") do
+            # Told its share: that.
+            m.own_cores = 128
+            @test SweepRunner._master_alloc_cores(m) == 128
+            # Not told, and alone in the job: the job's.
+            m.own_cores = 0
+            @test SweepRunner._master_alloc_cores(m) == 512
+            # Not told, with three other masters of the same job each holding a node: what is
+            # left is its own. Each of four full masters is then at 100%, not at 25%.
+            real = Dict{String,Any}(
+                "stage" => "st",
+                "state" => "running",
+                "started" => time() - 10,
+                "updated" => time() + 3600,
+                "interval" => 60.0,
+                "host" => "h",
+                "pid" => 1,
+                "tasks" => Dict{String,Any}(),
+                "warnings" => String[],
+                "nodes" => Any[],
+                "nodes_without_workers" => String[],
+                "worker_table" => Any[],
+            )
+            for (i, job) in enumerate(("777", "777", "777", "888"))
+                id = "other_$i"
+                dir = joinpath(state_root(v), "masters", id)
+                mkpath(dir)
+                st = merge(
+                    real,
+                    Dict{String,Any}(
+                        "master" => id,
+                        "job" => job,
+                        "workers" => Dict{String,Any}("cores_joined" => 128),
+                    ),
+                )
+                write(joinpath(dir, "status.json"), JSON3.write(st))
+            end
+            @test SweepRunner._master_alloc_cores(m) == 128      # 512 less 3 × 128; job 888 is not ours
+        end
+    end
+end
+
+@testset "a status check that throws is said, by name, and the others still run (#155)" begin
+    _st_vault() do v, outdir
+        ks = DataVault.keys(v)
+        m = SweepRunner.Master()
+        m.vault = v
+        m.stage = "st"
+        m.multi = true
+        m.min_utilisation = 0.5
+        m.stuck_after = 1.0
+        log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+        SweepRunner._STATUS_EXTRA[] = m -> error("this check is broken")
+        try
+            for _ in 1:3
+                SweepRunner.status_tick!(m, log)
+            end
+        finally
+            SweepRunner._STATUS_EXTRA[] = nothing
+        end
+        ev = [e for e in _st_events(outdir) if e.kind == "status_tick_failed"]
+        # Said once for three ticks, by name, with the count and what it threw.
+        @test length(ev) == 1
+        @test (ev[1].step, ev[1].count) == ("extra", 1)
+        @test occursin("this check is broken", ev[1].err)
+        # The step after them still ran: the status was written.
+        @test isfile(SweepRunner.status_path(v, m))
     end
 end
