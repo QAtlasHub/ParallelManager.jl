@@ -442,6 +442,11 @@ end
         @test (w["conv.phase1"].todo, w["conv.phase1"].cost) == (0, 0.0)
         @test w["typx.phase2"].blocked_by == ["typ.phase1"]
         @test w["typ.phase1"].todo == 2
+        # A cost that has no answer for a stage's keys leaves one of them eligible (to be
+        # measured), not none: "nothing runnable" in every job was the alternative (#136).
+        wn = remaining_work(open, c; profile="short", cost=(s, k) -> NaN)
+        typn = only([x for x in wn if x.stage == "typ.phase1"])
+        @test (typn.todo, typn.eligible) == (2, 1)
         # Under the profile only the keys within max_key_time (5 s) count as eligible.
         ws = remaining_work(open, c; profile="short", cost)
         typ = only([x for x in ws if x.stage == "typ.phase1"])
