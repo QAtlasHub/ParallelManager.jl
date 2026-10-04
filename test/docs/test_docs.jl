@@ -191,6 +191,9 @@ end
     )
     returned = Set(parse(Int, m.captures[1]) for m in eachmatch(r"\breturn (\d)\b", cli))
     union!(returned, parse(Int, m.captures[1]) for m in eachmatch(r"code = (\d)\b", cli))
+    for m in eachmatch(r"\? (\d) : (\d)\b", cli)             # `return cond ? 6 : 0`
+        union!(returned, parse.(Int, m.captures))
+    end
     @test returned ⊆ documented
     @test documented ⊆ union(returned, Set([0]))
     # The usage text a person reads names them too.
