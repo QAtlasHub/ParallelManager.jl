@@ -50,6 +50,17 @@ Base.@kwdef struct JobSpec
     script::String
     env::Dict{String,String} = Dict{String,String}()
     args::Vector{String} = String[]
+    # The numbers a submission is charged by are checked where they enter: a NaN or a negative
+    # one makes the comparison with the budget pass for every job.
+    function JobSpec(name, partition, nodes, time_limit, script, env, args)
+        nodes >= 1 || throw(ArgumentError("JobSpec $name: nodes must be >= 1, got $nodes"))
+        (isfinite(time_limit) && time_limit > 0) || throw(
+            ArgumentError(
+                "JobSpec $name: time_limit must be positive and finite, got $time_limit"
+            ),
+        )
+        return new(name, partition, nodes, time_limit, script, env, args)
+    end
 end
 
 """
@@ -66,6 +77,17 @@ struct JobState
     nodes::Int
     time_limit::Float64
     elapsed::Float64
+    # `time_limit` may be `Inf` (no limit: it commits without bound); nothing may be NaN or
+    # negative.
+    function JobState(id, name, partition, state, nodes, time_limit, elapsed)
+        bad(msg) = throw(ArgumentError("JobState $id: $msg"))
+        nodes >= 0 || bad("nodes must be >= 0, got $nodes")
+        (!isnan(time_limit) && time_limit >= 0) ||
+            bad("time_limit must be >= 0 and not NaN, got $time_limit")
+        (isfinite(elapsed) && elapsed >= 0) ||
+            bad("elapsed must be finite and >= 0, got $elapsed")
+        return new(id, name, partition, state, nodes, time_limit, elapsed)
+    end
 end
 
 """
@@ -215,10 +237,14 @@ function job_states(s::SlurmScheduler)::Vector{JobState}
         # refused rather than trusted in part.
         length(f) == 7 || error("squeue: cannot read the line $(repr(line))")
         nodes = tryparse(Int, f[4])
-        limit = _slurm_time(f[5])
+        # A limit Slurm prints as a word (`NOT_SET`, `INVALID`, `Partition_Limit`) is "not
+        # known": taken as no limit, which commits without bound if the job is ours and costs
+        # nothing if it is not. Refusing the whole answer over it stopped every round for as
+        # long as ANY job of the user had such a limit.
+        limit = something(_slurm_time(f[5]), Inf)
         elapsed = _slurm_time(f[6])
-        (nodes === nothing || limit === nothing || elapsed === nothing) &&
-            error("squeue: cannot read nodes or times in $(repr(line))")
+        (nodes === nothing || elapsed === nothing) &&
+            error("squeue: cannot read nodes or elapsed time in $(repr(line))")
         state = if f[3] == "RUNNING"
             :running
         elseif f[3] == "PENDING"
@@ -235,6 +261,36 @@ function job_states(s::SlurmScheduler)::Vector{JobState}
         )
     end
     return jobs
+end
+
+# States `sacct` gives a job that is over, and ones it gives a job that still exists.
+const _SACCT_OVER = (
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "PREEMPTED",
+    "BOOT_FAIL",
+    "DEADLINE",
+)
+const _SACCT_LIVE = (
+    "PENDING", "RUNNING", "SUSPENDED", "COMPLETING", "CONFIGURING", "REQUEUED", "RESIZING"
+)
+
+# Asked of the accounting, for a job the queue no longer lists. `nothing` whenever the answer is
+# not one of the known states: accounting off, the job not in it yet, the command failing.
+# (Read against stubs only: this has not been run on a cluster.)
+function job_gone(s::SlurmScheduler, id::AbstractString)
+    out = s.run(`sacct -n -X -P -j $id -o State`)
+    out === nothing && return nothing
+    lines = split(out, '\n'; keepempty=false)
+    isempty(lines) && return nothing
+    state = first(split(strip(first(lines))))          # "CANCELLED by 1234" -> CANCELLED
+    state in _SACCT_OVER && return true
+    state in _SACCT_LIVE && return false
+    return nothing
 end
 
 function remaining_time(s::SlurmScheduler, id::AbstractString)
@@ -279,6 +335,13 @@ end
 
 job_states(s::MockScheduler) = copy(s.jobs)
 
+# The mock's accounting: a job it issued (ids count up from 1000) and no longer lists has ended.
+function job_gone(s::MockScheduler, id::AbstractString)
+    any(j -> j.id == id, s.jobs) && return false
+    n = tryparse(Int, id)
+    return (n !== nothing && 1000 < n <= s.next) ? true : nothing
+end
+
 function remaining_time(s::MockScheduler, id::AbstractString)
     i = findfirst(j -> j.id == id, s.jobs)
     return i === nothing ? nothing : s.jobs[i].time_limit - s.jobs[i].elapsed
@@ -306,6 +369,33 @@ struct PartitionPolicy
     slots_per_node::Int
     key_time::Union{Float64,Nothing}
     env::Dict{String,String}
+    # The checks are here, in the only way to make one: built positionally, a policy used to
+    # skip them.
+    function PartitionPolicy(
+        name, nodes, time_limit, script, profile, max_jobs, slots_per_node, key_time, env
+    )
+        bad(msg) = throw(ArgumentError("PartitionPolicy $name: $msg"))
+        # Each of these, wrong, makes a job's cost zero, negative or NaN — and a comparison
+        # with the budget that every job passes.
+        nodes >= 1 || bad("nodes must be >= 1, got $nodes")
+        (isfinite(time_limit) && time_limit > 0) ||
+            bad("time_limit must be positive and finite, got $time_limit")
+        slots_per_node >= 1 || bad("slots_per_node must be >= 1, got $slots_per_node")
+        max_jobs >= 0 || bad("max_jobs must be >= 0, got $max_jobs")
+        (key_time === nothing || (isfinite(key_time) && key_time > 0)) ||
+            bad("key_time must be positive and finite, got $key_time")
+        return new(
+            String(name),
+            Int(nodes),
+            Float64(time_limit),
+            String(script),
+            profile === nothing ? nothing : String(profile),
+            Int(max_jobs),
+            Int(slots_per_node),
+            key_time === nothing ? nothing : Float64(key_time),
+            Dict{String,String}(String(k) => String(v) for (k, v) in env),
+        )
+    end
 end
 
 function PartitionPolicy(;
@@ -319,26 +409,8 @@ function PartitionPolicy(;
     key_time::Union{Real,Nothing}=nothing,
     env::AbstractDict=Dict{String,String}(),
 )
-    bad(msg) = throw(ArgumentError("PartitionPolicy $name: $msg"))
-    # Each of these, wrong, makes a job's cost zero, negative or NaN — and a comparison with
-    # the budget that every job passes.
-    nodes >= 1 || bad("nodes must be >= 1, got $nodes")
-    (isfinite(time_limit) && time_limit > 0) ||
-        bad("time_limit must be positive and finite, got $time_limit")
-    slots_per_node >= 1 || bad("slots_per_node must be >= 1, got $slots_per_node")
-    max_jobs >= 0 || bad("max_jobs must be >= 0, got $max_jobs")
-    (key_time === nothing || (isfinite(key_time) && key_time > 0)) ||
-        bad("key_time must be positive and finite, got $key_time")
     return PartitionPolicy(
-        String(name),
-        Int(nodes),
-        Float64(time_limit),
-        String(script),
-        profile === nothing ? nothing : String(profile),
-        Int(max_jobs),
-        Int(slots_per_node),
-        key_time === nothing ? nothing : Float64(key_time),
-        Dict{String,String}(String(k) => String(v) for (k, v) in env),
+        name, nodes, time_limit, script, profile, max_jobs, slots_per_node, key_time, env
     )
 end
 
@@ -358,6 +430,29 @@ struct JobPolicy
     max_jobs::Int
     dry_run::Bool
     default_key_time::Float64
+    function JobPolicy(
+        name, partitions, budget_node_hours, max_jobs, dry_run, default_key_time
+    )
+        bad(msg) = throw(ArgumentError("JobPolicy $name: $msg"))
+        isempty(name) &&
+            bad("name must not be empty: it is how the controller knows its jobs")
+        # NaN would make `spent + job > budget` false for every job.
+        (isfinite(budget_node_hours) && budget_node_hours >= 0) ||
+            bad("budget_node_hours must be finite and >= 0, got $budget_node_hours")
+        max_jobs >= 0 || bad("max_jobs must be >= 0, got $max_jobs")
+        (isfinite(default_key_time) && default_key_time > 0) ||
+            bad("default_key_time must be positive and finite, got $default_key_time")
+        allunique(p.name for p in partitions) || bad("a partition is named twice")
+        # A copy: the caller's vector is not this policy's.
+        return new(
+            String(name),
+            collect(PartitionPolicy, partitions),
+            Float64(budget_node_hours),
+            Int(max_jobs),
+            dry_run,
+            Float64(default_key_time),
+        )
+    end
 end
 
 function JobPolicy(;
@@ -368,22 +463,8 @@ function JobPolicy(;
     dry_run::Bool=true,
     default_key_time::Real=600.0,
 )
-    bad(msg) = throw(ArgumentError("JobPolicy $name: $msg"))
-    isempty(name) && bad("name must not be empty: it is how the controller knows its jobs")
-    # NaN would make `spent + job > budget` false for every job.
-    (isfinite(budget_node_hours) && budget_node_hours >= 0) ||
-        bad("budget_node_hours must be finite and >= 0, got $budget_node_hours")
-    max_jobs >= 0 || bad("max_jobs must be >= 0, got $max_jobs")
-    (isfinite(default_key_time) && default_key_time > 0) ||
-        bad("default_key_time must be positive and finite, got $default_key_time")
-    allunique(p.name for p in partitions) || bad("a partition is named twice")
     return JobPolicy(
-        String(name),
-        collect(PartitionPolicy, partitions),
-        Float64(budget_node_hours),
-        Int(max_jobs),
-        dry_run,
-        Float64(default_key_time),
+        name, partitions, budget_node_hours, max_jobs, dry_run, default_key_time
     )
 end
 
@@ -470,20 +551,108 @@ mutable struct Ledger
     jobs::Dict{String,Dict{String,Any}}
 end
 
-function Ledger(path::AbstractString)
+Ledger(path::AbstractString) = Ledger(String(path), _read_ledger(path))
+
+# The rows of a ledger file, checked. A number that is missing, NaN or negative makes the
+# account a number the budget check passes for every job, so such a file is an error, said with
+# the row — not a ledger to decide on.
+function _read_ledger(path::AbstractString)
     jobs = Dict{String,Dict{String,Any}}()
-    if isfile(path)
-        raw = JSON3.read(read(path, String), Dict{String,Any})
-        for (id, j) in get(raw, "jobs", Dict{String,Any}())
-            jobs[String(id)] = Dict{String,Any}(j)
-        end
+    isfile(path) || return jobs
+    raw = JSON3.read(read(path, String), Dict{String,Any})
+    for (id, j) in get(raw, "jobs", Dict{String,Any}())
+        row = Dict{String,Any}(j)
+        _check_ledger_row(String(id), row)
+        jobs[String(id)] = row
     end
-    return Ledger(String(path), jobs)
+    return jobs
+end
+
+function _check_ledger_row(id::AbstractString, j::AbstractDict)
+    bad(msg) = throw(ArgumentError("ledger row $id: $msg"))
+    for f in ("name", "partition", "nodes", "time_limit", "elapsed", "state", "ended")
+        haskey(j, f) || bad("no `$f`")
+    end
+    n = j["nodes"]
+    (n isa Real && isfinite(n) && n >= 0) ||
+        bad("nodes must be a number >= 0, got $(repr(n))")
+    e = j["elapsed"]
+    (e isa Real && isfinite(e) && e >= 0) ||
+        bad("elapsed must be finite and >= 0, got $(repr(e))")
+    t = j["time_limit"]
+    # JSON has no Inf: a job without a limit is written as `null`.
+    t === nothing && (j["time_limit"]=Inf; t=Inf)
+    (t isa Real && !isnan(t) && t >= 0) ||
+        bad("time_limit must be >= 0 and not NaN, got $(repr(t))")
+    j["ended"] isa Bool || bad("ended must be true or false, got $(repr(j["ended"]))")
+    return nothing
 end
 
 function save_ledger(l::Ledger)
-    atomic_write(io -> JSON3.write(io, Dict("jobs" => l.jobs)), l.path)
+    rows = Dict(
+        id => Dict{String,Any}(
+            k => (v isa AbstractFloat && isinf(v) ? nothing : v) for (k, v) in j
+        ) for (id, j) in l.jobs
+    )
+    atomic_write(io -> JSON3.write(io, Dict("jobs" => rows)), l.path)
     return l.path
+end
+
+# Whether the ledger's file was there when it was last read: a missing file reads as "nothing
+# used", which a controller must say rather than assume.
+_ledger_exists(l::Ledger) = isfile(l.path)
+
+# Take what is on disk now. A controller is not the only writer: a job's last act and a
+# login-node loop share one ledger.
+function reload_ledger!(l::Ledger)
+    fresh = _read_ledger(l.path)
+    empty!(l.jobs)
+    merge!(l.jobs, fresh)
+    return l
+end
+
+# How long a ledger lock may be held before it is taken as left behind by a controller that
+# died. A round holds it across `squeue` and `sbatch`, each bounded at a minute.
+const _LEDGER_LOCK_STALE = 600.0
+
+"""
+    with_ledger(f, ledger; wait=120.0)
+
+Run `f()` holding the ledger's lock (a directory beside the file: `mkdir` is atomic on NFS), with
+the ledger re-read from disk first. Two controllers on one ledger then decide one after the
+other, each on what the other wrote, instead of overwriting each other's rows. Throws if the lock
+cannot be had within `wait` seconds.
+"""
+function with_ledger(f, l::Ledger; wait::Real=120.0)
+    lockdir = l.path * ".lock"
+    mkpath(dirname(l.path))
+    t0 = time()
+    while true
+        try
+            mkdir(lockdir)
+            break
+        catch e
+            e isa InterruptException && rethrow()
+            isdir(lockdir) || rethrow()
+        end
+        # Left behind by a controller that died holding it.
+        age = time() - mtime(lockdir)
+        if age > _LEDGER_LOCK_STALE
+            rm(lockdir; force=true, recursive=true)
+            continue
+        end
+        time() - t0 > wait && error(
+            "the ledger $(l.path) is locked by another controller " *
+            "($(round(Int, age)) s); nothing decided",
+        )
+        sleep(0.2)
+    end
+    try
+        reload_ledger!(l)
+        return f()
+    finally
+        rm(lockdir; force=true, recursive=true)
+    end
 end
 
 # How many polls in a row a job has to be absent from the scheduler's answer before the ledger
@@ -536,26 +705,65 @@ The submission recorded as `provisional` got the scheduler's `id`. The ledger is
 function confirm_submit!(l::Ledger, tmp::AbstractString, id::AbstractString)
     row = pop!(l.jobs, String(tmp))
     row["state"] = "pending"
+    old = get(l.jobs, String(id), nothing)
+    if old !== nothing
+        # The id is already on record (adopted from a poll in between): one row, with the
+        # larger of what the two know.
+        row["elapsed"] = max(Float64(row["elapsed"]), Float64(old["elapsed"]))
+        row["state"] = old["state"]
+    end
     l.jobs[String(id)] = row
     save_ledger(l)
     return nothing
 end
 
-"""
-    observe!(ledger, states; now=time())
+# For how long a job has to have been absent, beside the number of polls, before absence is taken
+# as its end: three polls a second apart are one moment, not three.
+const _ENDED_MIN_ABSENT = Ref(120.0)
+# How long a submission may go unlisted before it is taken as not made.
+const _SUBMIT_UNSEEN = Ref(600.0)
 
-Bring the ledger up to what the scheduler says.
+"""
+    job_gone(scheduler, id) -> Union{Bool,Nothing}
+
+Positive evidence about a job the queue no longer lists: `true` it has ended, `false` it exists,
+`nothing` the scheduler cannot say (the default).
+"""
+job_gone(::Scheduler, ::AbstractString) = nothing
+
+"""
+    observe!(ledger, states; now=time(), names=(), gone=id -> nothing) -> Vector{NamedTuple}
+
+Bring the ledger up to what the scheduler says, and return what changed
+(`(; id, what, evidence, …)`, `what` being `:ended` or `:adopted`), for the caller to log.
 
 - A job the scheduler lists — in ANY state — exists: its elapsed time and state are updated.
-- A job it does not list is counted absent. Only after $(_ENDED_AFTER_MISSING) polls in a row is
-  it taken as ended, and it is billed for what it can have run since it was last seen (up to its
-  time limit), not for the last elapsed time read. A job that reappears is live again.
+- A listed job named as one of ours (`names`) that the ledger does not have is ADOPTED, at its
+  limit: a job the ledger does not know is one the budget does not see.
+- A job it does not list is ended only on evidence:
+  - `gone(id) === true` (the scheduler's accounting says so), or
+  - the answer is one that can be trusted about absence — it lists at least one job the ledger
+    knows — and the job has been absent for $(_ENDED_AFTER_MISSING) such polls and
+    `_ENDED_MIN_ABSENT` seconds, or
+  - the clock says it cannot be running: it was seen running and its time limit has passed.
+  An answer that lists none of the ledger's jobs (empty, another cluster, a filter) does not
+  count as an absence: three of those used to empty the ledger, and the fourth round submitted.
+- A job ended by absence is billed for what it can have run since it was last seen (up to its
+  time limit). A job that reappears is live again.
 - A row still `submitting` (the controller did not learn the id) takes the id of a listed job
   with its name that the ledger does not have yet.
 """
-function observe!(l::Ledger, states::AbstractVector{JobState}; now::Real=time())
+function observe!(
+    l::Ledger,
+    states::AbstractVector{JobState};
+    now::Real=time(),
+    names=(),
+    gone=id -> nothing,
+)
+    changes = NamedTuple[]
     by = Dict(j.id => j for j in states)
     unclaimed = [j for j in states if !haskey(l.jobs, j.id)]
+    trusted = any(j -> haskey(l.jobs, j.id), states)
     for id in collect(keys(l.jobs))
         j = l.jobs[id]
         s = get(by, id, nothing)
@@ -568,6 +776,7 @@ function observe!(l::Ledger, states::AbstractVector{JobState}; now::Real=time())
                 deleteat!(unclaimed, k)
                 delete!(l.jobs, id)
                 l.jobs[s.id] = j
+                id = s.id
             end
         end
         if s !== nothing
@@ -576,22 +785,108 @@ function observe!(l::Ledger, states::AbstractVector{JobState}; now::Real=time())
             j["missing"] = 0
             j["last_seen"] = Float64(now)
             j["ended"] = false
+            delete!(j, "absent_since")
             continue
         end
         j["ended"] === true && continue
-        j["missing"] = Int(get(j, "missing", 0)) + 1
-        j["missing"] >= _ENDED_AFTER_MISSING || continue
+        since = Float64(now) - Float64(get(j, "last_seen", now))
+        evidence = nothing
+        if j["state"] == "submitting"
+            # Never listed. A queued job shows within seconds, so one that has not in
+            # `_SUBMIT_UNSEEN` was not taken; if it does turn up later it is adopted by name.
+            j["missing"] = Int(get(j, "missing", 0)) + 1
+            if j["missing"] >= _ENDED_AFTER_MISSING && since >= _SUBMIT_UNSEEN[]
+                j["ended"] = true
+                push!(
+                    changes,
+                    (;
+                        id=id,
+                        what=:ended,
+                        evidence="submitted $(round(Int, since)) s ago and never listed",
+                        was="submitting",
+                        polls_missed=j["missing"],
+                        seconds_billed=0.0,
+                    ),
+                )
+                j["state"] = "ended"
+            end
+            continue
+        end
+        g = gone(id)
+        if g === true
+            evidence = "the scheduler's accounting says it ended"
+        elseif g === false
+            j["missing"] = 0
+            continue
+        else
+            if trusted
+                j["missing"] = Int(get(j, "missing", 0)) + 1
+                get!(j, "absent_since", Float64(now))
+                absent = Float64(now) - Float64(j["absent_since"])
+                if j["missing"] >= _ENDED_AFTER_MISSING && absent >= _ENDED_MIN_ABSENT[]
+                    evidence =
+                        "absent from $(j["missing"]) answers that listed other jobs of " *
+                        "the ledger, over $(round(Int, absent)) s"
+                end
+            end
+            # Whatever the answers are worth: a job seen running cannot outlive its limit.
+            left = Float64(j["time_limit"]) - Float64(j["elapsed"])
+            if evidence === nothing && j["state"] == "running" && since > left + 60
+                evidence = "last seen running $(round(Int, since)) s ago with $(round(Int, max(left, 0.0))) s of its limit left"
+            end
+        end
+        evidence === nothing && continue
         j["ended"] = true
+        billed = 0.0
         if j["state"] != "submitting"
             # It ran, at most, from when it was last seen until now.
-            since = Float64(now) - Float64(get(j, "last_seen", now))
-            j["elapsed"] = min(
-                Float64(j["time_limit"]), Float64(j["elapsed"]) + max(since, 0.0)
-            )
+            before = Float64(j["elapsed"])
+            j["elapsed"] = min(Float64(j["time_limit"]), before + max(since, 0.0))
+            isfinite(j["elapsed"]) || (j["elapsed"] = before + max(since, 0.0))
+            billed = j["elapsed"]
         end
+        push!(
+            changes,
+            (;
+                id=id,
+                what=:ended,
+                evidence=evidence,
+                was=String(j["state"]),
+                polls_missed=Int(get(j, "missing", 0)),
+                seconds_billed=billed,
+            ),
+        )
         j["state"] = "ended"
     end
-    return nothing
+    # Ours by name, listed, and in no row: adopted at its limit.
+    for u in unclaimed
+        u.name in names || continue
+        l.jobs[u.id] = Dict{String,Any}(
+            "name" => u.name,
+            "partition" => u.partition,
+            "nodes" => u.nodes,
+            "time_limit" => u.time_limit,
+            "submitted" => Float64(now),
+            "elapsed" => u.elapsed,
+            "state" => String(u.state),
+            "ended" => false,
+            "missing" => 0,
+            "last_seen" => Float64(now),
+            "adopted" => true,
+        )
+        push!(
+            changes,
+            (;
+                id=u.id,
+                what=:adopted,
+                evidence="listed under the policy's name and in no ledger row",
+                was=String(u.state),
+                polls_missed=0,
+                seconds_billed=u.elapsed,
+            ),
+        )
+    end
+    return changes
 end
 
 """
@@ -689,10 +984,16 @@ function decide(
     mine = [j for j in jobs if haskey(ledger.jobs, j.id) || j.name in names]
     nh = node_hours(ledger)
     spent = nh.used + nh.committed
-    live_total = length(mine)
+    # A row still `submitting` is a job that may be queued and not listed yet (an `sbatch` that
+    # timed out after it was taken): it holds a place too.
+    unlisted = [
+        j for j in values(ledger.jobs) if j["state"] == "submitting" && j["ended"] !== true
+    ]
+    live_total = length(mine) + length(unlisted)
     for p in policy.partitions
         w = work(p.profile)
         live = [j for j in mine if j.partition == p.name]
+        pending_here = count(j -> j["partition"] == p.name, unlisted)
         prof = p.profile === nothing ? "no profile" : "profile $(p.profile)"
         if w.units == 0
             push!(
@@ -724,7 +1025,7 @@ function decide(
         slots = p.nodes * p.slots_per_node
         n = ceil(Int, (cost - have) / (slots * p.time_limit))
         n = min(n, ceil(Int, (w.units - live_slots) / slots))
-        room = min(p.max_jobs - length(live), policy.max_jobs - live_total)
+        room = min(p.max_jobs - length(live) - pending_here, policy.max_jobs - live_total)
         if room <= 0
             push!(
                 out,
@@ -820,43 +1121,113 @@ function manage!(ctl::JobController, work)::Vector{Decision}
         e isa InterruptException && rethrow()
         return _refuse_all(ctl, "the scheduler could not be asked: $(_short_err(e))")
     end
-    # "No jobs" while the ledger holds jobs that should be listed is not an answer to charge
-    # against: a wrapper, the wrong cluster, a filter. Nothing is submitted on it, and the ledger
-    # is taken as one absence, not as the end of every job.
-    if isempty(states) && _ledger_live(ctl.ledger) && !ctl.policy.dry_run
-        # It still counts as one absence for each live job: if the queue really is empty, the
-        # jobs end after the usual number of polls and the controller goes on.
-        observe!(ctl.ledger, states)
-        save_ledger(ctl.ledger)
-        return _refuse_all(
-            ctl,
-            "the scheduler lists no job at all while the ledger has live ones; " *
-            "not trusted, nothing submitted this round",
-        )
+    # A dry run looks: it decides on a copy of what is on disk and writes nothing. It used to
+    # save the ledger, so three looks at an empty answer marked every job ended.
+    if ctl.policy.dry_run
+        seen = try
+            Ledger(ctl.ledger.path, deepcopy(_read_ledger(ctl.ledger.path)))
+        catch e
+            e isa InterruptException && rethrow()
+            return _refuse_all(ctl, "the ledger cannot be read: $(_short_err(e))")
+        end
+        _observe_and_say!(ctl, seen, states; dry=true)
+        empty!(ctl.ledger.jobs)
+        merge!(ctl.ledger.jobs, seen.jobs)             # what the caller prints is what was seen
+        decisions = decide(ctl.policy, work, states, seen)
+        foreach(d -> _say_decision(ctl, d), decisions)
+        return decisions
     end
-    observe!(ctl.ledger, states)
-    save_ledger(ctl.ledger)
-    decisions = decide(ctl.policy, work, states, ctl.ledger)
-    for d in decisions
+    # Under the ledger's lock, on what is on disk now: a job's last act and a login-node loop
+    # are two controllers on one ledger. A ledger that cannot be locked or read is a refusal;
+    # an error inside the round is the round's own and is raised.
+    entered = Ref(false)
+    return try
+        with_ledger(ctl.ledger) do
+            entered[] = true
+            return _manage_locked!(ctl, work, states)
+        end
+    catch e
+        (e isa InterruptException || entered[]) && rethrow()
+        _refuse_all(ctl, "the ledger could not be used: $(_short_err(e))")
+    end
+end
+
+function _say_decision(ctl::JobController, d::Decision)
+    return log_event(
+        ctl.log,
+        :job_decision;
+        level=d.action === :refuse ? :warn : :info,
+        action=String(d.action),
+        partition=d.partition,
+        reason=d.reason,
+        node_hours=d.node_hours,
+        dry_run=ctl.policy.dry_run,
+    )
+end
+
+# Bring `l` up to the scheduler's answer and log what that changed.
+function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
+    changes = observe!(
+        l,
+        states;
+        names=_job_names(ctl.policy),
+        gone=id -> try
+            job_gone(ctl.scheduler, id)
+        catch e
+            e isa InterruptException && rethrow()
+            nothing
+        end,
+    )
+    for c in changes
         log_event(
             ctl.log,
-            :job_decision;
-            action=String(d.action),
-            partition=d.partition,
-            reason=d.reason,
-            node_hours=d.node_hours,
-            dry_run=ctl.policy.dry_run,
+            c.what === :ended ? :job_ended : :job_adopted;
+            level=c.what === :adopted ? :warn : :info,
+            id=c.id,
+            evidence=c.evidence,
+            was=c.was,
+            polls_missed=c.polls_missed,
+            seconds_billed=c.seconds_billed,
+            dry_run=dry,
         )
-        (d.action === :submit && !ctl.policy.dry_run) || continue
+    end
+    return changes
+end
+
+function _manage_locked!(ctl::JobController, work, states)::Vector{Decision}
+    l = ctl.ledger
+    if !_ledger_exists(l) && isempty(l.jobs)
+        # "Nothing used so far" is an assumption when the file is not there; said once, when
+        # the file is first written.
+        log_event(ctl.log, :ledger_new; level=:warn, path=l.path)
+    end
+    _observe_and_say!(ctl, l, states; dry=false)
+    save_ledger(l)
+    # An answer that lists none of the ledger's live jobs is not one to submit on: the jobs
+    # are there for all this controller knows. They end on evidence (see `observe!`), not on
+    # how often the same answer is repeated.
+    if _ledger_live(l) &&
+        !any(j -> haskey(l.jobs, j.id) && l.jobs[j.id]["ended"] !== true, states)
+        return _refuse_all(
+            ctl,
+            "the scheduler lists none of the $(count(j -> j["ended"] !== true, values(l.jobs))) " *
+            "job(s) the ledger has live; not trusted, nothing submitted this round",
+        )
+    end
+    decisions = decide(ctl.policy, work, states, l)
+    for d in decisions
+        _say_decision(ctl, d)
+        d.action === :submit || continue
         # On record BEFORE the scheduler is called: a job that is queued and not in the ledger
         # is one the budget does not see.
-        tmp = record_intent!(ctl.ledger, d.spec)
+        tmp = record_intent!(l, d.spec)
         id = try
             submit(ctl.scheduler, d.spec)
         catch e
             e isa InterruptException && rethrow()
             # It may have been queued all the same (a timeout after sbatch took it). The row
-            # stays, committed, until a poll finds the job or it has been absent long enough.
+            # stays, committed and holding its place, until a poll finds the job or it has
+            # gone unlisted long enough.
             log_event(
                 ctl.log,
                 :job_submit_failed;
@@ -867,7 +1238,7 @@ function manage!(ctl::JobController, work)::Vector{Decision}
             )
             continue
         end
-        confirm_submit!(ctl.ledger, tmp, id)
+        confirm_submit!(l, tmp, id)
         log_event(
             ctl.log,
             :job_submitted;
@@ -878,7 +1249,7 @@ function manage!(ctl::JobController, work)::Vector{Decision}
             node_hours=d.node_hours,
         )
     end
-    save_ledger(ctl.ledger)
+    save_ledger(l)
     return decisions
 end
 

@@ -73,8 +73,9 @@ function report_progress(step::Integer; of::Union{Integer,Nothing}=nothing, note
     ctx = _KEY[]
     ctx === nothing && return false
     # A unit that no longer holds its key (it was cut, or reclaimed) must not write over the
-    # stamp of whoever holds it now.
-    _still_owner(ctx) || return false
+    # stamp of whoever holds it now. Only on a positive answer: a lock that could not be READ is
+    # not a lock that was lost.
+    _ownership(ctx).state === :lost && return false
     try
         _write_progress(ctx.vault, ctx.kstr, Progress(step, of, time(), String(note)))
         ctx.reported[] = true
@@ -109,12 +110,53 @@ function resume_point()
     return ctx === nothing ? nothing : ctx.resume
 end
 
-# Does this `work_fn` call still hold its key's lock? Outside the per-key pipeline
-# (`check_checkpoints`) there is no lock to hold.
-function _still_owner(ctx::KeyContext)::Bool
-    ctx.cp.mode === :normal || return true
-    return DataVault.running_owner(ctx.vault, ctx.key) == ctx.owner
+# Who holds `key`'s lock, as far as it can be told: `(; state, holder)` with `state`
+#   :mine    — `tok` is on it;
+#   :lost    — positively not: another token is on it (`holder`), or there is no lock;
+#   :unknown — it is there and could not be read, after a few tries. `running_owner` answers
+#              `nothing` for any read error, and on a network file system a read fails now and
+#              then; taken as "not the owner", that stopped healthy units.
+function _lock_state(vault::Vault, key::DataKey, tok::AbstractString; tries::Int=3)
+    for i in 1:tries
+        owner = try
+            DataVault.running_owner(vault, key)
+        catch e
+            e isa InterruptException && rethrow()
+            nothing
+        end
+        owner == tok && return (; state=:mine, holder=owner)
+        owner === nothing || return (; state=:lost, holder=owner)
+        there = try
+            DataVault.is_running(vault, key)
+        catch e
+            e isa InterruptException && rethrow()
+            true                                  # could not even be looked at: not known
+        end
+        there || return (; state=:lost, holder=nothing)
+        i < tries && sleep(0.05 * i)
+    end
+    return (; state=:unknown, holder=nothing)
 end
+
+# The same for the unit a `work_fn` call is: outside the per-key pipeline (`check_checkpoints`)
+# there is no lock to hold. A lock that stays unreadable is said, at most once a minute per key,
+# and the unit goes on: it writes, and the commit's own owner check decides.
+function _ownership(ctx::KeyContext)
+    ctx.cp.mode === :normal || return (; state=:mine, holder=ctx.owner)
+    r = _lock_state(ctx.vault, ctx.key, ctx.owner)
+    if r.state === :unknown && ctx.log !== nothing
+        last = get(_LOCK_UNREADABLE_SAID, ctx.kstr, 0.0)
+        if time() - last >= 60
+            _LOCK_UNREADABLE_SAID[ctx.kstr] = time()
+            log_event(ctx.log, :lock_unreadable; level=:warn, stage=ctx.stage, key=ctx.kstr)
+        end
+    end
+    return r
+end
+
+const _LOCK_UNREADABLE_SAID = Dict{String,Float64}()
+
+_still_owner(ctx::KeyContext)::Bool = _ownership(ctx).state !== :lost
 
 function _write_progress(vault::Vault, kstr::AbstractString, p::Progress)
     atomic_write(_progress_file(vault, kstr)) do io
