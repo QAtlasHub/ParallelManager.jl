@@ -577,6 +577,14 @@ function _order_stops!(m::Master, table::Union{TaskTable,Nothing}, pred, req::Ab
         return [r for r in table.rows if r.state === :running && pred(r)]
     end
     for r in rows
+        old = get(m.ctl.stopping, r.kstr, nothing)
+        if old !== nothing
+            # A stop on a unit that already has one: the earlier deadline stands, and a cut
+            # that is under way stays one. Replaced, the order read `cut = false` again and the
+            # worker's exit was booked as a death of the key.
+            old.deadline = min(old.deadline, deadline)
+            continue
+        end
         m.ctl.stopping[r.kstr] = StopOrder(
             deadline, false, String(req["id"]), get(req, "interrupt", false) === true
         )
@@ -597,65 +605,138 @@ function _enforce_stops!(m::Master, table::TaskTable, log::EventLog)::Bool
             delete!(c.stopping, kstr)
             continue
         end
-        (o.cut || time() <= o.deadline) && continue
+        (o.cut || o.failed || time() <= o.deadline || time() < o.next) && continue
         o.cut = true
         changed = true
-        _cut!(m, row, o, log)
+        _cut!(m, table, row, o, log)
     end
     return changed
 end
 
 # Cut one unit that outlived its grace. The worker goes FIRST, then the lock: released while the
-# worker was still computing, the key would be taken by another master and the first worker
-# would go on writing its checkpoint and progress over the new owner's. With the worker removed
-# the dispatch task's call returns, so the round — and the allocation — is not held by a unit
-# that was told to stop.
+# worker was still computing, the key would be taken by another master and run twice. With the
+# worker removed the dispatch task's call returns, so the round — and the allocation — is not
+# held by a unit that was told to stop.
 #
-# A worker whose launcher this process cannot kill (one started by a cluster manager that keeps
-# no process handle) is asked to leave and may not; that is said in the event
-# (`worker_removed=false`), and the unit's writes are refused by the owner check instead.
-function _cut!(m::Master, row::TaskRow, o::StopOrder, log::EventLog)
+# The rule is enforced, not hoped for: if the worker is still there after the kill (a cluster
+# manager that keeps no process handle, an `rmprocs` that timed out), the lock STAYS, the kill is
+# tried again on later ticks, and after `_CUT_TRIES` the order has failed — the round then ends
+# with an error naming the worker, because the allocation holds a process nobody could stop.
+function _cut!(m::Master, table::TaskTable, row::TaskRow, o::StopOrder, log::EventLog)
     v = m.vault
     tok = row.owner
     pid = row.worker
-    task = @async begin
-        removed = false
-        if pid != 0 && pid != myid()
-            _kill_worker!(pid)
-            removed = !(pid in procs())
+    task = @async try
+        # Still that unit, on that worker? A unit that returned in this tick has handed the
+        # worker its next key, and the kill would land on that one.
+        same = lock(table.lock) do
+            return row.state === :running && row.worker == pid && row.owner == tok
         end
-        released = false
-        err = nothing
-        try
-            released = tok === nothing ? false : DataVault.clear_running!(v, row.key, tok)
-        catch e
-            e isa InterruptException && rethrow()
-            err = _short_err(e)
-        end
-        # The dispatch task releases a dead worker's lock too, and may have got there first:
-        # what matters, and what is reported, is that the lock is no longer this unit's.
-        if !released && err === nothing
-            released = try
-                DataVault.running_owner(v, row.key) != tok
-            catch
-                false
+        if same
+            removed = false
+            if pid != 0 && pid != myid()
+                something(_KILL_WORKER[], _kill_worker!)(pid)
+                removed = !(pid in procs())
+            end
+            if removed
+                _cut_release!(m, row, o, tok, pid, log)
+            else
+                _cut_not_removed!(m, row, o, tok, pid, log)
             end
         end
+    catch e
+        e isa InterruptException && rethrow()
+        # A cut that threw is a cut that did not happen: tried again, and said.
+        o.cut = false
+        o.next = time() + _CUT_RETRY[]
         log_event(
             log,
-            :key_cut;
-            level=:warn,
+            :key_cut_failed;
+            level=:error,
             stage=m.stage,
             key=row.kstr,
-            owner=tok,
             worker=pid,
-            request=o.request,
-            worker_removed=removed,
-            lock_released=released,
-            err=err,
+            err=_short_err(e),
         )
     end
     push!(m.ctl.cuts, task)
+    return nothing
+end
+
+# How often a cut whose worker would not go is tried, and how long between tries.
+const _CUT_TRIES = 3
+const _CUT_RETRY = Ref(5.0)
+# What removes a worker. A `Ref` so a test can stand in a worker that cannot be removed.
+const _KILL_WORKER = Ref{Any}(nothing)
+
+function _cut_release!(m::Master, row::TaskRow, o::StopOrder, tok, pid::Int, log::EventLog)
+    v = m.vault
+    released = false
+    err = nothing
+    try
+        released = tok === nothing ? false : DataVault.clear_running!(v, row.key, tok)
+    catch e
+        e isa InterruptException && rethrow()
+        err = _short_err(e)
+    end
+    # The dispatch task releases a dead worker's lock too, and may have got there first: what
+    # matters, and what is reported, is that the lock is no longer this unit's.
+    if !released && err === nothing
+        released = try
+            DataVault.running_owner(v, row.key) != tok
+        catch
+            false
+        end
+    end
+    log_event(
+        log,
+        :key_cut;
+        level=:warn,
+        stage=m.stage,
+        key=row.kstr,
+        owner=tok,
+        worker=pid,
+        request=o.request,
+        worker_removed=true,
+        lock_released=released,
+        tries=o.tries + 1,
+        err=err,
+    )
+    return nothing
+end
+
+function _cut_not_removed!(
+    m::Master, row::TaskRow, o::StopOrder, tok, pid::Int, log::EventLog
+)
+    o.tries += 1
+    who = lock(() -> get(m.who, pid, nothing), m.lock)
+    host = who === nothing ? "" : who.host
+    if o.tries >= _CUT_TRIES
+        o.failed = true
+        o.why =
+            "worker $pid" *
+            (isempty(host) ? "" : " on $host (pid $(who.pid))") *
+            " could not be removed after $(o.tries) tries; key $(row.kstr) is still " *
+            "running there and its lock is kept"
+    else
+        o.cut = false
+        o.next = time() + _CUT_RETRY[]
+    end
+    log_event(
+        log,
+        :key_cut;
+        level=o.failed ? :error : :warn,
+        stage=m.stage,
+        key=row.kstr,
+        owner=tok,
+        worker=pid,
+        host=host,
+        request=o.request,
+        worker_removed=false,
+        lock_released=false,                 # the worker still computes: the lock is its own
+        tries=o.tries,
+        gave_up=o.failed,
+    )
     return nothing
 end
 

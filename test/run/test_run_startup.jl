@@ -213,7 +213,7 @@ end
             @test r.done == length(ks)
             @test parse(Int, read(joinpath(seen, "n"), String)) >= 1
             kinds = [e.kind for e in _su_events(outdir)]
-            @test !("control_failed" in kinds)
+            @test !("tick_failed" in kinds)
             @test !("manifest_failed" in kinds)
         end
     end
