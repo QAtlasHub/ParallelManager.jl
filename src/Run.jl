@@ -603,7 +603,7 @@ function run!(
     # is not handed work, and the round goes on without it.
     prepare =
         pids -> try
-            _ensure_worker_modules(mods)
+            _ensure_worker_modules(mods; pids=pids)
             _observe_late!(vault, pids, observe, log, stage)
             _redirect_late!(pids)
             pids
@@ -1381,6 +1381,10 @@ function _drive_workers!(
     started = Set{Int}()
     tasks = Task[]
     task_of = Dict{Int,Task}()
+    # Workers that could not be readied in this round: left out, not asked again every tick.
+    rejected = Set{Int}()
+    # With a pool: the workers that were there when `run!` began, which it readied itself.
+    first_foreign = pool === nothing ? Set{Int}() : Set(p for p in workers() if p != myid())
     # Set when the round has to end with an error (a unit that could not be cut, a tick step
     # that keeps failing): no more keys are handed out, the units running finish, and the error
     # is thrown. `abandoned` are the dispatch tasks not waited for: each is inside a call to a
@@ -1555,20 +1559,38 @@ function _drive_workers!(
     # round began were prepared by `run!`; later ones are prepared here.
     function _adopt!()
         # `workers()` is `[1]` when there are none: the master is not one of its own workers.
-        fresh = [p for p in workers() if !(p in started) && p != myid()]
+        fresh = [p for p in workers() if !(p in started) && p != myid() && !(p in rejected)]
         # A worker the pool is still starting is visible here before the pool knows its size;
         # it gets a dispatch task once it is registered, not before.
         pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)
         isempty(fresh) && return nothing
         late = !isempty(started)
-        # Workers `run!` found were readied by it; a pool's own, and any that join later, here.
-        mine = pool === nothing ? Int[] : [p for p in fresh if !(p in pool.foreign)]
-        ready = if prepare === nothing
-            fresh
-        elseif late
-            prepare(fresh)
+        # Workers `run!` found when it began were readied by it; a pool's own, and any that
+        # join later, here.
+        found = if pool === nothing
+            (late ? Int[] : fresh)
         else
-            vcat(setdiff(fresh, mine), isempty(mine) ? Int[] : prepare(mine))
+            [p for p in fresh if p in first_foreign]
+        end
+        todo = setdiff(fresh, found)
+        ready = if prepare === nothing || isempty(todo)
+            fresh
+        else
+            ok = prepare(todo)
+            if length(ok) < length(todo)
+                # The batch failed as one. Each by itself, so the one that cannot be readied is
+                # the only one left out — and it is set aside: asked again every tick, it was
+                # re-readying every worker and logging the same line each second.
+                ok = Int[]
+                for p in todo
+                    if isempty(prepare([p]))
+                        push!(rejected, p)
+                    else
+                        push!(ok, p)
+                    end
+                end
+            end
+            vcat(found, ok)
         end
         _identify_workers!(master, ready)
         who = lock(() -> copy(master.who), master.lock)
@@ -1601,7 +1623,7 @@ function _drive_workers!(
             task_of[pid] = t
             push!(tasks, t)
         end
-        late && log_event(log, :workers_joined; stage=stage, n=n)
+        (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
         return nothing
     end
 
