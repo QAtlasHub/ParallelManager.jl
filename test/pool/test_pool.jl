@@ -406,11 +406,14 @@ end
     _pl_custom((node, size, n, flags) -> error("no such partition")) do pool
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
+            SweepRunner._NODE_FAIL_SPAN[] = 0.0                 # five in a row, however fast
             err = try
                 run!(k -> Dict{String,Any}("x" => 1), v, ks; pool=pool)
                 nothing
             catch e
                 e
+            finally
+                SweepRunner._NODE_FAIL_SPAN[] = 60.0
             end
             @test err isa ErrorException
             @test occursin("worker starts failed in a row", err.msg)
@@ -851,6 +854,7 @@ end
 @testset "a node that cannot start workers is taken out, and said; the others are used (#133)" begin
     nprocs() > 1 && rmprocs(workers())
     pool = SizedPool(_PlTwo(); key_req=k -> KeyReq(1, 1.0), poll=0.05, keep=true)
+    SweepRunner._NODE_FAIL_SPAN[] = 0.0                         # five in a row, however fast
     try
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
@@ -868,10 +872,108 @@ end
                 e -> e.node == gethostname(), [e for e in ev if e.kind == "pool_spawn"]
             )
             @test "bad" in pool.bad_nodes
+            # Not for the rest of the job: after a pause it gets one more try (#154).
+            log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+            SweepRunner._pool_nodes_back!(pool, time(), log, :pl)
+            @test "bad" in pool.bad_nodes                       # not yet
+            SweepRunner._pool_nodes_back!(
+                pool, time() + SweepRunner._NODE_RETRY_AFTER[] + 1, log, :pl
+            )
+            @test !("bad" in pool.bad_nodes)
+            @test pool.node_fails["bad"] == SweepRunner._NODE_MAX_FAILS - 1   # one try
         end
     finally
+        SweepRunner._NODE_FAIL_SPAN[] = 60.0
         shutdown!(pool)
         nprocs() > 1 && rmprocs(workers())
         note_workers!(; planned=0, launched=0)
+    end
+end
+
+# ── third review (#154) ──────────────────────────────────────────────────────────────────────────
+
+@testset "a worker the dispatcher cannot ready is retired in the pool, and a pool of such workers gives up (#154)" begin
+    _pl_pool(; key_req=k -> KeyReq(1, 1.0)) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            t0 = time()
+            # No worker can load this: every one of them is rejected by the dispatcher.
+            err = try
+                run!(
+                    k -> Dict{String,Any}("x" => 1),
+                    v,
+                    ks;
+                    pool=pool,
+                    load=:NoSuchModuleXyz154,
+                )
+                nothing
+            catch e
+                e
+            end
+            # Not a queue that waits for ever behind workers that are counted and unusable.
+            @test err isa ErrorException
+            @test occursin("worker starts failed in a row", err.msg)
+            @test time() - t0 < 300
+            ev = _pl_events(outdir)
+            retired = [e for e in ev if e.kind == "pool_retire"]
+            @test !isempty(retired)
+            @test all(e -> get(e, :why, "") == "rejected by the dispatcher", retired)
+            @test all(k -> !DataVault.is_done(v, k), ks)
+            # The rejected ones were removed and their room is back: what the pool holds is
+            # what its remaining workers hold (starts that were in flight when it gave up
+            # land in a pool made with `keep`), and none of them is a rejected one.
+            room = _pl_room(pool, 4)
+            @test room.free == room.want
+            @test isempty(intersect(keys(pool.workers), [e.worker for e in retired]))
+        end
+    end
+end
+
+@testset "starts that bring some of their workers are not the pool failing (#154)" begin
+    partial = (node, size, n, flags) -> collect(9000 .+ (1:max(n - 1, 0)))   # one short, each time
+    _pl_custom(partial; cores=64, mem_gb=640.0) do pool
+        log = SweepRunner.EventLog(joinpath(mktempdir(), "events_x.jsonl"))
+        node = gethostname()
+        for i in 1:15
+            tok = (pool.seq += 1)
+            pool.starting[tok] = (node, KeyReq(1, 1.0), 4)
+            pool.free_c[node] -= 4
+            pool.free_m[node] -= 4.0
+            SweepRunner._pool_start!(pool, tok, log, :pl)
+            @test pool.fails == 0                               # it brought three of four
+            @test !SweepRunner._pool_gave_up(pool)
+            empty!(pool.workers)                                # (the same fake ids each time)
+        end
+        @test get(pool.node_fails, node, 0) == 0
+        empty!(pool.workers)
+    end
+end
+
+@testset "five quick failures do not take a node out; five over time do (#154)" begin
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        log = SweepRunner.EventLog(joinpath(mktempdir(), "events_x.jsonl"))
+        node = gethostname()
+        for _ in 1:8
+            SweepRunner._pool_node_failed!(pool, node, log, :pl)
+        end
+        @test isempty(pool.bad_nodes)                           # eight in a second: not yet
+        pool.node_fail_since[node] = time() - SweepRunner._NODE_FAIL_SPAN[] - 1
+        SweepRunner._pool_node_failed!(pool, node, log, :pl)
+        @test node in pool.bad_nodes
+    end
+end
+
+@testset "a stall is a start that has been on its way too long, not a quiet pool (#154)" begin
+    _pl_custom((node, size, n, flags) -> Int[]; stall_after=600.0) do pool
+        now = time()
+        pool.last_join = now - 7200                             # two quiet hours
+        @test SweepRunner._pool_oldest_start(pool, now) == now  # nothing in flight
+        pool.starting[1] = (gethostname(), KeyReq(1, 1.0), 1)
+        pool.start_at[1] = now - 5                              # a start that just began
+        @test now - SweepRunner._pool_oldest_start(pool, now) < pool.stall_after
+        pool.start_at[1] = now - 700                            # one that has not come back
+        @test now - SweepRunner._pool_oldest_start(pool, now) >= pool.stall_after
+        delete!(pool.starting, 1)
+        delete!(pool.start_at, 1)
     end
 end
