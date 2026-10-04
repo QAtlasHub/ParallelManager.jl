@@ -309,9 +309,16 @@ with it.
 A master applies only requests made after it started, so a `stop` from last
 week does not stop today's job. For the same reason a request sent when no
 master is running is applied by nobody: the CLI then exits **3** and says so.
-`--wait SECONDS` waits for a master's acknowledgement and prints what it did
-(exit 4: nobody acknowledged in time; exit 5: a master could not apply it, for
-example a `resize` with no worker pool). From Julia, `wait_acks(vault, id)`
+`--wait SECONDS` waits for **every** listening master's acknowledgement and
+prints what each did (exit 4: a master did not acknowledge in time, and is
+named; exit 5: a master could not apply it, for example a `resize` with no
+worker pool). Without `--wait` the command says the request was sent and not
+waited for: whether it is applied is then not known. A master run with
+`status_interval = 0` writes no status, so it is not seen as listening.
+
+A request is checked by the master that reads it, not only by the sender: a
+hand-written `resize` with `n = -1` or a `grace` of NaN is refused, changes
+nothing, and is acknowledged with the reason. From Julia, `wait_acks(vault, id)`
 does the same and `masters_listening(vault)` says who would read a request
 sent now.
 

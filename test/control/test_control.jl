@@ -874,3 +874,148 @@ end
         @test o.deadline < first_deadline
     end
 end
+
+# ── requests are checked by the one who reads them (#138) ────────────────────────────────────────
+
+@testset "a request that cannot be applied changes nothing, and is acknowledged with why (#138)" begin
+    _ct_vault() do v, outdir
+        m = SweepRunner.Master()
+        m.vault = v
+        m.multi = true
+        table = TaskTable(DataVault.keys(v))
+        log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+        apply =
+            req -> SweepRunner._apply_request!(
+                m,
+                table,
+                Dict{String,Any}("id" => "r", req...),
+                log,
+                _ct_opts(),
+                nothing,
+            )
+        # Written by hand, or by another version: `control!` would not have sent these.
+        d = apply(Dict("op" => "resize", "n" => -1))
+        @test occursin("integer >= 0", d["error"])
+        @test m.ctl.target === nothing                          # not left at -1
+        d = apply(Dict("op" => "resize", "n" => 2.5))
+        @test haskey(d, "error") && m.ctl.target === nothing
+        d = apply(Dict("op" => "stop", "grace" => NaN))
+        @test occursin("grace", d["error"])
+        @test !m.ctl.stop_all && isempty(m.ctl.stopping)        # nobody was cut at once
+        d = apply(Dict("op" => "stop", "grace" => -3))
+        @test haskey(d, "error")
+        d = apply(Dict("op" => "drain"))
+        @test occursin("drain needs", d["error"]) && isempty(m.ctl.drained)
+        d = apply(Dict("op" => "enqueue"))
+        @test occursin("keys", d["error"]) && isempty(m.ctl.extra)
+        d = apply(Dict("op" => "explode"))
+        @test occursin("unknown op", d["error"])
+        # An enqueue that fails part-way leaves no keys standing for later rounds.
+        @test_throws Exception apply(
+            Dict("op" => "enqueue", "config" => "/no/such/file.toml")
+        )
+        @test isempty(m.ctl.extra)
+        # And one that is fine still applies.
+        d = apply(Dict("op" => "pause"))
+        @test !haskey(d, "error") && m.ctl.paused
+        d = apply(Dict("op" => "stop", "grace" => 30))
+        @test !haskey(d, "error") && m.ctl.stop_all
+    end
+end
+
+@testset "cli: every listening master is waited for, and a failed reap is not exit 0 (#138)" begin
+    _ct_vault() do v, outdir
+        run!(_ct_ok, v, DataVault.keys(v))
+        # Two masters that report as running; only one answers.
+        real = only(read_status(v))
+        for id in ("hostA_1", "hostB_2")
+            dir = joinpath(state_root(v), "masters", id)
+            mkpath(dir)
+            st = Dict{String,Any}(
+                k => val for (k, val) in real if !(k in ("stale", "path"))
+            )
+            st["master"] = id
+            st["state"] = "running"
+            st["updated"] = time() + 3600
+            write(joinpath(dir, "status.json"), JSON3.write(st))
+        end
+        listening = SweepRunner.masters_listening(outdir)
+        @test Set(listening) ⊇ Set(["hostA_1", "hostB_2"])
+        if Set(listening) ⊇ Set(["hostA_1", "hostB_2"])
+            io = IOBuffer()
+            t = @async SweepRunner.cli(["pause", outdir, "--wait", "3"]; io=io)
+            # hostA acknowledges whatever request appears.
+            ackd = false
+            t0 = time()
+            while !ackd && time() - t0 < 10
+                reqs = joinpath(state_root(v), "control", "requests")
+                for f in (isdir(reqs) ? readdir(reqs) : String[])
+                    id = replace(f, ".json" => "")
+                    dir = joinpath(state_root(v), "control", "acks", id)
+                    mkpath(dir)
+                    ack = Dict(
+                        "master" => "hostA_1",
+                        "id" => id,
+                        "op" => "pause",
+                        "detail" => Dict(),
+                    )
+                    write(joinpath(dir, "hostA_1.json"), JSON3.write(ack))
+                    ackd = true
+                end
+                sleep(0.05)
+            end
+            code = fetch(t)
+            out = String(take!(io))
+            @test code == 4                                     # one master did not answer
+            @test occursin("hostA_1: applied", out)
+            @test occursin("no acknowledgement", out) && occursin("hostB_2", out)
+        end
+    end
+    # A reap that could not remove a lock says which and why, and is not a success.
+    _ct_vault() do v, outdir
+        k = DataVault.keys(v)[1]
+        p = run(`sleep 0.01`; wait=false)
+        gone = string(gethostname(), ":", getpid(p), ":0000dead")
+        wait(p)
+        @test DataVault.acquire_running!(v, k, gone) === :ok
+        dir = dirname(DataVault._running_file(v, k))
+        chmod(dir, 0o555)                                       # nothing can be moved out of it
+        try
+            if !iswritable(dir)                                 # not as root
+                io = IOBuffer()
+                @test SweepRunner.cli(["locks", outdir, "--reap"]; io=io) == 1
+                out = String(take!(io))
+                @test occursin("reaped 0 of 1 dead lock(s)", out)
+                @test occursin("1 could not be removed", out)
+                @test occursin(".running", out)                 # which one
+            end
+        finally
+            chmod(dir, 0o755)
+        end
+        @test SweepRunner.cli(["locks", outdir, "--reap"]; io=IOBuffer()) == 0
+        @test !DataVault.is_running(v, k)
+    end
+end
+
+@testset "a scheduler command that fails says how (#138)" begin
+    @test SweepRunner._run_command(`sh -c "echo to-stderr >&2; exit 7"`) === nothing
+    @test occursin("exited with code 7", SweepRunner._COMMAND_FAILURE[])
+    @test occursin("to-stderr", SweepRunner._COMMAND_FAILURE[])
+    @test SweepRunner._run_command(`no-such-command-here-xyz`) === nothing
+    @test occursin("could not be started", SweepRunner._COMMAND_FAILURE[])
+    @test SweepRunner._run_command(`sleep 5`; timeout=0.2) === nothing
+    @test occursin("did not answer", SweepRunner._COMMAND_FAILURE[])
+    @test SweepRunner._run_command(`echo fine`) == "fine\n"
+    @test SweepRunner._COMMAND_FAILURE[] == ""
+    # ...and the scheduler's error carries it.
+    failing =
+        cmd -> SweepRunner._run_command(`sh -c "echo slurm_load_jobs error >&2; exit 1"`)
+    err = try
+        SweepRunner.job_states(SlurmScheduler(; user="me", run=failing))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException
+    @test occursin("exited with code 1", err.msg) && occursin("slurm_load_jobs", err.msg)
+end

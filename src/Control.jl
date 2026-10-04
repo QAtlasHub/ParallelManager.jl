@@ -460,6 +460,10 @@ function _apply_request!(
     c = m.ctl
     op = Symbol(req["op"])
     d = Dict{String,Any}()
+    # The file is checked by the one who READS it: it may be hand-written, or from another
+    # version. A request that is refused changes nothing and is acknowledged with the reason.
+    why = _check_request(req)
+    why === nothing || return (d["error"]=why; d)
     if op === :pause
         c.paused = true
     elseif op === :resume
@@ -472,9 +476,11 @@ function _apply_request!(
         end
         have = Set(canonical(k) for k in c.extra)
         fresh = DataKey[k for k in ks if !(canonical(k) in have)]
-        append!(c.extra, fresh)
         d["keys"] = length(ks)
+        # The table first: if that throws, the keys are not left standing for later rounds by
+        # a request that is acknowledged as failed.
         d["queued"] = table === nothing ? 0 : _enqueue!(m, table, ks, log, opts, affinity)
+        append!(c.extra, fresh)
     elseif op === :cancel
         flt = _filter_of(req)
         push!(c.cancels, flt)
@@ -505,12 +511,53 @@ function _apply_request!(
     elseif op === :drain
         push!(c.drained, String(req["node"]))
     elseif op === :resize
+        before = c.target
         c.target = Int(req["n"])
-        merge!(d, _resize!(m, table, log))
+        try
+            merge!(d, _resize!(m, table, log))
+        catch
+            c.target = before                       # not applied: not left in force either
+            rethrow()
+        end
     else
         d["error"] = "unknown op"
     end
     return d
+end
+
+# What is wrong with a request, in words, or `nothing`. `control!` checks what it writes; this
+# checks what is read.
+function _check_request(req::AbstractDict)
+    op = get(req, "op", nothing)
+    op isa AbstractString || return "the request has no `op`"
+    Symbol(op) in _CONTROL_OPS || return "unknown op $(repr(op))"
+    grace = get(req, "grace", nothing)
+    if grace !== nothing
+        (grace isa Real && isfinite(grace) && grace >= 0) ||
+            return "grace must be a finite number of seconds >= 0, got $(repr(grace))"
+    end
+    if op == "resize"
+        n = get(req, "n", nothing)
+        (n isa Integer && n >= 0) ||
+            return "resize needs n, an integer >= 0; got $(repr(n))"
+    end
+    if op == "drain"
+        node = get(req, "node", nothing)
+        (node isa AbstractString && !isempty(node)) ||
+            return "drain needs the name of a node; got $(repr(node))"
+    end
+    node = get(req, "node", nothing)
+    (node === nothing || node isa AbstractString) ||
+        return "node must be a name, got $(repr(node))"
+    if op == "enqueue"
+        (haskey(req, "keys") || haskey(req, "config")) ||
+            return "enqueue needs `keys` or `config`"
+    end
+    for f in ("running", "interrupt")
+        v = get(req, f, nothing)
+        (v === nothing || v isa Bool) || return "$f must be true or false, got $(repr(v))"
+    end
+    return nothing
 end
 
 # Add keys to a table that is being drawn. A key that is done is settled, one that is locked is

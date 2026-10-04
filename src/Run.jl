@@ -1304,10 +1304,27 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
             end
         end
         try
-            DataVault.clear_running!(vault, r.key, tok)
-            log_event(
-                log, :lock_released; stage=stage, key=r.kstr, owner=tok, why="master_exit"
-            )
+            # `false`: the lock was not this token's any more (released by a cut, or taken by
+            # a sibling). Said as that, not as a release that did not happen.
+            if DataVault.clear_running!(vault, r.key, tok)
+                log_event(
+                    log,
+                    :lock_released;
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    why="master_exit",
+                )
+            else
+                log_event(
+                    log,
+                    :lock_not_ours;
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    why="master_exit: the lock was already released or is held by another",
+                )
+            end
         catch e
             e isa InterruptException && rethrow()
             # Said as what it is: the lock is still there, until `stale_after`.
