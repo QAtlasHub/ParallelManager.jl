@@ -1935,6 +1935,9 @@ function _round_settle!(r::Round, i::Int, row, pid::Int, t0, outcome)
     return nothing
 end
 
+# How long a round that has ended waits for readying that is still under way.
+const _PREPARE_DRAIN = Ref(60.0)
+
 # Start a dispatch task for every worker that does not have one. Workers present when the
 # round began were prepared by `run!`; later ones are prepared here — beside the ticker, not in
 # it. Readying loads modules and reads the sources on each worker, seconds on a cluster's file
@@ -2417,6 +2420,12 @@ function _drive_workers!(
         for pid in r.started
             pid in workers() && remote_do(_drop_round, pid, r.rid)
         end
+        # Workers still being readied are not adopted any more, but what the readying started
+        # on them — a module load, an observation writing its snapshot under the outdir — is
+        # waited for, within a bound: when `run!` returns nothing of the round is still
+        # running. (It was: a caller that removed its outdir right after `run!` found a worker
+        # still writing into it.)
+        timedwait(() -> isempty(r.preparing), _PREPARE_DRAIN[]; pollint=0.05)
     end
     return _round_finish!(r, failure)
 end

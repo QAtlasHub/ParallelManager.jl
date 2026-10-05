@@ -1375,3 +1375,25 @@ end
         end
     end
 end
+
+@testset "when run! returns, no worker of the round is still being readied" begin
+    # One worker per start, so the keys are done by the first while the next ones are still
+    # being readied (three seconds each): the readying is waited for, not left running behind
+    # a `run!` that has returned — it writes under the outdir.
+    short = (node, size, n, flags) -> _pl_local(node, size, 1, flags)
+    _pl_custom(short) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            r = withenv("SWEEPRUNNER_TEST_OBSERVE_DELAY" => "3") do
+                run!(k -> (sleep(0.2); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
+            end
+            @test r.done == length(ks)
+            seen =
+                () ->
+                    count(e -> e.kind in ("observed", "observe_failed"), _pl_events(outdir))
+            n = seen()
+            sleep(4.0)                                           # longer than one readying
+            @test seen() == n
+        end
+    end
+end
