@@ -1644,7 +1644,7 @@ function _drive_workers!(
             tok = owner_token(host, ospid)
             # Settled since it was drawn (a stop's `settle_queued!`): not started after all.
             start_task!(table, i, tok, pid) || continue
-            pool === nothing || _pool_served!(pool)
+            pool === nothing || _pool_served!(pool, pid)
             _out_add!(tok, vault, row.key)
             out[] += 1
             t0 = time()
@@ -1987,6 +1987,7 @@ function _drive_workers!(
             level=:error,
             stage=stage,
             fails=pool.fails,
+            rejects=pool.rejects,
             nodes_out=sort!(collect(pool.bad_nodes)),
             queued=count(r -> r.state === :todo, table.rows),
         )
@@ -1995,11 +1996,19 @@ function _drive_workers!(
         else
             " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
         end
+        # What to look for depends on what failed: starts that brought nothing, or workers that
+        # started and could not be readied.
+        what, where = if pool.rejects > pool.fails
+            "$(pool.rejects) workers in a row started and could not be readied",
+            "kind=\"workers_rejected\" / \"pool_retire\""
+        else
+            "$(pool.fails) worker starts failed in a row",
+            "kind=\"pool_spawn_failed\" / \"pool_spawn_short\""
+        end
         error(
-            "SizedPool: $(max(pool.fails, pool.rejects)) worker starts failed in a row with keys still queued." *
+            "SizedPool: $what with keys still queued." *
             nodes_out *
-            " The reasons are in the event log (kind=\"pool_spawn_failed\" / " *
-            "\"pool_spawn_short\").",
+            " The reasons are in the event log ($where).",
         )
     end
 

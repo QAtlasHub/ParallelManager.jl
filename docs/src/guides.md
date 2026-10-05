@@ -1062,9 +1062,18 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
 - A start that fails is logged (`pool_spawn_failed`), one that brings fewer
   workers than asked too (`pool_spawn_short`), and a worker that started but
   could not be readied is removed. Starts that neither join nor fail for
-  `stall_after` are a `pool_stalled` warning. **Ten failed starts in a row
-  with keys still queued is an error from `run!`** (`pool_gave_up`), not a
-  round that quietly ended.
+  `stall_after` (counted from when the oldest of them began) are a
+  `pool_stalled` warning.
+- **A node that does not work is taken out, and the pool gives up only when
+  nothing is left to try.** A node counts a failure when a start there brings
+  no worker, or when one of its workers starts and cannot be readied; five in
+  a row over at least a minute take it out (`pool_node_out`, with why). It is
+  tried once more five minutes later (`pool_node_retry`); a worker of that node
+  taking a key clears it. `run!` throws (`pool_gave_up`) — instead of the round
+  quietly ending — when every node has been taken out twice, or when ten starts
+  (or ten readied workers) in a row have failed over at least a minute. The
+  spans are there because a job's first tick starts more than ten batches at
+  once, and a few seconds of `srun` refusing fails them together.
 - A worker whose launching process has exited is treated as gone even before
   Distributed notices the connection drop.
 
