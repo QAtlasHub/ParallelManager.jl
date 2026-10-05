@@ -56,6 +56,11 @@ comfortably.  Set lower values only for local debugging.
   instead of that stall. Defaults to `ENV["SWEEPRUNNER_MAX_WORKERS"]`, else what
   [`srun_worker_limit`](@ref) reads from the cluster, else no limit. Above it, run several
   masters on node groups ([`split_nodes`](@ref)) with `SWEEPRUNNER_SHARD=i/m`.
+- Under `:slurm` all workers are tasks of one `srun` step. It is started with
+  `SLURM_KILL_BAD_EXIT=0` (what `srun -K0` sets), so that on a cluster configured with
+  `KillOnBadExit=1` one worker that is killed — out of memory, most often — does not end the
+  step and every other worker with it. A value the job's own environment sets is left alone:
+  export `SLURM_KILL_BAD_EXIT=1` to have the whole step end with its first failed worker.
 - `worker_logs` — a directory: every worker writes its own stdout / stderr to a file there
   ([`worker_logs!`](@ref)) instead of relaying each line through the master.
 
@@ -145,13 +150,10 @@ function init_workers!(;
             # `SLURM_KILL_BAD_EXIT=0` (what `srun -K0` sets): all workers are tasks of ONE
             # `srun` step, and on a cluster configured with `KillOnBadExit=1` a single worker
             # that is killed — out of memory, most often — has Slurm terminate the whole step,
-            # every other worker with it. Seen on the first run on a cluster: one `kill -9`,
-            # sixteen workers gone. A value the job's own script set is left alone.
+            # every other worker with it. A value the job's own script set is left alone.
             withenv(_slurm_launch_env(n_workers, worker_timeout)...) do
-                mgr = SlurmClusterManager.SlurmManager(;
-                    launch_timeout=Float64(launch_timeout)
-                )
-                return addprocs(mgr; exeflags=`--project=$project $flags`)
+                launch = something(_SLURM_LAUNCH[], _slurm_addprocs)
+                return launch(Float64(launch_timeout), `--project=$project $flags`)
             end
             worker_logs === nothing || worker_logs!(worker_logs)
         end
@@ -292,6 +294,15 @@ function verify_workers!()
     flush(stdout)
     return nothing
 end
+
+# Start the `:slurm` backend's workers: one `srun` step, one task per worker.
+function _slurm_addprocs(launch_timeout::Float64, exeflags)
+    mgr = SlurmClusterManager.SlurmManager(; launch_timeout=launch_timeout)
+    return addprocs(mgr; exeflags=exeflags)
+end
+# What `init_workers!` calls to start them. A `Ref` so a test can see the environment `srun`
+# would be started in without a scheduler.
+const _SLURM_LAUNCH = Ref{Any}(nothing)
 
 # The environment `srun` is started in for the `:slurm` backend's workers.
 function _slurm_launch_env(n_workers::Integer, worker_timeout, env=ENV)

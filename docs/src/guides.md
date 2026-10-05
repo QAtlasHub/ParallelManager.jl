@@ -628,8 +628,12 @@ What keeps that check from passing on an under-count:
   it was last seen running and its time limit has passed. Evidence that the
   wrong cluster would give too — half an hour of answers listing none of the
   ledger's jobs, or of the accounting calling it live while the queue does
-  not list it — is marked `weak` and logged as a warning. It is then billed for
-  what it can have run since it was last seen. A job in any listed state
+  not list it — is marked `weak` and logged as a warning. A job whose end the
+  accounting confirmed is billed the time the accounting gives for it (`sacct
+  -o ElapsedRaw`); any other, or one the accounting has no time for, is billed
+  what it can have run since it was last seen, up to its limit. `job_ended`
+  says which (`billed_by`), and an accounting that could not be asked for the
+  time is logged as `job_elapsed_failed`. A job in any listed state
   (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
   live again.
 - An answer that lists none of the ledger's live jobs — empty, another

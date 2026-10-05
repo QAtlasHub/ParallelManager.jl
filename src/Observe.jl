@@ -106,17 +106,35 @@ end
 # The same, for workers that joined after the round began (see `_drive_workers!`).
 #
 # All of them at once, like the first ones: an observation reads the sources (seconds each on a
-# cluster's file system), and asked one worker after the other a pool of forty was readied for
-# four minutes after its thirty-two keys were done — a pool of 1500 would take hours.
+# cluster's file system), so asking one worker after the other takes that long per worker.
+#
+# Each worker's call is its own: `asyncmap` rethrows the first exception and drops every other
+# result with it, so one worker that had gone away voided the observations the others had
+# already made — none was logged, and all were asked again, one at a time.
 function _observe_late!(vault::Vault, pids, observe::Bool, log, stage)
     if !observe
-        asyncmap(
-            pid -> remotecall_fetch(SweepRunner._forget_observation!, pid, vault), pids
-        )
+        failed = asyncmap(pids) do pid
+            try
+                remotecall_fetch(SweepRunner._forget_observation!, pid, vault)
+                nothing
+            catch e
+                e isa InterruptException && rethrow()
+                e
+            end
+        end
+        # A worker that could not be told to forget would name a stale observation in its
+        # markers: that is the caller's to act on, once the others have been told.
+        i = findfirst(!isnothing, failed)
+        i === nothing || throw(failed[i])
         return nothing
     end
     outcomes = asyncmap(pids) do pid
-        return remotecall_fetch(SweepRunner._observe_here!, pid, vault, "worker")
+        try
+            remotecall_fetch(SweepRunner._observe_here!, pid, vault, "worker")
+        catch e
+            e isa InterruptException && rethrow()
+            (nothing, _short_err(e))
+        end
     end
     for (pid, (token, err)) in zip(pids, outcomes)
         if token === nothing

@@ -287,28 +287,33 @@ const _SACCT_LIVE = (
 # Asked of the accounting, for a job the queue no longer lists. `nothing` whenever the answer is
 # not one of the known states: accounting off, the job not in it yet, the command failing.
 # (Read against stubs only: this has not been run on a cluster.)
-function job_gone(s::SlurmScheduler, id::AbstractString)
-    out = _run(s, `sacct -n -X -P -j $id -o State`)
-    # The command failing is not "no evidence": it is said (the caller logs it), so that an
-    # accounting that is off or down is known to be why a job's end is seen late.
+# The first line the accounting gives for `field` of job `id`, or `nothing` when it gives none
+# (accounting off, the job not in it yet). The command failing is not "no answer": it throws,
+# for the caller to say, so that an accounting that is down is known to be why a job's end is
+# seen late or its time is an estimate.
+function _sacct_first(s::SlurmScheduler, id::AbstractString, field::AbstractString)
+    out = _run(s, `sacct -n -X -P -j $id -o $field`)
     out === nothing && error("sacct failed for job $id" * _why_failed())
     lines = split(out, '\n'; keepempty=false)
-    isempty(lines) && return nothing
-    state = first(split(strip(first(lines))))          # "CANCELLED by 1234" -> CANCELLED
+    return isempty(lines) ? nothing : String(strip(first(lines)))
+end
+
+function job_gone(s::SlurmScheduler, id::AbstractString)
+    line = _sacct_first(s, id, "State")
+    line === nothing && return nothing
+    state = first(split(line))                          # "CANCELLED by 1234" -> CANCELLED
     state in _SACCT_OVER && return true
     state in _SACCT_LIVE && return false
     return nothing
 end
 
-# How long the accounting says a job ran, in seconds; `nothing` when it cannot say. (First run
-# against a cluster: a 30-second job that the ledger saw end through the accounting was billed
-# its whole two-minute limit, because the last time the queue listed it was all it had.)
+# How long the accounting says a job ran, in seconds; `nothing` when it gives no time. Without
+# it a job that the ledger sees end through the accounting can only be billed the most it can
+# have run since the queue last listed it — its whole limit, for one that finished early.
 function job_elapsed(s::SlurmScheduler, id::AbstractString)
-    out = _run(s, `sacct -n -X -P -j $id -o ElapsedRaw`)
-    out === nothing && return nothing
-    lines = split(out, '\n'; keepempty=false)
-    isempty(lines) && return nothing
-    secs = tryparse(Float64, strip(first(lines)))
+    line = _sacct_first(s, id, "ElapsedRaw")
+    line === nothing && return nothing
+    secs = tryparse(Float64, line)
     return (secs === nothing || !isfinite(secs) || secs < 0) ? nothing : secs
 end
 
@@ -913,14 +918,19 @@ job_gone(::Scheduler, ::AbstractString) = nothing
 """
     job_elapsed(scheduler, id) -> Union{Float64,Nothing}
 
-How long a job that has ended ran, by the scheduler's accounting; `nothing` when it cannot say
-(the default). The ledger bills a job that the accounting says is over for this, instead of for
-the most it can have run since the queue last listed it.
+How long a job that has ended ran, by the scheduler's accounting; `nothing` when it has no
+answer (the default). May throw when the accounting cannot be asked: that is logged
+(`job_elapsed_failed`) and the job is billed the estimate.
+
+The ledger bills a job whose end the accounting has confirmed ([`job_gone`](@ref), on two
+polls) for this, instead of for the most it can have run since the queue last listed it; the
+`job_ended` event says which (`billed_by`: `accounting` or `estimate`).
 """
 job_elapsed(::Scheduler, ::AbstractString) = nothing
 
 """
-    observe!(ledger, states; now=time(), names=(), gone=id -> nothing) -> Vector{NamedTuple}
+    observe!(ledger, states; now=time(), names=(), gone=id -> nothing,
+             elapsed=id -> nothing) -> Vector{NamedTuple}
 
 Bring the ledger up to what the scheduler says, and return what changed
 (`(; id, what, evidence, …)`, `what` being `:ended` or `:adopted`), for the caller to log.
@@ -940,8 +950,10 @@ Bring the ledger up to what the scheduler says, and return what changed
     also what the wrong cluster gives. (Three such answers in a row, with no time required,
     used to empty the ledger.) Or
   - the clock says it cannot be running: it was seen running and its time limit has passed.
-- A job ended by absence is billed for what it can have run since it was last seen (up to its
-  time limit). A job that reappears is live again.
+- A job that has ended is billed for what it can have run since it was last seen (up to its
+  time limit) — or, when the accounting confirmed its end and `elapsed(id)` gives a time, for
+  that time. Each `:ended` change says which (`billed_by`) and carries the error of an
+  `elapsed` that threw (`elapsed_err`). A job that reappears is live again.
 - A row still `submitting` (the controller did not learn the id) takes the id of a listed job
   with its name that the ledger does not have yet.
 """
@@ -1064,21 +1076,30 @@ function observe!(
         evidence === nothing && continue
         j["ended"] = true
         billed = 0.0
+        billed_by = "estimate"
+        elapsed_err = ""
         if j["state"] != "submitting"
             # It ran, at most, from when it was last seen until now.
             before = Float64(j["elapsed"])
             j["elapsed"] = min(Float64(j["time_limit"]), before + max(since, 0.0))
             isfinite(j["elapsed"]) || (j["elapsed"] = before + max(since, 0.0))
-            # ...unless the accounting, which is what says it is over, also says for how long:
-            # a job that finished its work early is not billed its whole limit.
+            # ...unless the accounting, having confirmed that it is over, also says for how
+            # long: then a job that finished its work early is not billed its whole limit.
+            # Which of the two a job was billed is recorded, and a question that failed is
+            # returned for the caller to say: an estimate counts against the budget like a
+            # measurement and must not look like one.
             if confirmed
                 ran = try
                     elapsed(id)
                 catch e
                     e isa InterruptException && rethrow()
+                    elapsed_err = _short_err(e)
                     nothing
                 end
-                (ran isa Real && isfinite(ran) && ran >= 0) && (j["elapsed"] = Float64(ran))
+                if ran isa Real && isfinite(ran) && ran >= 0
+                    j["elapsed"] = Float64(ran)
+                    billed_by = "accounting"
+                end
             end
             billed = j["elapsed"]
         end
@@ -1093,6 +1114,8 @@ function observe!(
                 was=String(j["state"]),
                 polls_missed=Int(get(j, "missing", 0)),
                 seconds_billed=billed,
+                billed_by=billed_by,
+                elapsed_err=elapsed_err,
             ),
         )
         j["state"] = "ended"
@@ -1511,9 +1534,22 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
             was=c.was,
             polls_missed=c.polls_missed,
             seconds_billed=c.seconds_billed,
+            billed_by=get(c, :billed_by, "estimate"),
             dry_run=dry,
         )
     end
+    # The accounting confirmed these ends and could not be asked for how long they ran: they
+    # were billed an estimate. Said once a round, like a failing `job_gone`.
+    unasked = [c for c in changes if !isempty(get(c, :elapsed_err, ""))]
+    isempty(unasked) || log_event(
+        ctl.log,
+        :job_elapsed_failed;
+        level=:warn,
+        id=first(unasked).id,
+        ids=[c.id for c in unasked],
+        err=first(unasked).elapsed_err,
+        dry_run=dry,
+    )
     return changes
 end
 

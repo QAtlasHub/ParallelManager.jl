@@ -1399,7 +1399,7 @@ end
 end
 
 @testset "a job the accounting says is over is billed for what the accounting says it ran" begin
-    # Found on a cluster (issp-ohtaka, job 3094908): 30 s of work, billed the 120 s limit.
+    # A job that did 30 s of work was billed its 120 s limit.
     spec = JobSpec(; name="t-a", partition="a", nodes=2, time_limit=3600.0, script="s")
     over = id -> true
     run_it =
@@ -1417,22 +1417,79 @@ end
     l, ch = run_it(id -> nothing)
     @test ch.seconds_billed == 310.0
     # With one: that, also when it is less than what the queue last showed plus the wait.
+    @test ch.billed_by == "estimate" && ch.elapsed_err == ""
     l, ch = run_it(id -> 42.0)
     @test ch.seconds_billed == 42.0
+    @test ch.billed_by == "accounting"
     @test l.jobs["1"]["elapsed"] == 42.0
     @test node_hours(l).used == 2 * 42.0 / 3600
     # An answer that is not a time, or a question that throws, changes nothing.
     @test run_it(id -> NaN)[2].seconds_billed == 310.0
-    @test run_it(id -> error("sacct is down"))[2].seconds_billed == 310.0
+    ch = run_it(id -> error("sacct is down"))[2]
+    @test ch.seconds_billed == 310.0
+    # ...and the estimate does not pass for a measurement: which it was, and why.
+    @test ch.billed_by == "estimate" && occursin("sacct is down", ch.elapsed_err)
     # The command and what is read from it.
     answers = Dict{String,Any}("sacct" => "30\n")
     seen = Cmd[]
     s = SlurmScheduler(; user="me", run=cmd -> (push!(seen, cmd); answers[cmd.exec[1]]))
     @test SweepRunner.job_elapsed(s, "7") == 30.0
     @test last(seen).exec == ["sacct", "-n", "-X", "-P", "-j", "7", "-o", "ElapsedRaw"]
-    for out in ("", "\n", "Unknown\n", "-5\n", nothing)
+    for out in ("", "\n", "Unknown\n", "-5\n")
         answers["sacct"] = out
         @test SweepRunner.job_elapsed(s, "7") === nothing
     end
+    # The command failing is not "no time": it throws, like `job_gone`, for the caller to say.
+    answers["sacct"] = nothing
+    @test_throws ErrorException SweepRunner.job_elapsed(s, "7")
     @test SweepRunner.job_elapsed(MockScheduler(), "7") === nothing
+end
+
+# A scheduler whose accounting also says how long a job ran — or cannot be asked.
+struct _JbTimed <: SweepRunner.Scheduler
+    inner::MockScheduler
+    elapsed::Base.RefValue{Any}
+end
+SweepRunner.submit(s::_JbTimed, spec::JobSpec) = SweepRunner.submit(s.inner, spec)
+SweepRunner.job_states(s::_JbTimed) = SweepRunner.job_states(s.inner)
+SweepRunner.job_gone(s::_JbTimed, id::AbstractString) = SweepRunner.job_gone(s.inner, id)
+function SweepRunner.job_elapsed(s::_JbTimed, ::AbstractString)
+    e = s.elapsed[]
+    return e isa Exception ? throw(e) : e
+end
+
+@testset "the controller bills from the accounting, and says when it had to estimate" begin
+    ended_with =
+        elapsed -> begin
+            outdir = mktempdir()
+            sched = _JbTimed(MockScheduler(), Ref{Any}(elapsed))
+            ctl = JobController(
+                sched, _jb_policy([_jb_part(; max_jobs=1)]; dry_run=false), outdir
+            )
+            manage!(ctl, _jb_work(100, 60000))
+            empty!(sched.inner.jobs)                                 # it ended
+            SweepRunner._ENDED_MIN_ABSENT[] = 0.3
+            try
+                manage!(ctl, _jb_work(0))
+                sleep(0.35)
+                manage!(ctl, _jb_work(0))
+            finally
+                SweepRunner._ENDED_MIN_ABSENT[] = 120.0
+            end
+            ev = _jb_events(outdir)
+            return ctl, only([e for e in ev if e.kind == "job_ended"]), ev
+        end
+    ctl, ended, ev = ended_with(42.0)
+    @test ended.seconds_billed == 42 && ended.billed_by == "accounting"
+    @test node_hours(ctl.ledger).used == 2 * 42.0 / 3600         # two nodes
+    @test !any(e -> e.kind == "job_elapsed_failed", ev)
+    ctl, ended, ev = ended_with(ErrorException("sacct failed for job 1001"))
+    @test ended.billed_by == "estimate" && ended.seconds_billed > 0
+    failed = only([e for e in ev if e.kind == "job_elapsed_failed"])
+    @test collect(String, failed.ids) == [String(ended.id)]
+    @test occursin("sacct failed", failed.err)
+    # No time from the accounting: an estimate, and nothing failed.
+    ctl, ended, ev = ended_with(nothing)
+    @test ended.billed_by == "estimate"
+    @test !any(e -> e.kind == "job_elapsed_failed", ev)
 end
