@@ -378,8 +378,29 @@ end
 # Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
 # cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
 # a job step dies with its srun client.
-function _kill_worker!(id::Integer; waitfor::Real=5)
+function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
     p = _launcher(id)
+    if hard
+        # For a worker known to be busy (a cut, a master on its way out): asking first is
+        # seconds of waiting behind Distributed's worker lock, one worker at a time, during
+        # which the unit goes on — and, in a cut, can return and take its next key. What
+        # launched it is killed at once, and Distributed is told without waiting.
+        try
+            if p isa Base.Process && process_running(p)
+                kill(p)                      # SIGTERM: an `srun` client takes its step with it
+                timedwait(() -> !process_running(p), 1.0; pollint=0.02) === :ok ||
+                    kill(p, Base.SIGKILL)
+            end
+        catch
+        end
+        try
+            id in procs() && rmprocs(id; waitfor=0)
+        catch
+        end
+        # Gone from `procs()` once Distributed has seen the connection drop.
+        timedwait(() -> !(id in procs()), Float64(waitfor); pollint=0.02)
+        return nothing
+    end
     try
         id in procs() && rmprocs(id; waitfor=waitfor)
     catch
@@ -587,6 +608,10 @@ mutable struct SizedPool
     said_limit::Bool
     closing::Bool           # `shutdown!` is under way: a start that lands now is removed
     rejects::Int            # workers in a row that started and could not be used
+    fail_since::Float64     # since when starts have been failing in a row (0: they are not)
+    reject_since::Float64   # the same for rejected workers
+    # node => how many times it has been taken out: a node is given up on the second time.
+    const node_outs::Dict{String,Int}
 end
 
 """
@@ -689,6 +714,9 @@ function SizedPool(
         false,
         false,
         0,
+        0.0,
+        0.0,
+        Dict{String,Int}(),
     )
 end
 
@@ -1090,7 +1118,9 @@ function _pool_tick!(
     # ended the moment the small keys were done, with the large ones reported `worker_lost`.
     freeing =
         any(w -> w.retiring, values(pool.workers)) ||
-        (waiting_for_room && !isempty(unwanted))
+        (waiting_for_room && !isempty(unwanted)) ||
+        # A node that was taken out comes back for a retry: waiting does change that.
+        any(n -> get(pool.node_outs, n, 0) < 2, pool.bad_nodes)
     pool.stuck =
         !isempty(needs) &&
         isempty(plan.starts) &&
@@ -1161,9 +1191,16 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
         pool.free_m[node] += short * size.mem_gb
         pool.last_join = time()
         if short > 0 && !pool.closing
-            # A start that brought SOME workers is not a failure of the pool: batches of 64
-            # that each missed one used to add up to "ten starts failed in a row".
-            isempty(ids) ? (pool.fails += 1) : (pool.fails = 0)
+            # A start that brought MOST of its workers is not a failure of the pool: batches of
+            # 64 that each missed one used to add up to "ten starts failed in a row". One that
+            # brought none is; one that brought a few of many is neither counted nor forgiven.
+            if isempty(ids)
+                pool.fails += 1
+                pool.fail_since == 0.0 && (pool.fail_since = time())
+            elseif 2 * length(ids) >= n
+                pool.fails = 0
+                pool.fail_since = 0.0
+            end
             # Said also when NO worker came and nothing was thrown: the count rose in silence,
             # and the error after ten failures pointed at events that did not exist.
             threw || log_event(
@@ -1179,16 +1216,15 @@ function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
             )
             # A node that brought up SOME of what was asked can start workers: it is the start
             # that brought none that counts against the node.
-            if isempty(ids)
-                _pool_node_failed!(pool, node, log, stage)
-            else
-                pool.node_fails[node] = 0
-                delete!(pool.node_fail_since, node)
-            end
+            # A start that brought nothing counts against the node. One that brought workers
+            # does not clear the node: whether they can be USED is known when one takes a key
+            # (`_pool_served!`) — a node whose workers start and cannot be readied used to be
+            # cleared by each start and started on for the whole job.
+            isempty(ids) &&
+                _pool_node_failed!(pool, node, log, stage; why="a start brought no worker")
         elseif short == 0
             pool.fails = 0
-            pool.node_fails[node] = 0
-            delete!(pool.node_fail_since, node)
+            pool.fail_since = 0.0
         end
         isempty(pool.starting) && (pool.closing = false)
         _pool_report!(pool)
@@ -1225,6 +1261,10 @@ function _pool_rejected!(pool::SizedPool, pid::Int, log, stage::Symbol)
     # starts themselves (each of which succeeded, and reset that count), so that a pool none
     # of whose workers can be readied gives up instead of starting them for ever.
     pool.rejects += 1
+    pool.reject_since == 0.0 && (pool.reject_since = time())
+    # ...and against its node: one node where nothing can be readied is taken out like one where
+    # nothing starts, instead of being planned first again each time it is emptied.
+    _pool_node_failed!(pool, w.node, log, stage; why="its workers cannot be readied")
     _pool_retire!(pool, pid, log, stage)
     return nothing
 end
@@ -1250,7 +1290,7 @@ end
 # again each tick (a failed start gives its room back, and the node with the most room is
 # preferred), while a success anywhere else reset the one counter there was.
 function _pool_node_failed!(
-    pool::SizedPool, node::AbstractString, log::EventLog, stage::Symbol
+    pool::SizedPool, node::AbstractString, log, stage::Symbol; why::AbstractString=""
 )
     n = pool.node_fails[node] = get(pool.node_fails, node, 0) + 1
     since = get!(pool.node_fail_since, node, time())
@@ -1260,6 +1300,7 @@ function _pool_node_failed!(
     node in pool.bad_nodes && return nothing
     push!(pool.bad_nodes, String(node))
     pool.node_out_at[String(node)] = time()
+    pool.node_outs[String(node)] = get(pool.node_outs, String(node), 0) + 1
     log_event(
         log,
         :pool_node_out;
@@ -1267,20 +1308,41 @@ function _pool_node_failed!(
         stage=stage,
         node=node,
         fails=n,
+        why=why,
+        times_out=pool.node_outs[String(node)],
         nodes_left=count(x -> !(x.name in pool.bad_nodes), pool.nodes),
     )
     return nothing
 end
 
 # Has the pool stopped trying? Too many starts failed in a row.
+# Ten in a row AND over some time, like the rule for a node: at the start of a job there are more
+# than ten batches in one tick, and a few seconds of `srun` refusing failed them together.
 function _pool_gave_up(pool::SizedPool)
-    return pool.fails >= _POOL_MAX_FAILS ||
-           pool.rejects >= _POOL_MAX_FAILS ||
-           all(n -> n.name in pool.bad_nodes, pool.nodes)
+    now = time()
+    spanned(since) = since > 0 && now - since >= _POOL_FAIL_SPAN[]
+    (pool.fails >= _POOL_MAX_FAILS && spanned(pool.fail_since)) && return true
+    (pool.rejects >= _POOL_MAX_FAILS && spanned(pool.reject_since)) && return true
+    # Every node out — and each of them for the second time: the first time a node is taken
+    # out it gets a retry after `_NODE_RETRY_AFTER`, and the pool waits for that.
+    return all(
+        n -> n.name in pool.bad_nodes && get(pool.node_outs, n.name, 0) >= 2, pool.nodes
+    )
 end
 
-# A worker of the pool took a key: its workers can be used.
-_pool_served!(pool::SizedPool) = (pool.rejects=0; nothing)
+const _POOL_FAIL_SPAN = Ref(60.0)
+
+# A worker of the pool took a key: the pool's workers can be used, and so can that node's.
+function _pool_served!(pool::SizedPool, pid::Int=0)
+    pool.rejects = 0
+    pool.reject_since = 0.0
+    w = get(pool.workers, pid, nothing)
+    if w !== nothing
+        pool.node_fails[w.node] = 0
+        delete!(pool.node_fail_since, w.node)
+    end
+    return nothing
+end
 
 # Is there still something the pool is working towards?
 function _pool_wants(pool::SizedPool, table::TaskTable)

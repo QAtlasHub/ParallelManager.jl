@@ -376,7 +376,11 @@ end
     first_five = collect(keys(ctl2.ledger.jobs))
     empty!(sched.jobs)                                         # they all ended, unused
     # The queue no longer lists them and the scheduler's accounting says they ended: that is
-    # evidence, and it is logged with each job.
+    # evidence — once it has said so on two polls (one answer is not acted on) — and it is
+    # logged with each job.
+    ds = manage!(ctl2, _jb_work(100, 60000))
+    @test all(id -> ctl2.ledger.jobs[id]["ended"] == false, first_five)
+    @test all(d -> d.action === :refuse, ds)
     ds = manage!(ctl2, _jb_work(100, 60000))
     @test all(id -> ctl2.ledger.jobs[id]["ended"] == true, first_five)
     ended = [e for e in _jb_events(outdir) if e.kind == "job_ended"]
@@ -400,9 +404,9 @@ end
         return w
     end
     rounds = controller_loop!(ctl, work; interval=0.01, max_rounds=10)
-    # submit; held while it runs; gone from the queue and ended by the scheduler's accounting,
-    # with nothing left and none live.
-    @test rounds == 3
+    # submit; held while it runs; gone from the queue, the accounting says so; it says so
+    # again and the job is ended, with nothing left and none live.
+    @test rounds == 4
     @test length(sched.submitted) == 1
 end
 
@@ -865,68 +869,92 @@ end
 
 # ── third review (#153) ──────────────────────────────────────────────────────────────────────────
 
-@testset "the ledger lock has an owner: only it releases, a stale one is taken once, a lost one is not written under (#153)" begin
+@testset "the ledger lock: kept fresh while held, taken once when its holder is dead, not written under when lost (#153, #170)" begin
     outdir = mktempdir()
     l = Ledger(joinpath(outdir, "ledger.json"))
     lockdir = l.path * ".lock"
-    # Held: the owner file is there, and it goes with the holder.
-    SweepRunner.with_ledger(l) do
-        @test isfile(joinpath(lockdir, "owner"))
-        @test_throws ErrorException SweepRunner.with_ledger(
-            () -> 1, Ledger(l.path); wait=0.3
-        )
-    end
-    @test !isdir(lockdir)
-
-    # Taken from a holder that was stuck: the holder does not write its copy over what the
-    # other decided, and does not remove the other's lock on its way out.
     SweepRunner._LEDGER_LOCK_STALE[] = 0.5
     try
-        other = Ledger(l.path)
+        # Held for several times as long as a lock may go unrefreshed, by a holder that
+        # yields: its keeper refreshes it, and a waiter does not take it.
+        t = @async SweepRunner.with_ledger(l) do
+            @test isfile(joinpath(lockdir, "owner"))
+            sleep(2.0)
+            return :held
+        end
+        sleep(0.2)
+        err = try
+            SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=1.2)
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("locked by another controller", err.msg)
+        @test fetch(t) === :held
+        @test !isdir(lockdir)                                    # released by its owner
+
+        # A holder that died: its lock stops changing. Two waiters take it one after the
+        # other — never both at once.
+        mkdir(lockdir)
+        write(joinpath(lockdir, "owner"), "dead:1:holder")
+        sleep(0.7)                                               # older than a lock may be
+        inside = Ref(0)
+        most = Ref(0)
+        body = () -> begin
+            inside[] += 1
+            most[] = max(most[], inside[])
+            sleep(0.3)
+            inside[] -= 1
+            return :done
+        end
+        ts = [@async SweepRunner.with_ledger(body, Ledger(l.path); wait=10.0) for _ in 1:2]
+        @test fetch.(ts) == [:done, :done]
+        @test most[] == 1
+        @test !isdir(lockdir)
+
+        # A holder whose lock was taken from it does not write its copy over what the other
+        # decided, and does not remove the lock that is there now.
         err = try
             SweepRunner.with_ledger(l) do
-                # This holder is stuck in a call that does not yield, so nothing refreshes
-                # its lock for longer than a lock may go unrefreshed...
-                t_stuck = time()
-                while time() - t_stuck < 0.8
-                end
-                # ...and another controller, asking at that moment, takes it as stale, decides,
-                # writes and leaves.
-                SweepRunner.with_ledger(other; wait=5.0) do
-                    @test SweepRunner._lock_token(lockdir) != nothing
-                    SweepRunner.record_submit!(
-                        other,
-                        "900",
-                        JobSpec(;
-                            name="t-short",
-                            partition="short",
-                            nodes=2,
-                            time_limit=60.0,
-                            script="s",
-                        ),
-                    )
-                    SweepRunner.save_ledger(other)
-                end
-                # A third holds it now; the first, coming back, must not write its stale copy
-                # and must not remove a lock that is not its own.
-                mkdir(lockdir)
-                write(joinpath(lockdir, "owner"), "somebody:1:else")
-                SweepRunner.save_ledger(l)                          # must refuse
-                return nothing
+                write(joinpath(lockdir, "owner"), "somebody:1:else")   # taken, as far as it can tell
+                SweepRunner.save_ledger(l)
             end
             nothing
         catch e
             e
         end
         @test err isa ErrorException && occursin("taken by another controller", err.msg)
-        # The other's row survived, and the third's lock is still there: not removed by the
-        # first on its way out.
-        @test haskey(Ledger(l.path).jobs, "900")
         @test SweepRunner._lock_token(lockdir) == "somebody:1:else"
+        @test !isfile(l.path)                                    # nothing was written
         rm(lockdir; recursive=true)
     finally
         SweepRunner._LEDGER_LOCK_STALE[] = 600.0
     end
+end
+
+@testset "the scheduler is asked inside the ledger's lock, and a failing accounting is said (#170)" begin
+    outdir = mktempdir()
+    lockdir = joinpath(outdir, "sweeprunner", "jobs", "ledger.json.lock")
+    locked = Bool[]
+    answers = Dict{String,Any}("squeue" => "", "sbatch" => "77\n")
+    run = cmd -> begin
+        cmd.exec[1] == "squeue" && push!(locked, isdir(lockdir))
+        return get(answers, cmd.exec[1], nothing)             # `sacct`: fails
+    end
+    ctl = JobController(
+        SlurmScheduler(; user="me", run=run),
+        _jb_policy([_jb_part(; max_jobs=1)]; dry_run=false),
+        outdir,
+    )
+    manage!(ctl, _jb_work(100, 60000))
+    @test locked == [true]                                       # asked while holding it
+    @test haskey(ctl.ledger.jobs, "77")
+    # The job has left the queue and the accounting cannot be asked: said, once a round.
+    manage!(ctl, _jb_work(100, 60000))
+    failed = [e for e in _jb_events(outdir) if e.kind == "job_gone_failed"]
+    @test length(failed) == 1
+    @test occursin("sacct failed for job 77", failed[1].err)
+    @test !occursin("squeue", failed[1].err)                     # not another command's reason
+    @test ctl.ledger.jobs["77"]["ended"] == false
 end
 
 @testset "the end of the only live job is seen: over wall time, or by hand (#153)" begin
@@ -977,11 +1005,31 @@ end
     SweepRunner.observe!(l, two; now=10.0)
     SweepRunner.observe!(l, two[2:2]; now=20.0)                  # 1 is absent since 20
     @test l.jobs["1"]["absent_since"] == 20.0
-    SweepRunner.observe!(l, two[2:2]; now=30.0, gone=id -> id == "1" ? false : nothing)
-    @test !haskey(l.jobs["1"], "absent_since")                   # the accounting says it exists
-    SweepRunner.observe!(l, two[2:2]; now=1000.0)                # absent again, from now
-    @test l.jobs["1"]["absent_since"] == 1000.0
-    @test l.jobs["1"]["ended"] == false                          # not 980 s of absence
+    # The accounting still calls it live while the queue does not list it: the queue is
+    # believed only over the long wall time — not never (#170), and not after two minutes.
+    live = id -> id == "1" ? false : nothing
+    SweepRunner.observe!(l, two[2:2]; now=30.0, gone=live)
+    SweepRunner.observe!(l, two[2:2]; now=1000.0, gone=live)
+    @test l.jobs["1"]["absent_since"] == 20.0
+    @test l.jobs["1"]["ended"] == false                          # 980 s: under half an hour
+    ch = SweepRunner.observe!(l, two[2:2]; now=20.0 + 1801.0, gone=live)
+    @test l.jobs["1"]["ended"] == true
+    @test only(ch).weak && occursin("accounting still lists it as live", only(ch).evidence)
+    # A job that is seen again starts a new absence from when that begins.
+    SweepRunner.record_submit!(l, "3", spec; now=0.0)
+    three = JobState("3", "t-a", "a", :running, 2, 3600.0, 10.0)
+    SweepRunner.observe!(l, [two[2], three]; now=3000.0)
+    SweepRunner.observe!(l, two[2:2]; now=3010.0)
+    @test l.jobs["3"]["absent_since"] == 3010.0
+    SweepRunner.observe!(l, [two[2], three]; now=3020.0)
+    @test !haskey(l.jobs["3"], "absent_since")
+    # One answer of the accounting does not end a job; two do.
+    SweepRunner.observe!(l, two[2:2]; now=3030.0, gone=id -> id == "3" ? true : nothing)
+    @test l.jobs["3"]["ended"] == false
+    ch = SweepRunner.observe!(
+        l, two[2:2]; now=3040.0, gone=id -> id == "3" ? true : nothing
+    )
+    @test l.jobs["3"]["ended"] == true && !only(ch).weak
     # `state` and `ended` are one fact.
     row = Dict{String,Any}(
         "name" => "x",
@@ -1005,19 +1053,22 @@ end
     answers["sacct"] = "COMPLETED\n"
     @test SweepRunner.job_gone(s, "42") === true
     @test last(seen).exec == ["sacct", "-n", "-X", "-P", "-j", "42", "-o", "State"]
-    for st in ("FAILED", "CANCELLED by 1234", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL")
+    for st in ("CANCELLED by 1234", SweepRunner._SACCT_OVER...)
         answers["sacct"] = st * "\n"
         @test SweepRunner.job_gone(s, "42") === true
     end
-    for st in ("RUNNING", "PENDING", "COMPLETING")
+    for st in SweepRunner._SACCT_LIVE
         answers["sacct"] = st * "\n"
         @test SweepRunner.job_gone(s, "42") === false
     end
-    # No evidence either way: accounting off, the job not in it yet, the command failing.
-    for out in ("", "\n", "SOMETHING_NEW\n", nothing)
+    # No evidence either way: the job not in the accounting yet, a state nobody listed.
+    for out in ("", "\n", "SOMETHING_NEW\n")
         answers["sacct"] = out
         @test SweepRunner.job_gone(s, "42") === nothing
     end
+    # The command failing is not "no evidence": it is an error, for the caller to say.
+    answers["sacct"] = nothing
+    @test_throws ErrorException SweepRunner.job_gone(s, "42")
 end
 
 @testset "a submission that failed is not reported as one, and a dry run refuses where a real one would (#153)" begin
@@ -1040,7 +1091,9 @@ end
 @testset "RunOpts built positionally is checked too (#153)" begin
     o = RunOpts()
     fields = Any[getfield(o, f) for f in fieldnames(RunOpts)]
-    @test RunOpts(fields...) == o || RunOpts(fields...) isa RunOpts
+    @test all(
+        f -> isequal(getfield(RunOpts(fields...), f), getfield(o, f)), fieldnames(RunOpts)
+    )
     bad = copy(fields)
     bad[2] = 0                                                   # max_attempts
     @test_throws ArgumentError RunOpts(bad...)

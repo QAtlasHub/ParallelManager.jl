@@ -46,9 +46,29 @@ function _out_remove!(tok::AbstractString)
     return (lock(() -> delete!(_OUT, String(tok)), _OUT_LOCK); nothing)
 end
 
-_out_tokens() = lock(() -> collect(keys(_OUT)), _OUT_LOCK)
+# Locks this process named and has given up releasing: the worker under them could not be
+# removed and is still computing. They are still LISTED (a sibling that asks is told "held"),
+# and they are not in `_OUT` — so the exit hook does not release them with the worker's own
+# token as the master leaves. Kept in `_OUT`, a lock the master "kept" ended with the master.
+const _KEPT = Set{String}()
 
-_out_has(tok::AbstractString) = lock(() -> haskey(_OUT, String(tok)), _OUT_LOCK)
+function _out_keep!(tok::AbstractString)
+    lock(_OUT_LOCK) do
+        delete!(_OUT, String(tok))
+        return push!(_KEPT, String(tok))
+    end
+    return nothing
+end
+
+function _out_unkeep!(tok::AbstractString)
+    return (lock(() -> delete!(_KEPT, String(tok)), _OUT_LOCK); nothing)
+end
+
+_out_tokens() = lock(() -> vcat(collect(keys(_OUT)), collect(_KEPT)), _OUT_LOCK)
+
+function _out_has(tok::AbstractString)
+    return lock(() -> haskey(_OUT, String(tok)) || String(tok) in _KEPT, _OUT_LOCK)
+end
 
 # A master that is leaving says so: the locks it named and still has out are released, so they do
 # not sit on disk until `stale_after` (or until someone asks the scheduler about a job that is
