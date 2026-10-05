@@ -67,7 +67,10 @@ end
 # observation that failed leaves its process's markers at `observation=unknown`, and says why.
 function _observe_processes!(vault::Vault, multi::Bool, observe::Bool, log, stage)
     targets = if multi
-        vcat([(myid(), "master")], [(w, "worker") for w in workers()])
+        # `workers()` is `[1]` when there are none (a pool before its first start): the master
+        # is not one of its own workers, and was observed — its sources read and hashed —
+        # twice at the start of every pool run.
+        vcat([(myid(), "master")], [(w, "worker") for w in workers() if w != myid()])
     else
         [(myid(), "master")]
     end

@@ -1241,6 +1241,10 @@ end
             @test 2.0 <= t < 2.0 * (length(pids) - 1)
             said = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid in pids]
             @test length(said) >= 2length(pids)                  # in the run, and just now
+            # The master is observed once, as the master: with no workers yet `workers()` is
+            # `[1]`, and it used to be observed a second time as a worker of itself.
+            own = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid == 1]
+            @test [String(e.role) for e in own] == ["master"]
         end
     end
 end
