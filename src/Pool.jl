@@ -392,14 +392,19 @@ function _terminate!(p; settle::Bool=false)
     return nothing
 end
 
-# How long the workers are given to leave when asked, before what launched them is killed.
+# How long no worker may have left, after all were asked to, before what launched the rest is
+# killed.
 const _LEAVE_GRACE = Ref(5.0)
 
 # Remove many workers at the end of a run, together: all are asked to leave in one call, and
-# after a short grace what launched each one is killed, all at once. (One after the other —
-# ask, wait, kill, wait — a few hundred workers take minutes. And the launchers are not kept
-# waiting for the whole of `waitfor` by one worker that does not answer: `rmprocs` waits that
-# long for all of them, holding Distributed's worker lock.)
+# what launched those that have not left is killed, all at once. (One after the other — ask,
+# wait, kill, wait — a few hundred workers take minutes.)
+#
+# They are given as long as they keep leaving: several hundred take a while to exit, and a
+# fixed few seconds had a third of them killed that were on their way out. Once none has left
+# for `_LEAVE_GRACE` seconds the rest are not going to — one that does not answer must not hold
+# the others' launchers for the whole of `waitfor`, which is how long `rmprocs` waits for all
+# of them, holding Distributed's worker lock.
 #
 # Returns the ids that are still there: a launcher still running, or — with no handle on what
 # launched it — a worker Distributed does not have as terminated. The caller must not count
@@ -414,7 +419,15 @@ function _kill_workers!(ids::AbstractVector{<:Integer}; waitfor::Real=30)
         e isa InterruptException && rethrow()
         # Some did not leave when asked: what launched them is killed below.
     end
-    timedwait(() -> istaskdone(asking), min(_LEAVE_GRACE[], Float64(waitfor)); pollint=0.05)
+    running() = count(p -> p isa Base.Process && process_running(p), launchers)
+    t0 = time()
+    left_at, n = t0, running()
+    while !istaskdone(asking) && time() - t0 < waitfor
+        sleep(0.05)
+        m = running()
+        m < n && ((n, left_at) = (m, time()))
+        time() - left_at >= _LEAVE_GRACE[] && break
+    end
     asyncmap(p -> _terminate!(p; settle=true), launchers; ntasks=256)
     timedwait(() -> istaskdone(asking), Float64(waitfor); pollint=0.05)
     left = Int[]
@@ -1554,8 +1567,9 @@ Remove every worker the pool started and give their room back. Starts still in f
 for, up to `wait` seconds, and remove their own workers when they land. `run!` / `run_loop!` call
 it when they return, unless the pool was made with `keep=true`.
 
-The workers are removed together: all are asked to leave, and after five seconds what launched
-each one is killed; the whole takes at most about `waitfor` seconds however many there are.
+The workers are removed together: all are asked to leave, and what launched those that have
+not left is killed once none has left for five seconds; the whole takes at most about `waitfor`
+seconds however many there are.
 Returns the workers that are still there after that (none, normally). Those keep their room in
 the pool and are said — a `pool_kill_failed` event when a `log` is given, a warning otherwise:
 a worker that could not be removed is on its cores until the job ends.
