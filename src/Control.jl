@@ -1012,10 +1012,12 @@ end
 
 """
     masters_listening(vault) -> Vector{String}
-    masters_listening(outdir::AbstractString; project=nothing, run=nothing) -> Vector{String}
+    masters_listening(outdir::AbstractString; project=nothing, run=nothing, master=nothing)
+        -> Vector{String}
 
 The ids of the masters that will read a request sent now: those whose status says they are
-running or between rounds and that have reported recently. A master applies only requests made
+running or between rounds and that have reported recently (`master`: only the one with that id
+or scheduler job id). A master run with `status_interval = 0` writes no status and is not seen. A master applies only requests made
 after it started, so a request sent when this is empty is applied by nobody — not by the next job
 either.
 """

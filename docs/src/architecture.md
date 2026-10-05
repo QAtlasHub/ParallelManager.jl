@@ -36,7 +36,8 @@ What it does not provide is:
    the queue forever.
 4. **A structured event log** that is safe for concurrent append from
    multiple processes and hostile to per-item `println`.
-5. **A uniform worker bootstrap** for `:threads` / `:distributed` / `:slurm`.
+5. **A uniform worker bootstrap** for `:distributed` / `:slurm` (and `:threads`, which gives a
+   key threads and runs the keys on the master one at a time).
 
 Putting those in `DataVault` would turn it into a parallel runtime; this
 package keeps `DataVault` focused on "one file, one key, safely written"
