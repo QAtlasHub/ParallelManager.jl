@@ -110,6 +110,7 @@ SweepRunner.KeyCost
 SweepRunner.key_costs
 SweepRunner.cost_summary
 SweepRunner.write_cost_table
+SweepRunner.cost_records_path
 SweepRunner.load_cost_table
 SweepRunner.cost_table_path
 SweepRunner.measured_cost
