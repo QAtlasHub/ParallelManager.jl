@@ -408,7 +408,10 @@ end
             ks = DataVault.keys(v)
             # The rules' time spans, in seconds for the test: five in a row over a second, and
             # a retry two seconds after the node was taken out.
+            # The two spans equal, as in production (60 s each): the pool's own count must not
+            # give up at the moment the node goes out, before the retry (#182).
             SweepRunner._NODE_FAIL_SPAN[] = 1.0
+            SweepRunner._POOL_FAIL_SPAN[] = 1.0
             SweepRunner._NODE_RETRY_AFTER[] = 2.0
             err = try
                 run!(k -> Dict{String,Any}("x" => 1), v, ks; pool=pool)
@@ -417,10 +420,11 @@ end
                 e
             finally
                 SweepRunner._NODE_FAIL_SPAN[] = 60.0
+                SweepRunner._POOL_FAIL_SPAN[] = 60.0
                 SweepRunner._NODE_RETRY_AFTER[] = 300.0
             end
             @test err isa ErrorException
-            @test occursin("worker starts failed in a row", err.msg)
+            @test occursin("no node is left to start workers on", err.msg)
             ev = _pl_events(outdir)
             failed = [e for e in ev if e.kind == "pool_spawn_failed"]
             out = [e for e in ev if e.kind == "pool_node_out"]
@@ -433,6 +437,9 @@ end
             @test all(e -> e.why == "a start brought no worker", out)
             @test count(e -> e.kind == "pool_node_retry", ev) == 1
             @test length(failed) >= SweepRunner._NODE_MAX_FAILS + 1
+            # Once it is out, the node is tried exactly once more: the retry.
+            first_out = findfirst(e -> e.kind == "pool_node_out", ev)
+            @test count(e -> e.kind == "pool_spawn_failed", ev[(first_out + 1):end]) == 1
             @test occursin("1 of 1 node(s) taken out", err.msg)
             @test out[end].nodes_left == 0
             @test occursin("no such partition", failed[1].err)
@@ -914,6 +921,7 @@ end
             t0 = time()
             # No worker can load this: every one of them is rejected by the dispatcher.
             SweepRunner._NODE_FAIL_SPAN[] = 1.0
+            SweepRunner._POOL_FAIL_SPAN[] = 1.0
             SweepRunner._NODE_RETRY_AFTER[] = 2.0
             err = try
                 run!(
@@ -928,6 +936,7 @@ end
                 e
             finally
                 SweepRunner._NODE_FAIL_SPAN[] = 60.0
+                SweepRunner._POOL_FAIL_SPAN[] = 60.0
                 SweepRunner._NODE_RETRY_AFTER[] = 300.0
             end
             # Not a queue that waits for ever behind workers that are counted and unusable,
@@ -1060,5 +1069,76 @@ end
             ev = [e for e in _pl_events(outdir) if e.kind == "pool_stalled"]
             @test ev[1].starting == 1 && ev[1].secs >= 1
         end
+    end
+end
+
+# ── fifth review (#182) ──────────────────────────────────────────────────────────────────────────
+
+@testset "the pool's give-up rules: which one fires, and what each waits for (#182)" begin
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        log = SweepRunner.EventLog(joinpath(mktempdir(), "events_x.jsonl"))
+        node = gethostname()
+        why = () -> SweepRunner._pool_gave_up_why(pool)
+        old = time() - SweepRunner._POOL_FAIL_SPAN[] - 1
+        # Ten failed starts over the span: given up, as starts.
+        pool.fails = 10
+        pool.fail_since = old
+        @test why() === :starts
+        # ...but not while a start is still on its way,
+        pool.starting[1] = (node, KeyReq(1, 1.0), 1)
+        @test why() === nothing
+        delete!(pool.starting, 1)
+        # ...and not while a node is out waiting for its retry.
+        push!(pool.bad_nodes, node)
+        pool.node_outs[node] = 1
+        @test why() === nothing
+        # Out for the second time, with no other node: given up, as nodes.
+        pool.node_outs[node] = 2
+        @test why() === :nodes
+        empty!(pool.bad_nodes)
+        empty!(pool.node_outs)
+        pool.fails = 0
+        pool.fail_since = 0.0
+        # Ten rejected workers over the span: given up, as rejections — and named as that.
+        pool.rejects = 10
+        pool.reject_since = old
+        @test why() === :rejects
+        pool.rejects = 0
+        pool.reject_since = 0.0
+
+        # Taking a node out starts the pool's own counts again: the node rule has taken over.
+        pool.fails = 10
+        pool.fail_since = old
+        pool.node_fail_since[node] = time() - SweepRunner._NODE_FAIL_SPAN[] - 1
+        pool.node_fails[node] = SweepRunner._NODE_MAX_FAILS - 1
+        SweepRunner._pool_node_failed!(
+            pool, node, log, :pl; why="a start brought no worker"
+        )
+        @test node in pool.bad_nodes
+        @test (pool.fails, pool.rejects) == (0, 0)
+        @test why() === nothing                                  # waiting for the retry
+
+        # A second out waits twice as long for its retry.
+        pause = SweepRunner._NODE_RETRY_AFTER[]
+        pool.node_outs[node] = 2
+        SweepRunner._pool_nodes_back!(pool, pool.node_out_at[node] + pause + 1, log, :pl)
+        @test node in pool.bad_nodes
+        SweepRunner._pool_nodes_back!(pool, pool.node_out_at[node] + 2pause + 1, log, :pl)
+        @test !(node in pool.bad_nodes)
+
+        # A worker of the node taking a key clears "out once already" too.
+        pool.node_outs[node] = 1
+        pool.workers[4242] = SweepRunner.PoolWorker(node, KeyReq(1, 1.0), time(), false)
+        SweepRunner._pool_served!(pool, 4242)
+        @test !haskey(pool.node_outs, node) && pool.node_fails[node] == 0
+        delete!(pool.workers, 4242)
+
+        # Failures hours apart are not "in a row".
+        pool.node_fails[node] = 4
+        pool.node_fail_since[node] = time() - 7200
+        pool.node_last_fail[node] = time() - 3600
+        SweepRunner._pool_node_failed!(pool, node, log, :pl)
+        @test pool.node_fails[node] == 1
+        @test !(node in pool.bad_nodes)
     end
 end

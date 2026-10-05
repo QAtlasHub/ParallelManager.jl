@@ -648,6 +648,9 @@ mutable struct SizedPool
     reject_since::Float64   # the same for rejected workers
     # node => how many times it has been taken out: a node is given up on the second time.
     const node_outs::Dict{String,Int}
+    # node => when it last counted a failure: a count is "in a row" only over failures that are
+    # not hours apart.
+    const node_last_fail::Dict{String,Float64}
 end
 
 """
@@ -753,6 +756,7 @@ function SizedPool(
         0.0,
         0.0,
         Dict{String,Int}(),
+        Dict{String,Float64}(),
     )
 end
 
@@ -1294,7 +1298,14 @@ const _NODE_RETRY_AFTER = Ref(300.0)
 function _pool_rejected!(pool::SizedPool, pid::Int, log, stage::Symbol)
     w = get(pool.workers, pid, nothing)
     (w === nothing || w.retiring) && return nothing
-    log_event(log, :pool_retire; stage=stage, worker=pid, why="rejected by the dispatcher")
+    log_event(
+        log,
+        :pool_retire;
+        stage=stage,
+        worker=pid,
+        node=w.node,
+        why="rejected by the dispatcher",
+    )
     # A worker that started and cannot be used is a start that failed — counted apart from the
     # starts themselves (each of which succeeded, and reset that count), so that a pool none
     # of whose workers can be readied gives up instead of starting them for ever.
@@ -1310,7 +1321,11 @@ end
 # A node taken out is tried again after a pause: one start, and out again if that fails.
 function _pool_nodes_back!(pool::SizedPool, now::Float64, log, stage::Symbol)
     for node in collect(pool.bad_nodes)
-        now - get(pool.node_out_at, node, now) >= _NODE_RETRY_AFTER[] || continue
+        # Each time a node has gone out again its next try waits twice as long (up to an hour):
+        # a node that stays bad is not given a batch of start-ups every five minutes all job.
+        outs = max(get(pool.node_outs, node, 1), 1)
+        pause = min(_NODE_RETRY_AFTER[] * 2.0^(outs - 1), max(_NODE_RETRY_AFTER[], 3600.0))
+        now - get(pool.node_out_at, node, now) >= pause || continue
         delete!(pool.bad_nodes, node)
         pool.node_fails[node] = _NODE_MAX_FAILS - 1
         pool.node_fail_since[node] = now - _NODE_FAIL_SPAN[]
@@ -1330,6 +1345,14 @@ end
 function _pool_node_failed!(
     pool::SizedPool, node::AbstractString, log, stage::Symbol; why::AbstractString=""
 )
+    # In a row in TIME too: a failure long after the last one starts a new count. (On a node
+    # whose workers hold twelve-hour keys nothing clears the count, and five unrelated
+    # rejections over hours took out a node with a hundred healthy workers.)
+    if time() - get(pool.node_last_fail, node, time()) > _NODE_FAIL_GAP[]
+        pool.node_fails[node] = 0
+        delete!(pool.node_fail_since, node)
+    end
+    pool.node_last_fail[String(node)] = time()
     n = pool.node_fails[node] = get(pool.node_fails, node, 0) + 1
     since = get!(pool.node_fail_since, node, time())
     # Five in a row AND over some time: with a tick a second, five seconds of `srun` refusing
@@ -1339,6 +1362,13 @@ function _pool_node_failed!(
     push!(pool.bad_nodes, String(node))
     pool.node_out_at[String(node)] = time()
     pool.node_outs[String(node)] = get(pool.node_outs, String(node), 0) + 1
+    # The node rule has taken over: the pool's own counts of failed starts and rejected workers
+    # start again. Left running, they reached ten at the same minute the nodes went out, and
+    # the pool gave up before the retry it was waiting for.
+    pool.fails = 0
+    pool.fail_since = 0.0
+    pool.rejects = 0
+    pool.reject_since = 0.0
     log_event(
         log,
         :pool_node_out;
@@ -1356,19 +1386,29 @@ end
 # Has the pool stopped trying? Too many starts failed in a row.
 # Ten in a row AND over some time, like the rule for a node: at the start of a job there are more
 # than ten batches in one tick, and a few seconds of `srun` refusing failed them together.
-function _pool_gave_up(pool::SizedPool)
-    now = time()
-    spanned(since) = since > 0 && now - since >= _POOL_FAIL_SPAN[]
-    (pool.fails >= _POOL_MAX_FAILS && spanned(pool.fail_since)) && return true
-    (pool.rejects >= _POOL_MAX_FAILS && spanned(pool.reject_since)) && return true
+_pool_gave_up(pool::SizedPool) = _pool_gave_up_why(pool) !== nothing
+
+# Why the pool has given up — `:nodes`, `:starts`, `:rejects` — or `nothing`.
+function _pool_gave_up_why(pool::SizedPool)
     # Every node out — and each of them for the second time: the first time a node is taken
     # out it gets a retry after `_NODE_RETRY_AFTER`, and the pool waits for that.
-    return all(
-        n -> n.name in pool.bad_nodes && get(pool.node_outs, n.name, 0) >= 2, pool.nodes
-    )
+    all(n -> n.name in pool.bad_nodes && get(pool.node_outs, n.name, 0) >= 2, pool.nodes) &&
+        return :nodes
+    # The counts below are for failures the node rule does not explain. They wait while a node
+    # is out for its retry, and while starts are still on their way (a burst of rejections
+    # during a mass start is followed by replacements that need their minute to come up).
+    waiting = any(n -> get(pool.node_outs, n, 0) < 2, pool.bad_nodes)
+    (waiting || !isempty(pool.starting)) && return nothing
+    now = time()
+    spanned(since) = since > 0 && now - since >= _POOL_FAIL_SPAN[]
+    (pool.fails >= _POOL_MAX_FAILS && spanned(pool.fail_since)) && return :starts
+    (pool.rejects >= _POOL_MAX_FAILS && spanned(pool.reject_since)) && return :rejects
+    return nothing
 end
 
 const _POOL_FAIL_SPAN = Ref(60.0)
+# Failures of a node further apart than this are not "in a row".
+const _NODE_FAIL_GAP = Ref(600.0)
 
 # A worker of the pool took a key: the pool's workers can be used, and so can that node's.
 function _pool_served!(pool::SizedPool, pid::Int=0)
@@ -1378,6 +1418,9 @@ function _pool_served!(pool::SizedPool, pid::Int=0)
     if w !== nothing
         pool.node_fails[w.node] = 0
         delete!(pool.node_fail_since, w.node)
+        # A node that works again is not "out once already": two short outages hours apart
+        # used to leave it given up on for the rest of the job.
+        delete!(pool.node_outs, w.node)
     end
     return nothing
 end
