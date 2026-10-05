@@ -900,29 +900,58 @@ end
     outdir = mktempdir()
     l = Ledger(joinpath(outdir, "ledger.json"))
     lockdir = l.path * ".lock"
-    # A holder refreshes every 0.4 s and a lock is taken after 0.6 s unchanged: wide enough
-    # that a process which does not run for a few tenths of a second does not hand it over.
-    SweepRunner._LEDGER_LOCK_STALE[] = 4.0
-    unrefreshed = SweepRunner._lock_unrefreshed()
-    @test unrefreshed == 0.6
-    stamp = (at) -> run(`touch -d @$(round(Int, at)) $(joinpath(lockdir, "owner"))`)
+    # The production ratio, in seconds: a holder refreshes every tenth of the stale time
+    # (0.2 s) and a lock is taken after the whole of it unchanged (2 s) — ten missed
+    # refreshes, not one and a half (#188).
+    stale = SweepRunner._LEDGER_LOCK_STALE[] = 2.0
+    # The owner file's timestamp, set without GNU `touch`.
+    stamp =
+        at -> begin
+            f = Base.Filesystem.open(joinpath(lockdir, "owner"), Base.Filesystem.JL_O_WRONLY)
+            try
+                Base.Filesystem.futime(f, Float64(at), Float64(at))
+            finally
+                close(f)
+            end
+        end
     try
-        # Held for several times as long as a lock may go unrefreshed, by a holder that
-        # yields: its keeper refreshes it, and a waiter does not take it.
+        # Held for several times the stale time by a holder that yields: its keeper refreshes
+        # it, and a waiter does not take it.
         t = @async SweepRunner.with_ledger(l) do
             @test isfile(joinpath(lockdir, "owner"))
-            sleep(2.4)
+            sleep(2.5stale)
             return :held
         end
         sleep(0.2)
         err = try
-            SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=1.8)
+            SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=2stale)
         catch e
             e
         end
         @test err isa ErrorException && occursin("locked by another controller", err.msg)
+        @test occursin("If its holder is gone, remove", err.msg)
         @test fetch(t) === :held
         @test !isdir(lockdir)                                    # released by its owner
+
+        # A live holder that does not yield for five refresh periods — synchronous file
+        # system calls, a first call compiling — keeps its lock (#188). With the threshold at
+        # one and a half periods it was taken, and the round lost.
+        t = @async SweepRunner.with_ledger(l) do
+            Libc.systemsleep(stale / 2)                          # blocks: no refresh
+            sleep(stale)                                         # yields: refreshed again
+            SweepRunner.save_ledger(l)                           # still ours
+            return :kept
+        end
+        yield()
+        err = try
+            SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=stale * 0.8)
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("locked by another controller", err.msg)
+        @test fetch(t) === :kept
+        @test !isdir(lockdir)
+        rm(l.path)
 
         # A holder that died: its lock stops changing. Two waiters take it one after the
         # other — never both at once.
@@ -938,6 +967,15 @@ end
         end
         @test err isa ErrorException && occursin("locked by another controller", err.msg)
         @test SweepRunner._lock_token(lockdir) == "dead:1:holder"
+        # What was watched is kept between calls (#188): a controller whose rounds each wait
+        # less than the stale time still takes a dead lock — on a later round, at once.
+        sleep(stale + 0.2)
+        t0 = time()
+        @test SweepRunner.with_ledger(() -> :taken, Ledger(l.path); wait=0.2) === :taken
+        @test time() - t0 < 0.2
+        mkdir(lockdir)
+        write(joinpath(lockdir, "owner"), "dead:1:holder")
+        stamp(time() - 3600)
         # ...and one that looks old and is still being refreshed — a holder whose clock is
         # an hour behind — is not taken however long it is watched.
         behind = Ref(true)
@@ -949,7 +987,7 @@ end
             end
         end
         err = try
-            SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=2.0)
+            SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=1.5stale)
         catch e
             e
         end
@@ -963,8 +1001,33 @@ end
         stamp(time() + 3600)
         t0 = time()
         @test SweepRunner.with_ledger(() -> :taken, Ledger(l.path); wait=10.0) === :taken
-        @test unrefreshed <= time() - t0 < 5.0
+        @test stale <= time() - t0 < 4stale
         @test !isdir(lockdir)
+
+        # A holder on THIS host whose process is gone is not watched for: there is nothing
+        # to wait for. One whose process is there is.
+        if Sys.islinux()
+            gone = run(`sleep 0.3`; wait=false)
+            gone_pid = getpid(gone)
+            wait(gone)
+            mkdir(lockdir)
+            write(joinpath(lockdir, "owner"), "$(gethostname()):$(gone_pid):x")
+            t0 = time()
+            @test SweepRunner.with_ledger(() -> :taken, Ledger(l.path); wait=5.0) === :taken
+            @test time() - t0 < stale / 2
+            there = run(`sleep 30`; wait=false)
+            mkdir(lockdir)
+            write(joinpath(lockdir, "owner"), "$(gethostname()):$(getpid(there)):x")
+            err = try
+                SweepRunner.with_ledger(() -> :stolen, Ledger(l.path); wait=stale / 2)
+            catch e
+                e
+            end
+            kill(there)
+            @test err isa ErrorException
+            @test occursin("locked by another controller", err.msg)
+            rm(lockdir; recursive=true)
+        end
 
         # The takeover removes the lock that was watched and no other: a waiter that stalled
         # between reading the owner and renaming finds another's lock there, and leaves it.
@@ -1032,7 +1095,7 @@ end
             SweepRunner.record_submit!(b, "B", spec; now=0.0)
             SweepRunner.save_ledger(b)
         end
-        @test time() - t0 >= unrefreshed                         # watched first, then taken
+        @test time() - t0 >= stale                               # watched first, then taken
         put!(go, nothing)
         err = fetch(ta)
         @test err isa ErrorException && occursin("taken by another controller", err.msg)
