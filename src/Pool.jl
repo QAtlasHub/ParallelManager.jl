@@ -831,11 +831,21 @@ end
 
 # May worker `pid` take `row`? A worker the pool started takes what its size holds; one that was
 # there before the pool takes anything, as it did without one.
-function _pool_accepts(pool::SizedPool, pid::Int, row::TaskRow, deadline, min_time)::Bool
+#
+# `tight`: only a key that uses more than half of the worker (cores or memory). A dispatch task
+# asks for one of those first. Taking the first key that fits, an eight-core worker that came up
+# before the two-core ones took the two-core keys at the head of the queue; the eight-core keys
+# behind them then had no idle worker to cover them and the pool started another for each — a
+# third more workers than keys on the first job this ran in.
+function _pool_accepts(
+    pool::SizedPool, pid::Int, row::TaskRow, deadline, min_time; tight::Bool=false
+)::Bool
     w = get(pool.workers, pid, nothing)
-    w === nothing && return pid in pool.foreign
+    w === nothing && return !tight && pid in pool.foreign
     w.retiring && return false
-    return _fits(w.size, _pool_need(pool, row, deadline, min_time))
+    need = _pool_need(pool, row, deadline, min_time)
+    _fits(w.size, need) || return false
+    return !tight || 2 * need.cores > w.size.cores || 2 * need.mem_gb > w.size.mem_gb
 end
 
 # May the dispatcher give worker `pid` a dispatch task yet? Not between the moment `addprocs`

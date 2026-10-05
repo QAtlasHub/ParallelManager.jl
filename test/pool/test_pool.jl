@@ -1244,3 +1244,60 @@ end
         end
     end
 end
+
+@testset "a worker takes a key of its own size before a smaller one" begin
+    # N = 8 needs four cores, N = 4 one; the keys with N = 4 come first in the queue.
+    req = k -> KeyReq(k.params["N"] == 8 ? 4 : 1, 1.0)
+    _pl_custom((node, size, n, flags) -> Int[]; key_req=req) do pool
+        _pl_vault() do v, outdir
+            table = TaskTable(DataVault.keys(v))
+            big = findfirst(r -> r.key.params["N"] == 8, table.rows)
+            small = findfirst(r -> r.key.params["N"] == 4, table.rows)
+            @test small < big
+            pool.workers[4301] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(4, 4.0), 0.0, false
+            )
+            pool.workers[4302] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+            ok =
+                (pid, i; kw...) -> SweepRunner._pool_accepts(
+                    pool, pid, table.rows[i], nothing, nothing; kw...
+                )
+            # Both keys fit the big worker; only the big key is its own size.
+            @test ok(4301, small) && ok(4301, big)
+            @test !ok(4301, small; tight=true) && ok(4301, big; tight=true)
+            # The small worker's own size is the small key; the big one does not fit at all.
+            @test ok(4302, small; tight=true) && !ok(4302, big)
+            # What the dispatch task draws: the big key for the big worker although the small
+            # one is ahead of it, and a small one once no big key is left.
+            draw =
+                pid -> begin
+                    j = SweepRunner.next_task!(
+                        table,
+                        pid;
+                        accept=r -> SweepRunner._pool_accepts(
+                            pool, pid, r, nothing, nothing; tight=true
+                        ),
+                    )
+                    if j === nothing
+                        SweepRunner.next_task!(
+                            table,
+                            pid;
+                            accept=r -> SweepRunner._pool_accepts(
+                                pool, pid, r, nothing, nothing
+                            ),
+                        )
+                    else
+                        j
+                    end
+                end
+            nbig = count(r -> r.key.params["N"] == 8, table.rows)
+            drawn = [draw(4301) for _ in 1:(nbig + 1)]
+            @test all(i -> table.rows[i].key.params["N"] == 8, drawn[1:nbig])
+            @test table.rows[drawn[end]].key.params["N"] == 4
+            delete!(pool.workers, 4301)
+            delete!(pool.workers, 4302)
+        end
+    end
+end

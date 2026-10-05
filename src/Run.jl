@@ -1746,8 +1746,15 @@ function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
         end
         i = if c.paused || r.stopped
             nothing
-        else
+        elseif pool === nothing
             _next_fitting!(table, pid, r.fits; accept=accept)
+        else
+            # A key of this worker's own size first; a smaller one only when none is queued.
+            tight =
+                row ->
+                    _pool_accepts(pool, pid, row, opts.deadline, r.min_time; tight=true)
+            j = _next_fitting!(table, pid, r.fits; accept=tight)
+            j === nothing ? _next_fitting!(table, pid, r.fits; accept=accept) : j
         end
         if i === nothing
             # Leave when nothing is out and nothing can arrive. A paused master keeps its
