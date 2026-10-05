@@ -47,8 +47,8 @@ usage: sweeprunner <command> <outdir> [options]
 
   pause | resume <outdir>
   stop <outdir> [--select name=v1,v2 ...] [--node HOST] [--grace SECONDS]
-  cancel <outdir> --select name=v1,v2 [...] [--samples 1,2] [--running] [--grace SECONDS]
-  prioritise <outdir> --select name=v1,v2 [...] [--samples 1,2]
+  cancel <outdir> (--select name=v1,v2 [...] | --samples 1,2 | --all) [--running] [--grace SECONDS]
+  prioritise <outdir> (--select name=v1,v2 [...] | --samples 1,2 | --all)
   resize <outdir> --n N
   drain <outdir> --node HOST
   enqueue <outdir> --config FILE
@@ -91,6 +91,18 @@ function cli(args::AbstractVector{<:AbstractString}=ARGS; io::IO=stdout)
     Symbol(cmd) in _CONTROL_OPS && return _cli_control(io, Symbol(cmd), rest)
     flags = Set(a for a in rest if startswith(a, "--"))
     pos = [a for a in rest if !startswith(a, "--")]
+    # The commands that read: a flag they do not know is a usage error (`locks out --Reap`
+    # listed and exited 0), and a path with no sweep state under it is exit 1, as documented.
+    if haskey(_CLI_READ_FLAGS, cmd)
+        unknown = setdiff(flags, _CLI_READ_FLAGS[cmd])
+        isempty(unknown) ||
+            return _cli_usage(io, "unknown option: $(first(sort!(collect(unknown))))")
+        length(pos) == 1 || return _cli_usage(io, "$cmd takes one <outdir>")
+        if !isdir(joinpath(pos[1], "sweeprunner")) && !isdir(joinpath(pos[1], "status"))
+            println(io, "no sweep state under $(pos[1])")
+            return 1
+        end
+    end
     if cmd == "status"
         length(pos) == 1 || return _cli_usage(io, "status takes one <outdir>")
         if "--json" in flags
@@ -195,7 +207,8 @@ function _cli_jobs(io::IO, rest)
         elseif a == "--loop"
             i < length(rest) || return _cli_usage(io, "--loop needs a value")
             every = tryparse(Float64, rest[i += 1])
-            every === nothing && return _cli_usage(io, "--loop takes seconds")
+            (every === nothing || !isfinite(every) || every <= 0) &&
+                return _cli_usage(io, "--loop takes a positive number of seconds")
         elseif startswith(a, "--")
             return _cli_usage(io, "unknown option: $a")
         elseif meta === nothing
@@ -220,6 +233,11 @@ function _cli_jobs(io::IO, rest)
         return _cli_usage(io, e.msg)
     end
     # Submitting takes both: the flag here and `dry_run = false` in the file.
+    (go && policy.dry_run) && println(
+        io,
+        "--submit was given, and the file says dry_run = true: nothing is submitted. ",
+        "What follows is what WOULD be decided.",
+    )
     if policy.dry_run || !go
         policy = JobPolicy(;
             name=policy.name,
@@ -268,10 +286,21 @@ function _cli_jobs(io::IO, rest)
     return 0
 end
 
+# The reading commands and the flags each takes.
+const _CLI_READ_FLAGS = Dict(
+    "status" => Set(["--workers", "--json"]),
+    "locks" => Set(["--reap"]),
+    "account" => Set{String}(),
+    "costs" => Set{String}(),
+)
+
 # What `jobs` exits with for a round's decisions: 6 when the round did nothing because it was
 # refused (the scheduler not asked or not trusted, the ledger not usable, the budget) — not
 # when one partition was refused and another was served.
 function _jobs_exit(ds)
+    # A submission that failed is not a round that went well, whatever else was submitted.
+    any(d -> d.action === :refuse && startswith(d.reason, "the submission failed"), ds) &&
+        return 6
     any(d -> d.action === :submit, ds) && return 0
     return any(d -> d.action === :refuse, ds) ? 6 : 0
 end
@@ -289,7 +318,7 @@ const _CLI_VALUED = (
     "--master",
     "--wait",
 )
-const _CLI_SWITCHES = ("--running",)
+const _CLI_SWITCHES = ("--running", "--all")
 
 # `32` -> 32, `0.5` -> 0.5, `true` -> true, anything else stays a string.
 function _cli_value(s::AbstractString)
@@ -328,7 +357,8 @@ function _cli_control(io::IO, op::Symbol, rest)
                 kw[:grace] = g
             elseif a == "--wait"
                 wait_s = tryparse(Float64, v)
-                wait_s === nothing && return _cli_usage(io, "--wait takes seconds")
+                (wait_s === nothing || !isfinite(wait_s) || wait_s < 0) &&
+                    return _cli_usage(io, "--wait takes a number of seconds")
             elseif a == "--n"
                 n = tryparse(Int, v)
                 n === nothing && return _cli_usage(io, "--n takes an integer")
@@ -346,6 +376,16 @@ function _cli_control(io::IO, op::Symbol, rest)
         i += 1
     end
     outdir === nothing && return _cli_usage(io, "$op needs an <outdir>")
+    # An empty filter matches every key. Sent by leaving `--select` out, `cancel` dropped the
+    # whole queue for the rest of the job: it has to be asked for.
+    everything = pop!(kw, :all, false)
+    if op in (:cancel, :prioritise) && isempty(select) && !haskey(kw, :samples)
+        everything || return _cli_usage(
+            io, "$op needs --select (or --samples); to mean every key, say --all"
+        )
+    elseif everything && !isempty(select)
+        return _cli_usage(io, "--all and --select together: which is meant?")
+    end
     isempty(select) || (kw[:select] = select)
     ids = try
         control!(outdir, op; kw...)

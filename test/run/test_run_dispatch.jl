@@ -357,6 +357,19 @@ end
     end
 end
 
+@testset "a hook that throws only for some keys is still said (#173)" begin
+    _dp_vault() do v, outdir
+        ks = DataVault.keys(v)[1:4]
+        first_key = ParamIO.canonical(ks[1])
+        # Fine for the first queued key — the one that is probed — and throws for the rest.
+        cost =
+            k -> ParamIO.canonical(k) == first_key ? 0.01 : error("no model for this key")
+        run!(_dp_rec(String[]), v, ks; opts=_dp_quiet(; deadline=time() + 600), cost=cost)
+        failed = only([e for e in _dp_events(outdir) if e.kind == "cost_hook_failed"])
+        @test occursin("no model for this key", failed.err)
+    end
+end
+
 @testset ":longest_first puts a key of unknown cost first, not last (#136)" begin
     _dp_vault() do v, _
         ks = DataVault.keys(v)[1:4]

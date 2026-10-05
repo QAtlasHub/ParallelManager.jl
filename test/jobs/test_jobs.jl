@@ -1089,3 +1089,30 @@ end
     s = SlurmScheduler(; user="me", run=cmd -> "1:00:00\n")
     @test remaining_time(s, "1") == 3600.0
 end
+
+# ── fourth review (#173) ─────────────────────────────────────────────────────────────────────────
+
+@testset "jobs: a failed submission is not exit 0, and a round that keeps failing is raised (#173)" begin
+    sub = Decision(:submit, "a", "r", nothing, 1.0)
+    failed = Decision(:refuse, "b", "the submission failed: sbatch …", nothing, 1.0)
+    @test SweepRunner._jobs_exit([sub, failed]) == 6            # one went through, one did not
+    @test SweepRunner.cli(["jobs", "a", "--loop", "0"]; io=IOBuffer()) == 2
+    @test SweepRunner.cli(["jobs", "a", "--loop", "-5"]; io=IOBuffer()) == 2
+    # An error that comes back every round is raised after a few, not printed for ever.
+    outdir = mktempdir()
+    ctl = JobController(MockScheduler(), _jb_policy(; dry_run=false), outdir)
+    calls = Ref(0)
+    err = try
+        controller_loop!(
+            ctl,
+            p -> (calls[] += 1; error("the vault is gone"));
+            interval=0.01,
+            max_rounds=100,
+        )
+        nothing
+    catch e
+        e
+    end
+    @test err isa ErrorException && occursin("the vault is gone", err.msg)
+    @test calls[] == SweepRunner._CONTROLLER_MAX_FAILED
+end
