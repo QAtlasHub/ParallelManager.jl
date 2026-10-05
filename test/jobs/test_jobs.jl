@@ -1397,3 +1397,42 @@ end
     @test err isa ErrorException && occursin("the vault is gone", err.msg)
     @test calls[] == SweepRunner._CONTROLLER_MAX_FAILED
 end
+
+@testset "a job the accounting says is over is billed for what the accounting says it ran" begin
+    # Found on a cluster (issp-ohtaka, job 3094908): 30 s of work, billed the 120 s limit.
+    spec = JobSpec(; name="t-a", partition="a", nodes=2, time_limit=3600.0, script="s")
+    over = id -> true
+    run_it =
+        (elapsed) -> begin
+            l = _jb_ledger()
+            SweepRunner.record_submit!(l, "1", spec; now=0.0)
+            SweepRunner.observe!(
+                l, [JobState("1", "t-a", "a", :running, 2, 3600.0, 10.0)]; now=100.0
+            )
+            SweepRunner.observe!(l, JobState[]; now=200.0, gone=over, elapsed=elapsed)
+            ch = SweepRunner.observe!(l, JobState[]; now=400.0, gone=over, elapsed=elapsed)
+            return l, only(ch)
+        end
+    # Without an answer: the most it can have run since it was last seen (10 s + 300 s).
+    l, ch = run_it(id -> nothing)
+    @test ch.seconds_billed == 310.0
+    # With one: that, also when it is less than what the queue last showed plus the wait.
+    l, ch = run_it(id -> 42.0)
+    @test ch.seconds_billed == 42.0
+    @test l.jobs["1"]["elapsed"] == 42.0
+    @test node_hours(l).used == 2 * 42.0 / 3600
+    # An answer that is not a time, or a question that throws, changes nothing.
+    @test run_it(id -> NaN)[2].seconds_billed == 310.0
+    @test run_it(id -> error("sacct is down"))[2].seconds_billed == 310.0
+    # The command and what is read from it.
+    answers = Dict{String,Any}("sacct" => "30\n")
+    seen = Cmd[]
+    s = SlurmScheduler(; user="me", run=cmd -> (push!(seen, cmd); answers[cmd.exec[1]]))
+    @test SweepRunner.job_elapsed(s, "7") == 30.0
+    @test last(seen).exec == ["sacct", "-n", "-X", "-P", "-j", "7", "-o", "ElapsedRaw"]
+    for out in ("", "\n", "Unknown\n", "-5\n", nothing)
+        answers["sacct"] = out
+        @test SweepRunner.job_elapsed(s, "7") === nothing
+    end
+    @test SweepRunner.job_elapsed(MockScheduler(), "7") === nothing
+end
