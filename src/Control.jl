@@ -684,7 +684,7 @@ function _cut!(m::Master, table::TaskTable, row::TaskRow, o::StopOrder, log::Eve
         if same
             removed = false
             if pid != 0 && pid != myid()
-                something(_KILL_WORKER[], _kill_worker!)(pid)
+                something(_KILL_WORKER[], _kill_hard!)(pid)
                 removed = !(pid in procs())
             end
             if removed
@@ -700,6 +700,7 @@ function _cut!(m::Master, table::TaskTable, row::TaskRow, o::StopOrder, log::Eve
         o.tries += 1
         if o.tries >= _CUT_TRIES
             o.failed = true
+            tok === nothing || _out_keep!(tok)       # not released by the exit hook either
             o.why =
                 "the cut of key $(row.kstr) on worker $pid threw $(o.tries) times " *
                 "(last: $(_short_err(e))); its lock is kept"
@@ -720,6 +721,8 @@ function _cut!(m::Master, table::TaskTable, row::TaskRow, o::StopOrder, log::Eve
     push!(m.ctl.cuts, task)
     return nothing
 end
+
+_kill_hard!(pid) = _kill_worker!(pid; hard=true)
 
 # How often a cut whose worker would not go is tried, and how long between tries.
 const _CUT_TRIES = 3
@@ -768,6 +771,8 @@ function _cut_not_removed!(
     host = who === nothing ? "" : who.host
     if o.tries >= _CUT_TRIES
         o.failed = true
+        # The lock is the worker's from here on: listed, and not released as the master exits.
+        tok === nothing || _out_keep!(tok)
         o.why =
             "worker $pid" *
             (isempty(host) ? "" : " on $host (pid $(who.pid))") *
