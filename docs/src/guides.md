@@ -403,7 +403,10 @@ six-hour unit cannot hold a job that was told to stop. The worker is lost for
 the rest of the job (a pool starts another when the queue needs one).
 
 **If the worker cannot be removed** (a cluster manager that keeps no handle on
-it, an `rmprocs` that timed out) the lock is *not* released: the unit is still
+it, an `rmprocs` that timed out) the lock is *not* released. "Removed" means its
+process is known to have ended — the launcher exited, or Distributed has it as
+terminated — not that it left `procs()`, which a worker does the moment it is
+*asked* to go. Until then: the unit is still
 computing, and a free lock would let the key run twice. The kill is tried again
 on later ticks (`key_cut` with `worker_removed = false`), and after three tries
 `run!` throws, naming the worker — the allocation holds a process nobody could
