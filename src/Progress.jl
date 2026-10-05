@@ -223,4 +223,33 @@ function read_progress(vault::Vault; unreadable::Base.RefValue{Int}=Ref(0))
     return out
 end
 
+# Above this many keys a round lists the progress directory once; up to it, it asks for each
+# key's stamp by name.
+const _PROGRESS_LIST_ABOVE = 64
+
+# The recorded progress of `kstrs` (canonical keys), for a round that is about them. A round of
+# a few keys asks for those stamps by name: listing the directory and reading every stamp in it
+# is a cost in the number of partly-done units of the whole stage, paid by each `run!` — and a
+# caller that runs one key per `run!` paid it per key.
+function _read_progress_for(
+    vault::Vault,
+    kstrs::AbstractVector{<:AbstractString};
+    unreadable::Base.RefValue{Int}=Ref(0),
+)
+    length(kstrs) > _PROGRESS_LIST_ABOVE &&
+        return read_progress(vault; unreadable=unreadable)
+    out = Dict{String,Progress}()
+    for kstr in kstrs
+        f = _progress_file(vault, kstr)
+        isfile(f) || continue
+        try
+            out[String(kstr)] = last(_parse_progress(read(f, String)))
+        catch e
+            e isa InterruptException && rethrow()
+            unreadable[] += 1
+        end
+    end
+    return out
+end
+
 export report_progress, resume_point, read_progress

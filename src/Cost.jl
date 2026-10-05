@@ -128,38 +128,40 @@ function key_costs(outdir::AbstractString; stage=nothing)
     want = stage === nothing ? nothing : String(stage)
     for f in _event_files(outdir)
         for line in eachline(f)
-            # A cheap test first: most lines of a log are neither.
-            (occursin("\"key_done\"", line) || occursin("\"key_spent\"", line)) || continue
-            e = try
-                JSON3.read(line, Dict{String,Any})
-            catch
-                continue
-            end
-            kind = get(e, "kind", "")
-            (kind == "key_done" || kind == "key_spent") || continue
-            st = String(get(e, "stage", ""))
-            (want === nothing || st == want) || continue
-            note = get(e, "note", nothing)
-            push!(
-                out,
-                KeyCost(
-                    st,
-                    String(get(e, "key", "")),
-                    String(something(get(e, "class", ""), "")),
-                    Float64(get(e, "secs", NaN)),
-                    Float64(something(get(e, "cpu", NaN), NaN)),
-                    Int(get(e, "cores", 0)),
-                    Int(get(e, "rss", 0)),
-                    String(get(e, "host", "")),
-                    Int(get(e, "attempt", 1)),
-                    note isa AbstractDict ? Dict{String,Any}(note) : Dict{String,Any}(),
-                    kind == "key_done" ? "ok" : String(get(e, "outcome", "?")),
-                    String(get(e, "rss_scope", haskey(e, "rss") ? "key" : "")),
-                ),
-            )
+            c = _parse_cost(line)
+            (c === nothing || (want !== nothing && c.stage != want)) && continue
+            push!(out, c)
         end
     end
     return out
+end
+
+# One line of an event log as a cost record, or `nothing` when it is not one.
+function _parse_cost(line::AbstractString)::Union{KeyCost,Nothing}
+    # A cheap test first: most lines of a log are neither.
+    (occursin("\"key_done\"", line) || occursin("\"key_spent\"", line)) || return nothing
+    e = try
+        JSON3.read(line, Dict{String,Any})
+    catch
+        return nothing
+    end
+    kind = get(e, "kind", "")
+    (kind == "key_done" || kind == "key_spent") || return nothing
+    note = get(e, "note", nothing)
+    return KeyCost(
+        String(get(e, "stage", "")),
+        String(get(e, "key", "")),
+        String(something(get(e, "class", ""), "")),
+        Float64(get(e, "secs", NaN)),
+        Float64(something(get(e, "cpu", NaN), NaN)),
+        Int(get(e, "cores", 0)),
+        Int(get(e, "rss", 0)),
+        String(get(e, "host", "")),
+        Int(get(e, "attempt", 1)),
+        note isa AbstractDict ? Dict{String,Any}(note) : Dict{String,Any}(),
+        kind == "key_done" ? "ok" : String(get(e, "outcome", "?")),
+        String(get(e, "rss_scope", haskey(e, "rss") ? "key" : "")),
+    )
 end
 
 key_costs(vault::Vault) = key_costs(vault.outdir; stage=vault.run)
@@ -251,14 +253,14 @@ _json_value(x) = x
 cost_table_path(vault::Vault) = joinpath(state_root(vault), "costs.json")
 
 """
-    write_cost_table(vault) -> Dict{String,NamedTuple}
+    cost_records_path(vault) -> String
 
-Summarise every key this stage has finished ([`cost_summary`](@ref) of [`key_costs`](@ref)) and
-write it to [`cost_table_path`](@ref), atomically. [`run!`](@ref) does this at the end of every
-round (and with the manifest while a round runs), so the next round, and the next job, find it.
+`<state_root>/cost_records.jsonl`: this stage's cost records (the `key_done` / `key_spent` lines
+of the event logs), one file for the stage. The cost table is summarised from it.
 """
-function write_cost_table(vault::Vault)
-    summary = cost_summary(key_costs(vault))
+cost_records_path(vault::Vault) = joinpath(state_root(vault), "cost_records.jsonl")
+
+function _save_cost_table(vault::Vault, summary)
     doc = Dict{String,Any}(
         "updated" => time(),
         "stage" => vault.run,
@@ -270,6 +272,147 @@ function write_cost_table(vault::Vault)
     )
     atomic_write(io -> JSON3.write(io, doc), cost_table_path(vault))
     return summary
+end
+
+"""
+    write_cost_table(vault) -> Dict{String,NamedTuple}
+
+REBUILD the stage's cost table from every event log under the vault's outdir: read them all
+([`key_costs`](@ref)), rewrite the stage's record file ([`cost_records_path`](@ref)) and the
+table ([`cost_table_path`](@ref)), atomically.
+
+This is the full rescan — its cost grows with every event file ever written under the outdir —
+and it is NOT what [`run!`](@ref) does: a round only adds what its own event log gained to the
+record file and summarises that one file. Call this once after moving a campaign to a version
+that keeps the record file (`cost_table_not_seeded` says when), or when the record file was lost.
+"""
+function write_cost_table(vault::Vault)
+    costs = KeyCost[]
+    lines = String[]
+    for f in _event_files(vault.outdir), line in eachline(f)
+        c = _parse_cost(line)
+        (c === nothing || c.stage != vault.run) && continue
+        push!(costs, c)
+        push!(lines, line)
+    end
+    path = cost_records_path(vault)
+    mkpath(dirname(path))
+    atomic_write(io -> foreach(l -> println(io, l), lines), path)
+    lock(() -> delete!(_COST_RECORDS, path), _COST_RECORDS_LOCK)
+    return _save_cost_table(vault, cost_summary(costs))
+end
+
+# ── what a round does: its own records, and one file ────────────────────────────────────────────
+
+# Up to how many event files a stage's record file is seeded from when it does not exist yet.
+# More than that is not read at the end of a round: it is said, and left to an explicit rebuild.
+const _COST_SEED_MAX_FILES = Ref(200)
+
+# record file => (bytes read so far, the records, hashes of the lines already taken). A round
+# reads only what the file gained since this process last looked.
+const _COST_RECORDS = Dict{String,Tuple{Int,Vector{KeyCost},Set{UInt64}}}()
+const _COST_RECORDS_LOCK = ReentrantLock()
+
+# The whole lines `path` holds from byte `from` on, and the offset after the last of them. A
+# file shorter than `from` was replaced: it is read from its start.
+function _lines_since(path::AbstractString, from::Integer)
+    isfile(path) || return String[], Int(from)
+    size = filesize(path)
+    size < from && (from = 0)
+    size == from && return String[], Int(from)
+    data = open(path) do io
+        seek(io, from)
+        return read(io, size - from)
+    end
+    last_nl = findlast(==(UInt8('\n')), data)
+    last_nl === nothing && return String[], Int(from)          # a line still being written
+    lines = split(String(data[1:last_nl]), '\n'; keepempty=false)
+    return String.(lines), Int(from) + last_nl
+end
+
+# Copy the cost records of this stage that the event log at `logpath` gained since byte `from`
+# into the stage's record file, in one append. Returns the offset to continue from.
+function _collect_cost_records!(vault::Vault, logpath::AbstractString, from::Integer)
+    lines, upto = _lines_since(logpath, from)
+    mine = String[]
+    for line in lines
+        c = _parse_cost(line)
+        (c === nothing || c.stage != vault.run) && continue
+        push!(mine, line)
+    end
+    if !isempty(mine)
+        path = cost_records_path(vault)
+        mkpath(dirname(path))
+        open(io -> write(io, join(mine, "\n") * "\n"), path, "a")
+    end
+    return upto
+end
+
+# The stage's records, from its record file: what the file gained since this process last read
+# it is parsed and added. A line seen twice (a seed and an append of the same record) counts once.
+function _cost_records(vault::Vault)::Vector{KeyCost}
+    path = cost_records_path(vault)
+    return lock(_COST_RECORDS_LOCK) do
+        from, costs, seen = get(_COST_RECORDS, path, (0, KeyCost[], Set{UInt64}()))
+        isfile(path) &&
+            filesize(path) < from &&
+            ((from, costs, seen) = (0, KeyCost[], Set{UInt64}()))
+        lines, upto = _lines_since(path, from)
+        for line in lines
+            h = hash(line)
+            h in seen && continue
+            c = _parse_cost(line)
+            c === nothing && continue
+            push!(seen, h)
+            push!(costs, c)
+        end
+        _COST_RECORDS[path] = (upto, costs, seen)
+        return copy(costs)
+    end
+end
+
+# The record file does not exist yet (a stage that ran under a version without one, or a new
+# stage). With few event files under the outdir it is built from them, once. With many it is
+# not: reading tens of thousands of files at the end of a round is what this file exists to
+# avoid. It starts empty, that is said, and the history is the explicit rebuild's to bring in.
+function _seed_cost_records!(vault::Vault, log::EventLog, stage::Symbol)
+    path = cost_records_path(vault)
+    isfile(path) && return false
+    files = _event_files(vault.outdir)
+    if length(files) > _COST_SEED_MAX_FILES[]
+        mkpath(dirname(path))
+        open(io -> nothing, path, "a")
+        log_event(
+            log,
+            :cost_table_not_seeded;
+            level=:warn,
+            stage=stage,
+            event_files=length(files),
+            max=_COST_SEED_MAX_FILES[],
+        )
+        return false
+    end
+    write_cost_table(vault)
+    return true
+end
+
+"""
+    update_cost_table!(vault, log, offset) -> Dict{String,NamedTuple}
+
+What [`run!`](@ref) does for the cost table: add the cost records that `log`'s file gained since
+byte `offset[]` to the stage's record file, and summarise that file into the table. It reads
+the part of ONE event log this round wrote and ONE record file (only what that gained since
+this process last read it) — not the outdir. `offset` is advanced.
+"""
+function update_cost_table!(vault::Vault, log::EventLog, offset::Base.RefValue{Int})
+    stage = Symbol(vault.run)
+    if _seed_cost_records!(vault, log, stage)
+        # The seed read this log too, up to now.
+        offset[] = isfile(log.path) ? filesize(log.path) : 0
+    else
+        offset[] = _collect_cost_records!(vault, log.path, offset[])
+    end
+    return _save_cost_table(vault, cost_summary(_cost_records(vault)))
 end
 
 """

@@ -551,6 +551,15 @@ Each key goes to a worker together with its lock token and the last progress rec
 When the queue drains, the keys that came back busy are asked about once more, since their holder
 may have finished or died while the pass ran.
 
+`cost_table` says whether the round keeps the stage's cost table (`<state_root>/costs.json`):
+`:auto` (the default) keeps it when something reads it — a `key_class` or a `pool` was given —
+`true` always, `false` never. Keeping it costs, at the end of a round and on the manifest's
+timer, a read of what THIS master's event log gained during the round, an append to the stage's
+record file and a read of what that file gained: it does not grow with the number of event files
+under the outdir. (0.6.9 and 0.6.10 reread every event file under the outdir at the end of every
+round, whoever read the table: minutes per round in an outdir with tens of thousands of them.)
+The full rescan is [`write_cost_table`](@ref), on request.
+
 `key_class` is `key -> label`: the class a key's cost is recorded under (a size, a model). Every
 finished key leaves a `key_done` record with its wall time, CPU time, cores, peak memory and node;
 [`key_costs`](@ref) reads them back and [`cost_summary`](@ref) groups them by this label, so the
@@ -661,13 +670,27 @@ function run!(
     cost=nothing,
     min_time=nothing,
     pool=nothing,
+    cost_table::Union{Bool,Symbol}=:auto,
 )
     stage = Symbol(vault.run)
+    (cost_table isa Bool || cost_table === :auto) || throw(
+        ArgumentError(
+            "run!: cost_table must be true, false or :auto, got $(repr(cost_table))"
+        ),
+    )
+    # The cost table is kept when something reads it: a `key_class` (the default cost, the
+    # explore rule) or a pool (its sizes). A caller with neither — one key per `run!` on each
+    # of its own workers, say — is not charged a table per round that nobody reads.
+    keep_costs =
+        cost_table === :auto ? (key_class !== nothing || pool !== nothing) : cost_table
     # A master handed in outlives this call (`run_loop!` between rounds); one made here does not.
     own = master === nothing
     master = own ? Master() : master
     log_name = "events_$(master.id).jsonl"
     log = EventLog(joinpath(vault.outdir, log_name); min_level=opts.log_level)
+    # Where this round's records begin in the master's event log: the cost table is updated
+    # from what the log gains from here on, not by reading the outdir.
+    cost_offset = Ref(isfile(log.path) ? filesize(log.path) : 0)
     # A pool starts its own workers as the queue needs them, so there may be none yet.
     multi = opts.workers !== :sequential && (nprocs() > 1 || pool !== nothing)
     master.vault = vault
@@ -845,7 +868,7 @@ function run!(
                 foreach(k -> add_complete!(m, k), done_now)
                 merge_and_save_manifest!(m)
                 # The cost table with it: a job killed at its wall clock leaves what it measured.
-                write_cost_table(vault)
+                keep_costs && update_cost_table!(vault, log, cost_offset)
             catch e
                 e isa InterruptException && rethrow()
                 log_event(
@@ -991,7 +1014,7 @@ function run!(
     # round reads it, and a class explored in this one has to be known to that one — else the
     # siblings were held back again and the loop took it for the deadline.
     try
-        write_cost_table(vault)
+        keep_costs && update_cost_table!(vault, log, cost_offset)
     catch e
         e isa InterruptException && rethrow()
         log_event(log, :cost_table_failed; level=:warn, stage=stage, err=_short_err(e))
@@ -1264,7 +1287,8 @@ starts used to skip: it joined a vault without knowing whose locks were in it.
 """
 function _scan!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts)
     lost = Ref(0)
-    progress = read_progress(vault; unreadable=lost)
+    todo = [r.kstr for r in table.rows if r.state === :todo]
+    progress = _read_progress_for(vault, todo; unreadable=lost)
     # Those keys start without their resume point: said, with how many.
     lost[] > 0 &&
         log_event(log, :progress_unreadable; level=:warn, stage=stage, files=lost[])
@@ -1303,7 +1327,7 @@ function _rescan_busy!(
 )::Int
     busy = [i for (i, r) in enumerate(table.rows) if r.outcome === :lock_busy]
     isempty(busy) && return 0
-    progress = read_progress(vault)
+    progress = _read_progress_for(vault, [table.rows[i].kstr for i in busy])
     masters = _lazy_masters(vault)
     infos = LockInfo[]
     n = 0
@@ -2796,6 +2820,7 @@ function _run_loop!(
     cost=nothing,
     min_time=nothing,
     pool=nothing,
+    cost_table::Union{Bool,Symbol}=:auto,
 )
     # Checked here, like `RunOpts`' numbers: a negative or NaN `idle_sleep` threw from `sleep`
     # after rounds had run, an infinite one never stopped waiting, and `max_empty_rounds = 0`
@@ -2862,6 +2887,7 @@ function _run_loop!(
             cost=cost,
             min_time=min_time,
             pool=pool,
+            cost_table=cost_table,
         )
         n_done += result.done
         n_collisions += result.collisions
@@ -2921,21 +2947,7 @@ function _run_loop!(
         stage=Symbol(vault.run),
         account=account_snapshot(master),
     )
-    # What the keys cost, where the next job (and whatever sizes it) can read it.
-    if rounds > 0
-        try
-            write_cost_table(vault)
-        catch e
-            e isa InterruptException && rethrow()
-            log_event(
-                EventLog(joinpath(vault.outdir, "events_$(master.id).jsonl")),
-                :cost_table_failed;
-                level=:warn,
-                stage=Symbol(vault.run),
-                err=_short_err(e),
-            )
-        end
-    end
+    # (The cost table is each round's to keep: `run!` leaves it up to date when it returns.)
     return (;
         ran=true,
         rounds=rounds,

@@ -57,9 +57,12 @@ end
         n = Ref(0)
         @test isempty(read_progress(v; unreadable=n))
         @test n[] == 2
+        # A round of a few keys reads its own keys' stamps by name (#198): the two above
+        # belong to no key of this round and are not its to report. One that does is.
+        write(SweepRunner._progress_file(v, ParamIO.canonical(ks[1])), "{ not json")
         run!(k -> Dict{String,Any}("x" => 1), v, ks; opts=_fl_quiet())
         ev = only([e for e in _fl_events(outdir) if e.kind == "progress_unreadable"])
-        @test ev.files == 2
+        @test ev.files == 1
     end
 end
 
