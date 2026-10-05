@@ -378,6 +378,36 @@ end
 # Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
 # cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
 # a job step dies with its srun client.
+# Remove many workers at the end of a run: all asked at once, then what launched each one
+# killed, together. One after the other — ask, wait, kill, wait — it was 0.4 s a worker on the
+# first run with 511 of them: `run!` returned 200 s after its last key was done.
+function _kill_workers!(ids::AbstractVector{<:Integer}; waitfor::Real=30)
+    isempty(ids) && return nothing
+    launchers = [something(_LAUNCHER_OF[], _launcher)(id) for id in ids]
+    try
+        live = intersect(ids, procs())
+        isempty(live) || rmprocs(live; waitfor=waitfor)
+    catch e
+        e isa InterruptException && rethrow()
+        # Some did not leave when asked: what launched them is killed below.
+    end
+    asyncmap(launchers; ntasks=256) do p
+        try
+            if p isa Base.Process && process_running(p)
+                kill(p)
+                if timedwait(() -> !process_running(p), 5.0; pollint=0.05) !== :ok
+                    kill(p, Base.SIGKILL)
+                    # ...and seen gone: when this returns, what the pool started is not there.
+                    timedwait(() -> process_exited(p), 5.0; pollint=0.05)
+                end
+            end
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
+    return nothing
+end
+
 function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
     p = something(_LAUNCHER_OF[], _launcher)(id)
     if hard
@@ -1518,10 +1548,9 @@ function shutdown!(pool::SizedPool; wait::Real=60.0)
     # what the pool started is gone.
     pool.closing = !isempty(pool.starting)
     timedwait(() -> isempty(pool.starting), Float64(wait); pollint=0.05)
-    for pid in collect(keys(pool.workers))
-        _kill_worker!(pid)
-        _pool_free!(pool, pid)
-    end
+    ids = collect(keys(pool.workers))
+    _kill_workers!(ids)
+    foreach(pid -> _pool_free!(pool, pid), ids)
     note_workers!(; planned=0, launched=0)
     return nothing
 end
