@@ -2047,12 +2047,17 @@ function _drive_workers!(
         end
         # What to look for depends on what failed: starts that brought nothing, or workers that
         # started and could not be readied.
-        what, where = if pool.rejects > pool.fails
+        # By the rule that fired, not by which count happens to be larger.
+        why = _pool_gave_up_why(pool)
+        what, where = if why === :rejects
             "$(pool.rejects) workers in a row started and could not be readied",
             "kind=\"workers_rejected\" / \"pool_retire\""
-        else
+        elseif why === :starts
             "$(pool.fails) worker starts failed in a row",
             "kind=\"pool_spawn_failed\" / \"pool_spawn_short\""
+        else
+            "no node is left to start workers on",
+            "kind=\"pool_node_out\", with why each node went"
         end
         error(
             "SizedPool: $what with keys still queued." *
