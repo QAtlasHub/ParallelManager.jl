@@ -1428,3 +1428,58 @@ end
     @test SweepRunner._worker_dead(4242, p) == true
     @test SweepRunner._worker_dead(987654, nothing) == true      # Distributed does not know it
 end
+
+@testset "a lock being kept stays kept when saying so fails (#188)" begin
+    _ct_vault() do v, outdir
+        ks = DataVault.keys(v)
+        table = TaskTable(ks)
+        # An event log that cannot be written: its directory is a file.
+        blocker = joinpath(outdir, "not-a-dir")
+        write(blocker, "x")
+        log = SweepRunner.EventLog(joinpath(blocker, "events_x.jsonl"))
+        m = SweepRunner.Master()
+        m.vault = v
+        r = SweepRunner.Round(
+            _ct_ok,
+            v,
+            table,
+            :ct,
+            log,
+            _ct_opts(),
+            m;
+            affinity=nothing,
+            prepare=nothing,
+            key_class=nothing,
+            fits=Returns(true),
+            tick=Returns(nothing),
+            pool=nothing,
+            min_time=nothing,
+        )
+        # The connection to worker 4242 closed and its process (the launcher here) is alive.
+        p = run(`sleep 30`; wait=false)
+        tok = "host:4242:keep188"
+        kept = Ref(false)
+        SweepRunner._EXIT_CONFIRM[] = 0.2
+        try
+            @test_throws Exception SweepRunner._round_call_failed!(
+                r,
+                Distributed.ProcessExitedException(4242),
+                table.rows[1],
+                tok,
+                4242,
+                "host",
+                p,
+                time(),
+                kept,
+            )
+            # The dispatch task's `finally` reads this: the token is not let go of.
+            @test kept[] == true
+            @test SweepRunner._out_has(tok)
+        finally
+            SweepRunner._EXIT_CONFIRM[] = 10.0
+            SweepRunner._out_unkeep!(tok)
+            delete!(SweepRunner._KEPT_WORKERS, 4242)
+            kill(p)
+        end
+    end
+end

@@ -1775,7 +1775,10 @@ function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
         r.out += 1
         t0 = time()
         died = false
-        kept = false
+        # A `Ref`, set by the handler BEFORE anything in it can throw: the `finally` below must
+        # not let go of a token whose worker may still be computing because the event log
+        # failed while that was being said.
+        kept = Ref(false)
         outcome = try
             last(
                 remotecall_fetch(
@@ -1794,12 +1797,12 @@ function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
             # The round stopped waiting for this task; what its worker does now is not the
             # round's (no death counted, no memory raised for a key it gave up on).
             current_task() in r.abandoned && return nothing
-            failed = _round_call_failed!(r, e, row, tok, pid, host, launcher, t0)
-            died, kept = failed.died, failed.kept
+            failed = _round_call_failed!(r, e, row, tok, pid, host, launcher, t0, kept)
+            died = failed.died
             failed.outcome
         finally
             r.out -= 1
-            if !kept
+            if !kept[]
                 _out_remove!(tok)
                 _out_unkeep!(tok)
             end
@@ -1814,13 +1817,14 @@ function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
     return nothing
 end
 
-# The call to the worker threw. What the unit's outcome is (`nothing`: hand the key out again),
-# whether this dispatch task is over (`died`), and whether the key's lock is kept.
-function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0)
+# The call to the worker threw. What the unit's outcome is (`nothing`: hand the key out again)
+# and whether this dispatch task is over (`died`). `kept` is set when the key's lock is kept —
+# first, so that it holds whatever throws after it.
+function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0, kept::Ref)
     (; vault, table, stage, log, master, pool) = r
     if !(e isa ProcessExitedException)
         log_event(log, :error; stage=stage, key=row.kstr, attempt=0, err=_short_err(e))
-        return (; outcome=:error, died=false, kept=false)
+        return (; outcome=:error, died=false)
     end
     # Distributed reports the exit when its side closes, which can be a moment before the
     # process is seen to have ended: that moment is waited for.
@@ -1830,6 +1834,7 @@ function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0
         # Distributed has closed its side (the worker was asked to leave, or the connection
         # dropped) and the PROCESS is not known to have ended: it may be computing. Its lock is
         # not released under it; the key is held, by it.
+        kept[] = true
         _out_keep!(tok)
         push!(_KEPT_WORKERS, pid)
         log_event(
@@ -1843,7 +1848,7 @@ function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0
             why="the connection to the worker is closed and its process is not " *
                 "known to have ended",
         )
-        return (; outcome=:lock_busy, died=true, kept=true)
+        return (; outcome=:lock_busy, died=true)
     end
     _release_dead!(vault, row, tok, stage, log)
     # The worker cannot say what the attempt cost; the master knows how long.
@@ -1862,14 +1867,14 @@ function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0
     if ord !== nothing && (ord.cut || ord.tries > 0)
         # Removed on purpose — also when the exit comes between two tries of the cut: not a
         # death of the key, and not its memory.
-        return (; outcome=:stopped, died=true, kept=false)
+        return (; outcome=:stopped, died=true)
     end
     lock(() -> row.deaths += 1, table.lock)
     # More memory for the next hand-out, when there is one: a key that is given up on now is
     # not "retried with more".
     (pool === nothing || row.deaths > _WORKER_DEATH_REDISPATCHES) ||
         _pool_death!(pool, row, pid, log, stage)
-    return (; outcome=_after_death(row, log, stage), died=true, kept=false)
+    return (; outcome=_after_death(row, log, stage), died=true)
 end
 
 # A unit came back (or did not): what it counts as, and the row settled or handed out again.
