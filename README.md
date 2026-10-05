@@ -77,7 +77,8 @@ and the store from [DataVault.jl](https://github.com/QAtlasHub/DataVault.jl).
   mock), a policy with a hard node-hour budget, and `decide` / `manage!`:
   nothing runnable means nothing submitted. Dry run by default.
 - **One entry point for all parallel modes** — `init_workers!(mode=:auto)`
-  dispatches to `:sequential` / `:threads` / `:distributed` / `:slurm`
+  sets up `:sequential` / `:threads` / `:distributed` / `:slurm` (keys are dispatched over
+  processes: under `:threads` they run on the master one at a time, with threads inside a key)
   depending on environment.
 - **Pure work functions** — your physics is a plain
   `(DataKey) -> Dict`, IO/locking/logging live in the runtime.
@@ -114,7 +115,7 @@ SweepRunner.run!(work_fn, vault, keys)
 ```
 
 Re-running the same script after completion: `:skip_complete` is logged and
-the process exits within milliseconds regardless of `length(keys)`.
+`run!` returns after one manifest read, whatever `length(keys)` is.
 
 ### Shared setup
 

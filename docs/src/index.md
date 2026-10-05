@@ -30,7 +30,8 @@ Depth = 2
   per-item `println` is a non-goal, by design.
 - **One entry point for all parallel modes** —
   [`init_workers!(mode=:auto)`](@ref SweepRunner.init_workers!)
-  dispatches to `:sequential` / `:threads` / `:distributed` / `:slurm`
+  sets up `:sequential` / `:threads` / `:distributed` / `:slurm` (keys are dispatched over
+  processes: under `:threads` they run on the master one at a time, with threads inside a key)
   depending on environment.
 - **Pure work functions** — your physics is a plain
   `(DataKey) -> Dict`, IO/locking/logging live in the runtime.

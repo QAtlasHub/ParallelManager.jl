@@ -624,8 +624,9 @@ function reload_ledger!(l::Ledger)
     return l
 end
 
-# How long a ledger lock may be held before it is taken as left behind by a controller that
-# died. A round holds it across `squeue` and `sbatch`, each bounded at a minute.
+# How long a ledger lock may go unrefreshed before it is taken as left behind by a controller
+# that died. Ten minutes: its holder refreshes it every minute, and a round's slowest calls
+# (`squeue`, `sacct`, `sbatch`) are each bounded at one.
 const _LEDGER_LOCK_STALE = Ref(600.0)
 
 """
@@ -816,7 +817,9 @@ end
 # On how many polls the accounting has to call a job over before that ends it.
 const _GONE_CONFIRM = 2
 const _ENDED_MIN_ABSENT = Ref(120.0)
-# The same, for answers that list no job of the ledger at all: half an hour.
+# The same, for answers that list no job of the ledger at all: half an hour — long enough that
+# a wrapper or a wrong cluster answering for a few polls ends nothing, short enough that a
+# controller is not stuck behind the last job of a partition for its whole time limit.
 const _ENDED_MIN_ABSENT_ALONE = Ref(1800.0)
 # How long a submission may go unlisted before it is taken as not made.
 const _SUBMIT_UNSEEN = Ref(600.0)
@@ -1481,12 +1484,18 @@ function _refuse_all(ctl::JobController, why::AbstractString)
 end
 
 """
-    controller_loop!(controller, work; interval=300.0, stop=() -> false, max_rounds=nothing)
+    controller_loop!(controller, work; interval=300.0, stop=() -> false, max_rounds=nothing,
+                     io=nothing, last=nothing)
 
-[`manage!`](@ref) every `interval` seconds until `stop()` is true, `max_rounds` have run, or
-nothing is left: no runnable work on any partition and no job of ours pending or running. A
-`dry_run` policy runs one round: nothing it decides changes what the next round would see. Returns
-the number of rounds.
+[`manage!`](@ref) every `interval` seconds until `stop()` is true, `max_rounds` have run, nothing
+is left (no runnable work on any partition and no job of ours pending or running), or the budget
+is spent with nothing live. A `dry_run` policy runs one round: nothing it decides changes what the
+next round would see. Returns the number of rounds.
+
+With `io`, each round's decisions are printed as it happens; `last` (a `Ref`) receives the last
+round's decisions. A round that throws is logged (`controller_round_failed`) and asked again —
+except an `ArgumentError` (a wrong configuration), a dry run, or the fifth failure in a row,
+which are raised.
 """
 function controller_loop!(
     ctl::JobController,

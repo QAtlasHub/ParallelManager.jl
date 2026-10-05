@@ -207,3 +207,21 @@ end
         end
     end
 end
+
+@testset "every event the package logs is in the kind table" begin
+    src = _doc_src_text()
+    kinds = Set(m.captures[1] for m in eachmatch(r"\n\s+:([a-z_]+);\n", src))
+    union!(
+        kinds,
+        m.captures[1] for
+        m in eachmatch(r"log_event\(\s*[A-Za-z_.\[\]]+,\s*:([a-z_]+)\s*[;,)]", src)
+    )
+    doc = read(joinpath(_DOC_SRC, "EventLog.jl"), String)
+    from = first(findfirst("# Event kinds used by `run!`", doc))
+    table = doc[from:(first(findnext("\"\"\"", doc, from)))]
+    @test length(kinds) > 50                                     # the patterns still find them
+    for k in sort!(collect(kinds))
+        occursin("`$k`", table) || @error "event kind not in EventLog's table" k
+        @test occursin("`$k`", table)
+    end
+end

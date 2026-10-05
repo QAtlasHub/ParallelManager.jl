@@ -254,8 +254,8 @@ cost_table_path(vault::Vault) = joinpath(state_root(vault), "costs.json")
     write_cost_table(vault) -> Dict{String,NamedTuple}
 
 Summarise every key this stage has finished ([`cost_summary`](@ref) of [`key_costs`](@ref)) and
-write it to [`cost_table_path`](@ref), atomically. [`run_loop!`](@ref) does this when it ends, so
-the table is there for the next job; call it yourself after a bare `run!`.
+write it to [`cost_table_path`](@ref), atomically. [`run!`](@ref) does this at the end of every
+round (and with the manifest while a round runs), so the next round, and the next job, find it.
 """
 function write_cost_table(vault::Vault)
     summary = cost_summary(key_costs(vault))

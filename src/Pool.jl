@@ -561,8 +561,11 @@ when the `run!` / `run_loop!` it was given to returns, unless `keep=true` (then 
   per-master limit ([`srun_worker_limit`](@ref), else 1500): past it workers neither join nor
   fail. Reaching it is logged once (`pool_at_limit`).
 
-After ten failed starts in a row the pool gives up and `run!` throws: a pool that cannot start
-workers is not a round that ended.
+A node whose starts bring no worker, or whose workers cannot be readied, five times in a row
+over at least a minute is taken out (`pool_node_out`) and tried once more five minutes later
+(`pool_node_retry`); a worker of it taking a key clears it. The pool gives up, and `run!` throws,
+when every node has been taken out twice, or when ten starts (or ten readied workers) in a row
+have failed over at least a minute: a pool that cannot start workers is not a round that ended.
 """
 mutable struct SizedPool
     const spawner::Spawner
@@ -1245,7 +1248,9 @@ end
 const _SAID_CAP = IdDict{Any,Int}()
 
 # How many starts in a row may fail on one node before it is taken out, over at least how
-# long, and after how long a node that was taken out is tried again.
+# long, and after how long a node that was taken out is tried again. A minute, because the tick
+# is a second and `srun` refuses for several while the last step's resources are released; five
+# minutes, because that is about how long a node or a controller that hiccuped needs.
 const _NODE_MAX_FAILS = 5
 const _NODE_FAIL_SPAN = Ref(60.0)
 const _NODE_RETRY_AFTER = Ref(300.0)

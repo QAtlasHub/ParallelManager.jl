@@ -792,8 +792,8 @@ worker ever ran. Where the reset is not available the record says
 `rss_scope = "process"`, and the class's summary `rss_process = true`.
 
 The table is rewritten with the manifest while a round runs
-(`RunOpts.manifest_interval`) and when `run_loop!` ends, so a job killed at
-its wall clock leaves what it measured.
+(`RunOpts.manifest_interval`) and at the end of every `run!`, so a job killed
+at its wall clock leaves what it measured.
 
 ## 15. Where a job's core-hours went
 

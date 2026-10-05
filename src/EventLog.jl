@@ -90,7 +90,45 @@ stay within that guarantee.
 | `pool_at_limit` | a start was wanted past that limit (`held`, `queued`); once        |
 | `pool_spawn_short` | a start brought fewer workers than asked (`asked`, `started`)   |
 | `pool_stalled`  | starts have neither joined nor failed for `stall_after`            |
-| `pool_gave_up`  | ten starts failed in a row with keys still queued; `run!` throws   |
+| `pool_gave_up`  | the pool has nothing left to try with keys still queued — every    |
+|                 | node taken out twice, or ten starts / ten readied workers in a row |
+|                 | failed over a minute (`fails`, `rejects`, `nodes_out`); `run!`     |
+|                 | throws                                                             |
+| `pool_node_out` | a node's starts brought no worker, or its workers could not be     |
+|                 | readied, five times over a minute (`node`, `why`, `times_out`)     |
+| `pool_node_retry` | a node that was taken out gets one more try                      |
+| `pool_kill_failed` | a retired worker is still there; its room is not given back     |
+| `tick_failed`   | a step of the master's periodic work threw (`step`, `count`,       |
+|                 | `secs`); the other steps still ran                                 |
+| `status_tick_failed` | a check of the status tick threw (`step`, `count`)            |
+| `key_cut_failed`| a cut threw; it is tried again, three times                        |
+| `key_stuck`     | a running key has reported no progress for `stuck_after`           |
+| `lock_kept`     | the master is leaving and a worker could not be removed: its lock  |
+|                 | stays with it                                                      |
+| `lock_not_ours` | a lock the master meant to release was already released or taken   |
+| `lock_unreadable` | a unit could not read its own lock file; it goes on              |
+| `low_utilisation` | fewer than `min_utilisation` of this master's cores have a key,  |
+|                 | with keys queued, for ten minutes (`why`)                          |
+| `utilisation_unknown` | the allocation's cores could not be read: the alarm is off   |
+| `utilisation_guess` | this master was not told which nodes are its own: its share   |
+|                 | is the job's cores less what the other masters report              |
+| `status_off`    | `status_interval = 0`: no status, and nothing that runs in its     |
+|                 | tick (the alarm, the stuck check, `workers_short`)                 |
+| `option_ignored`| an option the round does not act on (`option`, `why`)              |
+| `cost_explore`  | a key of unknown cost was started to measure its class             |
+| `cost_explore_capped` | more unknown classes than are explored in one round          |
+| `cost_hook_failed` | the `cost` / `min_time` hook threw (`err`)                      |
+| `manifest_failed` | the manifest could not be written during a round                 |
+| `spawn_failed`  | the `spawn` hook of a `:resize` threw                              |
+| `underused_request_failed` | the stop request of an under-used master could not be  |
+|                 | written                                                            |
+| `observed` / `observe_failed` | a process observed its sources, or could not         |
+| `profile_too_small` | a campaign profile's `min_nodes` exceeds the allocation        |
+| `job_ended`     | the controller took one of its jobs as ended (`evidence`, `weak`)  |
+| `job_gone_failed` | the scheduler's accounting could not be asked                    |
+| `job_submit_failed` | `sbatch` failed or timed out; the ledger row stays committed   |
+| `ledger_new`    | a controller started a ledger where there was none                 |
+| `controller_round_failed` | a round of `controller_loop!` threw                      |
 | `pool_retire`   | an idle worker whose size no queued key fits gave its room back    |
 | `pool_retry_mem`| a worker died under a key: the key is retried with more memory     |
 |                 | (`had_gb`, `next_gb`)                                              |

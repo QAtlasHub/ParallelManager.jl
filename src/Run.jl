@@ -132,12 +132,14 @@ The numbers are checked when the options are built: `max_attempts >= 1`; `stale_
   and not advancing", left for a person or a [`control!`](@ref) request to act on. Set it above
   the longest step your `work_fn` takes between two reports. `0` (the default) never says it.
 - `min_utilisation::Float64 = 0.5` — the alarm for a job that uses a fraction of what it is
-  charged for. When fewer than this fraction of the ALLOCATED cores (`SLURM_JOB_CPUS_PER_NODE`)
-  have a key, with keys queued, for ten minutes, the master says so: a `low_utilisation` warning
+  charged for. When fewer than this fraction of the cores that are THIS MASTER'S to fill (its
+  pool's nodes; its node group, `SWEEPRUNNER_NODELIST`; else the job's cores less what the other
+  masters of the job report) have a key, with keys queued, for ten minutes, the master says so: a `low_utilisation` warning
   in the event log and on its stderr, and a line at the top of the status, with the reason it
   can see (workers cover only part of the allocation; or workers idle with keys nobody fits).
-  Nothing is stopped. `0` turns it off; outside a Slurm job the allocation is not known and
-  nothing is compared.
+  Nothing is stopped. `0` turns it off. It runs in the status tick, so `status_interval = 0`
+  turns it off too (the round says `status_off`); outside a Slurm job, without a pool, the
+  allocation is not known and nothing is compared.
 
 # Example
 
@@ -426,13 +428,15 @@ function _guarded(f)
     return nothing
 end
 
-# How many times a worker that joined late is readied before it is given up on.
+# How many times a worker that joined late is readied before it is given up on. Three: once is
+# what a file system that was slow for a moment fails, and each try costs a tick.
 const _PREPARE_TRIES = 3
 
 # The ticker's steps: how often a failing one is said again, and how many failures in a row end
 # the round.
 const _TICK_SAY_EVERY = 100
-# The steps whose lasting failure ends the round, and after how long.
+# The steps whose lasting failure ends the round, and after how long. Five minutes: longer than
+# a file system or a controller usually stays away, shorter than a job can afford to idle.
 const _TICK_FATAL_STEPS = (:pool, :adopt, :stop_grace, :enforce_stops)
 const _TICK_FATAL_AFTER = Ref(300.0)
 # How long the units still running get once a round is ending on a failed step, when the
@@ -2699,7 +2703,9 @@ function _say_ignored(
     return nothing
 end
 
-# How many classes of unknown cost are explored in one round.
+# How many classes of unknown cost are explored in one round. Eight: enough for the handful of
+# sizes a sweep usually has, few enough that a `key_class` too fine to mean anything does not
+# switch the deadline check off.
 const _EXPLORE_MAX = Ref(8)
 
 # Ask the cost hook about the first queued key, to say an error it throws: once, with what it
