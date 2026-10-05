@@ -40,7 +40,7 @@ mode actually used (useful when `mode=:auto`).
   tight when 100+ workers race each other through
   `_include_from_serialized` on a shared depot.
 
-Both defaults (300s) handle the 128-worker i8cpu case on ISSP System B
+Both defaults (300s) were enough for 128 workers on one node of one cluster
 comfortably.  Set lower values only for local debugging.
 
 # Start-up

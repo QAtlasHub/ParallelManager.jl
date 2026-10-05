@@ -567,9 +567,10 @@ budget_node_hours = 5000          # hard: no default
 max_jobs          = 8
 dry_run           = true
 default_key_time  = "10min"       # used when there is no cost model
+bill              = "estimate"    # what an ended job counts for: estimate | elapsed | limit
 
 [[jobs.partition]]
-name           = "i8cpu"
+name           = "debug"
 nodes          = 8
 time_limit     = "30min"
 script         = "batch/run_campaign.sh"
@@ -578,7 +579,7 @@ max_jobs       = 1
 slots_per_node = 32               # workers per node: how much a job can take
 
 [[jobs.partition]]
-name           = "F16cpu"
+name           = "large"
 nodes          = 16
 time_limit     = "24h"
 script         = "batch/run_campaign.sh"
@@ -595,10 +596,31 @@ bin/sweeprunner jobs configs/campaign.toml --submit --loop 300   # every 5 min u
 
 ```
 budget   812.0 used + 384.0 committed of 5000.0 node-hours
-  hold   i8cpu       nothing runnable under profile short
-  submit F16cpu      1930 unit(s) runnable under profile large, about 5120.4 worker-hours; 2 job(s) there
-  refuse F72cpu      budget: 4871.0 node-hours used or committed, this job needs 1728.0, the budget is 5000.0
+  hold   debug       nothing runnable under profile short
+  submit large       1930 unit(s) runnable under profile large, about 5120.4 worker-hours; 2 job(s) there
+  refuse huge        budget: 4871.0 node-hours used or committed, this job needs 1728.0, the budget is 5000.0
 ```
+
+**The budget is this package's count, not a centre's bill.** The partition
+names, sizes and limits above are an example, and so is every rule the
+controller applies: it counts nodes × hours for whole-node jobs, caps the jobs
+per partition, and refuses past a number of node-hours. Computing centres
+differ in all of that — some charge the time a job ran and some the time it
+asked for; some count cores, or weight partitions, or round up, or charge a
+minimum per job; some have no consumption budget at all and limit the nodes or
+jobs a user may hold; some partitions share a node between jobs. The
+controller was run against one cluster, and nothing in it was derived from any
+centre's regulations. Read the rules of the centre the jobs go to and set:
+
+- `budget_node_hours` to what you are willing to let the controller commit, in
+  the controller's unit;
+- `bill` to what an ended job should count for: `estimate` (the default: the
+  most it can have run since the queue last listed it, at most its limit —
+  never less than it ran), `elapsed` (the time the scheduler's accounting
+  gives, for a centre that charges the time used), or `limit` (its whole time
+  limit once it has run, for a centre that charges the time asked for);
+- `max_jobs` per partition and overall to stay inside the centre's own caps —
+  a cap on nodes per user, or a partition that shares nodes, is not modelled.
 
 Per partition, [`decide`](@ref SweepRunner.decide):
 

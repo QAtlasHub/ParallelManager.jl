@@ -441,12 +441,31 @@ end
 
 """
     JobPolicy(; name, partitions, budget_node_hours, max_jobs=typemax(Int), dry_run=true,
-              default_key_time=600.0)
+              default_key_time=600.0, bill=:estimate)
 
 The rules a controller submits under. `name` prefixes every job it submits and is how it
 recognises its own. `budget_node_hours` is hard: a submission that would take used plus
 committed node-hours past it is refused. `dry_run` (the default) decides and logs but submits
 nothing.
+
+**The budget is this package's own count, not a computing centre's bill.** The ledger adds up
+nodes × hours for the jobs it submitted. What a centre charges is its own rule — the time a job
+ran or the time it asked for, whole nodes or cores, weights per partition, rounding, a minimum
+per job, a cap on nodes or jobs per user instead of a budget at all — and the rules of one
+centre are not those of the next. Choose `budget_node_hours` and `bill` for the centre the jobs
+go to; nothing here was derived from any centre's regulations.
+
+`bill` is what a job that has ended counts for:
+
+- `:estimate` (the default): the most it can have run — from when the queue last listed it
+  until its end was seen, at most its time limit. Never less than it ran.
+- `:elapsed`: the time the scheduler's accounting gives for it ([`job_elapsed`](@ref)), when the
+  accounting has confirmed its end and has a time; the estimate otherwise. For a centre that
+  charges the time used.
+- `:limit`: its whole time limit, once it has been seen running. For a centre that charges the
+  time asked for.
+
+A live job always counts its whole limit as committed.
 """
 struct JobPolicy
     name::String
@@ -455,10 +474,19 @@ struct JobPolicy
     max_jobs::Int
     dry_run::Bool
     default_key_time::Float64
+    bill::Symbol
     function JobPolicy(
-        name, partitions, budget_node_hours, max_jobs, dry_run, default_key_time
+        name,
+        partitions,
+        budget_node_hours,
+        max_jobs,
+        dry_run,
+        default_key_time,
+        bill::Symbol=:estimate,
     )
         bad(msg) = throw(ArgumentError("JobPolicy $name: $msg"))
+        bill in _BILL_RULES ||
+            bad("bill must be one of $(join(_BILL_RULES, ", ")), got $bill")
         isempty(name) &&
             bad("name must not be empty: it is how the controller knows its jobs")
         # NaN would make `spent + job > budget` false for every job.
@@ -476,6 +504,7 @@ struct JobPolicy
             Int(max_jobs),
             dry_run,
             Float64(default_key_time),
+            bill,
         )
     end
 end
@@ -487,9 +516,10 @@ function JobPolicy(;
     max_jobs::Integer=typemax(Int),
     dry_run::Bool=true,
     default_key_time::Real=600.0,
+    bill::Symbol=:estimate,
 )
     return JobPolicy(
-        name, partitions, budget_node_hours, max_jobs, dry_run, default_key_time
+        name, partitions, budget_node_hours, max_jobs, dry_run, default_key_time, bill
     )
 end
 
@@ -512,7 +542,7 @@ max_jobs          = 8
 dry_run           = true
 
 [[jobs.partition]]
-name           = "i8cpu"
+name           = "debug"
 nodes          = 8
 time_limit     = "30min"
 script         = "batch/run.sh"
@@ -559,6 +589,7 @@ function load_job_policy(path::AbstractString)
         max_jobs=Int(get(j, "max_jobs", typemax(Int))),
         dry_run=get(j, "dry_run", true) === true,
         default_key_time=parse_duration(get(j, "default_key_time", 600.0)),
+        bill=Symbol(get(j, "bill", "estimate")),
     )
 end
 
@@ -832,6 +863,9 @@ function _check_ledger_held(l::Ledger)
     return nothing
 end
 
+# What a job that has ended counts for (see `JobPolicy`).
+const _BILL_RULES = (:estimate, :elapsed, :limit)
+
 # How many polls in a row a job has to be absent from the scheduler's answer before the ledger
 # takes it as ended. One absence is not evidence: a job between states, a controller that
 # answered for part of the queue.
@@ -920,17 +954,17 @@ job_gone(::Scheduler, ::AbstractString) = nothing
 
 How long a job that has ended ran, by the scheduler's accounting; `nothing` when it has no
 answer (the default). May throw when the accounting cannot be asked: that is logged
-(`job_elapsed_failed`) and the job is billed the estimate.
+(`job_elapsed_failed`) and the job counts as estimated.
 
-The ledger bills a job whose end the accounting has confirmed ([`job_gone`](@ref), on two
-polls) for this, instead of for the most it can have run since the queue last listed it; the
-`job_ended` event says which (`billed_by`: `accounting` or `estimate`).
+Asked only under `JobPolicy(bill = :elapsed)`, for a job whose end the accounting has confirmed
+([`job_gone`](@ref), on two polls). The `job_ended` event says which rule a job was counted by
+(`billed_by`: `accounting`, `limit` or `estimate`).
 """
 job_elapsed(::Scheduler, ::AbstractString) = nothing
 
 """
     observe!(ledger, states; now=time(), names=(), gone=id -> nothing,
-             elapsed=id -> nothing) -> Vector{NamedTuple}
+             elapsed=id -> nothing, bill=:estimate) -> Vector{NamedTuple}
 
 Bring the ledger up to what the scheduler says, and return what changed
 (`(; id, what, evidence, …)`, `what` being `:ended` or `:adopted`), for the caller to log.
@@ -950,10 +984,11 @@ Bring the ledger up to what the scheduler says, and return what changed
     also what the wrong cluster gives. (Three such answers in a row, with no time required,
     used to empty the ledger.) Or
   - the clock says it cannot be running: it was seen running and its time limit has passed.
-- A job that has ended is billed for what it can have run since it was last seen (up to its
-  time limit) — or, when the accounting confirmed its end and `elapsed(id)` gives a time, for
-  that time. Each `:ended` change says which (`billed_by`) and carries the error of an
-  `elapsed` that threw (`elapsed_err`). A job that reappears is live again.
+- A job that has ended counts, by `bill` (see [`JobPolicy`](@ref)): for what it can have run
+  since it was last seen, up to its time limit (`:estimate`); for the time `elapsed(id)` gives
+  when the accounting confirmed its end (`:elapsed`); or for its whole limit once it has run
+  (`:limit`). Each `:ended` change says which rule was applied (`billed_by`) and carries the
+  error of an `elapsed` that threw (`elapsed_err`). A job that reappears is live again.
 - A row still `submitting` (the controller did not learn the id) takes the id of a listed job
   with its name that the ledger does not have yet.
 """
@@ -964,7 +999,10 @@ function observe!(
     names=(),
     gone=id -> nothing,
     elapsed=id -> nothing,
+    bill::Symbol=:estimate,
 )
+    bill in _BILL_RULES ||
+        throw(ArgumentError("observe!: bill must be one of $(join(_BILL_RULES, ", "))"))
     changes = NamedTuple[]
     by = Dict(j.id => j for j in states)
     unclaimed = [j for j in states if !haskey(l.jobs, j.id)]
@@ -1083,12 +1121,18 @@ function observe!(
             before = Float64(j["elapsed"])
             j["elapsed"] = min(Float64(j["time_limit"]), before + max(since, 0.0))
             isfinite(j["elapsed"]) || (j["elapsed"] = before + max(since, 0.0))
-            # ...unless the accounting, having confirmed that it is over, also says for how
-            # long: then a job that finished its work early is not billed its whole limit.
-            # Which of the two a job was billed is recorded, and a question that failed is
-            # returned for the caller to say: an estimate counts against the budget like a
-            # measurement and must not look like one.
-            if confirmed
+            # That estimate is what counts unless the policy says otherwise: which of the
+            # rules below matches what the centre charges is the policy's to say, not this
+            # function's to assume. Which one a job was counted by is recorded, and a question
+            # that failed is returned for the caller to say: an estimate counts against the
+            # budget like a measurement and must not look like one.
+            if bill === :limit && (j["state"] == "running" || before > 0)
+                # The time it asked for, once it has run at all.
+                isfinite(Float64(j["time_limit"])) &&
+                    (j["elapsed"] = Float64(j["time_limit"]))
+                billed_by = "limit"
+            elseif bill === :elapsed && confirmed
+                # The time the accounting, having confirmed that it is over, gives for it.
                 ran = try
                     elapsed(id)
                 catch e
@@ -1500,6 +1544,7 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
         l,
         states;
         names=_job_names(ctl.policy),
+        bill=ctl.policy.bill,
         elapsed=id -> job_elapsed(ctl.scheduler, id),
         gone=id -> try
             job_gone(ctl.scheduler, id)
