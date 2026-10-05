@@ -182,6 +182,12 @@ print_account(x) = print_account(stdout, x)
 function print_account(io::IO, a::AbstractDict)
     total = Float64(a["allocated"])
     _account_line(io, "allocated", total, 0.0)
+    # Not the allocation: the cores that joined, because the allocation could not be read.
+    get(a, "allocated_known", true) === false && println(
+        io,
+        "    (the allocation is not known: \"allocated\" is the cores that joined, so ",
+        "\"never started\" and the percentages are against that)",
+    )
     _account_line(io, "computing", a["computing"], total)
     _account_line(io, "kept", a["kept"], total; indent="  ")
     pct = total > 0 ? string(" (", round(Int, 100 * a["lost"] / total), "%)") : ""

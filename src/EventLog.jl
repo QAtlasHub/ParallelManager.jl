@@ -253,9 +253,11 @@ Returns `nothing`.
 function log_event(log::EventLog, kind::Symbol; level::Symbol=:info, kwargs...)
     # Drop events below the log's threshold. `level` is consumed here (a filter
     # decision); it is NOT written into the JSON — the `kind` already implies it.
-    _level_value(level) < log.min_level && return nothing
     rec = (; ts=string(now()), kind=String(kind), kwargs...)
+    # Counted and echoed BEFORE the file's threshold: `log_level = :error` keeps warnings out of
+    # the file, and used to keep them out of the job's output and the round's summary with it.
     _level_value(level) >= 30 && _note_warning(kind, rec, level)
+    _level_value(level) < log.min_level && return nothing
     # Build the full line with newline so a single `write` is one atomic
     # append on POSIX (given `O_APPEND` and size < PIPE_BUF).
     line = string(JSON3.write(rec), '\n')
@@ -311,8 +313,11 @@ function _note_warning(kind::Symbol, rec, level::Symbol=:warn)
         k = String(kind)
         c = _WARNINGS[k] = get(_WARNINGS, k, 0) + 1
         now = time()
-        d = level === :error || now - get(_WARNING_SAID, k, -Inf) >= _WARNING_EVERY[]
-        d && (_WARNING_SAID[k] = now)
+        # The quiet minute is per kind AND per thing it is about: a second node taken out, or
+        # another step failing, inside the minute is news, not a repeat.
+        about = string(k, ":", _warning_subject(rec))
+        d = level === :error || now - get(_WARNING_SAID, about, -Inf) >= _WARNING_EVERY[]
+        d && (_WARNING_SAID[about] = now)
         return c, d
     end
     due || return nothing
@@ -334,6 +339,14 @@ function _note_warning(kind::Symbol, rec, level::Symbol=:warn)
         # Nowhere to say that the echo failed; the event is in the file.
     end
     return nothing
+end
+
+# What a warning is about, where its record says: the node, the step, the option, the class.
+function _warning_subject(rec)
+    for f in (:node, :step, :option, :class)
+        haskey(rec, f) && return string(getproperty(rec, f))
+    end
+    return ""
 end
 
 # A copy of the counts, and what was added since `before`: for a round's summary.
