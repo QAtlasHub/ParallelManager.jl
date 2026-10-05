@@ -406,7 +406,10 @@ end
     _pl_custom((node, size, n, flags) -> error("no such partition")) do pool
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
-            SweepRunner._NODE_FAIL_SPAN[] = 0.0                 # five in a row, however fast
+            # The rules' time spans, in seconds for the test: five in a row over a second, and
+            # a retry two seconds after the node was taken out.
+            SweepRunner._NODE_FAIL_SPAN[] = 1.0
+            SweepRunner._NODE_RETRY_AFTER[] = 2.0
             err = try
                 run!(k -> Dict{String,Any}("x" => 1), v, ks; pool=pool)
                 nothing
@@ -414,16 +417,24 @@ end
                 e
             finally
                 SweepRunner._NODE_FAIL_SPAN[] = 60.0
+                SweepRunner._NODE_RETRY_AFTER[] = 300.0
             end
             @test err isa ErrorException
             @test occursin("worker starts failed in a row", err.msg)
             ev = _pl_events(outdir)
             failed = [e for e in ev if e.kind == "pool_spawn_failed"]
-            # Its one node is taken out after five failures in a row (#133), and a pool with
-            # no node left has given up: not ten more tries at the same node.
-            @test length(failed) == SweepRunner._NODE_MAX_FAILS
+            out = [e for e in ev if e.kind == "pool_node_out"]
+            # Its one node is taken out once its starts have failed five times over the span
+            # (#133) — not on five failures in the same second (#154) — is tried again after
+            # the pause, inside the pool's own tick, and only when that fails too has the pool
+            # given up (#171): not at once, and not ten more tries at the same node.
+            @test length(out) == 2
+            @test [e.times_out for e in out] == [1, 2]
+            @test all(e -> e.why == "a start brought no worker", out)
+            @test count(e -> e.kind == "pool_node_retry", ev) == 1
+            @test length(failed) >= SweepRunner._NODE_MAX_FAILS + 1
             @test occursin("1 of 1 node(s) taken out", err.msg)
-            @test only([e for e in ev if e.kind == "pool_node_out"]).nodes_left == 0
+            @test out[end].nodes_left == 0
             @test occursin("no such partition", failed[1].err)
             @test count(e -> e.kind == "pool_gave_up", ev) == 1
             # Nothing is left starting, and the room is all back.
@@ -902,6 +913,8 @@ end
             ks = DataVault.keys(v)
             t0 = time()
             # No worker can load this: every one of them is rejected by the dispatcher.
+            SweepRunner._NODE_FAIL_SPAN[] = 1.0
+            SweepRunner._NODE_RETRY_AFTER[] = 2.0
             err = try
                 run!(
                     k -> Dict{String,Any}("x" => 1),
@@ -913,10 +926,18 @@ end
                 nothing
             catch e
                 e
+            finally
+                SweepRunner._NODE_FAIL_SPAN[] = 60.0
+                SweepRunner._NODE_RETRY_AFTER[] = 300.0
             end
-            # Not a queue that waits for ever behind workers that are counted and unusable.
+            # Not a queue that waits for ever behind workers that are counted and unusable,
+            # and not a node that is started on again for the whole job (#171): its workers
+            # cannot be readied, so the NODE is taken out, retried once, and given up on.
             @test err isa ErrorException
-            @test occursin("worker starts failed in a row", err.msg)
+            @test occursin("1 of 1 node(s) taken out", err.msg)
+            out = [e for e in _pl_events(outdir) if e.kind == "pool_node_out"]
+            @test length(out) == 2
+            @test all(e -> e.why == "its workers cannot be readied", out)
             @test time() - t0 < 300
             ev = _pl_events(outdir)
             retired = [e for e in ev if e.kind == "pool_retire"]
@@ -1018,6 +1039,26 @@ end
             cuts = [e for e in ev if e.kind == "key_cut"]
             @test Set(e.key for e in cuts) == running
             @test all(e -> e.worker_removed == true && e.lock_released == true, cuts)
+        end
+    end
+end
+
+@testset "a start that does not come back is said as a stall, from inside the pool's tick (#171)" begin
+    gate = Ref(false)
+    hang = (node, size, n, flags) -> begin
+        timedwait(() -> gate[], 120.0; pollint=0.05)
+        return _pl_local(node, size, n, flags)
+    end
+    _pl_custom(hang; stall_after=1.0) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)[1:1]
+            t = @async run!(k -> Dict{String,Any}("x" => 1), v, ks; pool=pool)
+            stalled = () -> any(e -> e.kind == "pool_stalled", _pl_events(outdir))
+            @test timedwait(stalled, 60.0; pollint=0.2) === :ok
+            gate[] = true                                        # the start comes back
+            @test fetch(t).done == 1
+            ev = [e for e in _pl_events(outdir) if e.kind == "pool_stalled"]
+            @test ev[1].starting == 1 && ev[1].secs >= 1
         end
     end
 end

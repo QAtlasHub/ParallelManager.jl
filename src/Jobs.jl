@@ -194,6 +194,11 @@ end
 # out, or its exit code and what it wrote to stderr. The three used to be one silent `nothing`,
 # so the error was "sbatch failed" with no reason.
 const _COMMAND_FAILURE = Ref("")
+
+# Run one scheduler command through the scheduler's `run`. The reason is cleared first: with a
+# `run=` hook that is not `_run_command`, a failure used to carry the reason of whatever command
+# had failed before it.
+_run(s, cmd::Cmd) = (_COMMAND_FAILURE[]=""; s.run(cmd))
 _why_failed() = isempty(_COMMAND_FAILURE[]) ? "" : " (" * _COMMAND_FAILURE[] * ")"
 
 """
@@ -215,7 +220,7 @@ function submit(s::SlurmScheduler, spec::JobSpec)::String
     exports = join(["ALL"; ["$k=$v" for (k, v) in sort!(collect(spec.env))]], ",")
     mins = _slurm_minutes(spec.time_limit)
     cmd = `sbatch --parsable -J $(spec.name) -p $(spec.partition) -N $(spec.nodes) -t $mins --export=$exports $(spec.script) $(spec.args)`
-    out = s.run(cmd)
+    out = _run(s, cmd)
     out === nothing &&
         error("sbatch failed for job $(spec.name) on $(spec.partition)" * _why_failed())
     id = strip(first(split(strip(out), ';')))
@@ -223,11 +228,11 @@ function submit(s::SlurmScheduler, spec::JobSpec)::String
     return String(id)
 end
 
-cancel(s::SlurmScheduler, id::AbstractString) = s.run(`scancel $id`) !== nothing
+cancel(s::SlurmScheduler, id::AbstractString) = _run(s, `scancel $id`) !== nothing
 
 function job_states(s::SlurmScheduler)::Vector{JobState}
     # The name last, and split with a limit: a job name may contain the separator.
-    out = s.run(`squeue -h -u $(s.user) -o "%i|%P|%T|%D|%l|%M|%j"`)
+    out = _run(s, `squeue -h -u $(s.user) -o "%i|%P|%T|%D|%l|%M|%j"`)
     out === nothing &&
         error("squeue failed: the jobs that exist are not known" * _why_failed())
     jobs = JobState[]
@@ -283,8 +288,10 @@ const _SACCT_LIVE = (
 # not one of the known states: accounting off, the job not in it yet, the command failing.
 # (Read against stubs only: this has not been run on a cluster.)
 function job_gone(s::SlurmScheduler, id::AbstractString)
-    out = s.run(`sacct -n -X -P -j $id -o State`)
-    out === nothing && return nothing
+    out = _run(s, `sacct -n -X -P -j $id -o State`)
+    # The command failing is not "no evidence": it is said (the caller logs it), so that an
+    # accounting that is off or down is known to be why a job's end is seen late.
+    out === nothing && error("sacct failed for job $id" * _why_failed())
     lines = split(out, '\n'; keepempty=false)
     isempty(lines) && return nothing
     state = first(split(strip(first(lines))))          # "CANCELLED by 1234" -> CANCELLED
@@ -294,14 +301,14 @@ function job_gone(s::SlurmScheduler, id::AbstractString)
 end
 
 function remaining_time(s::SlurmScheduler, id::AbstractString)
-    out = s.run(`squeue -h -j $id -o %L`)
+    out = _run(s, `squeue -h -j $id -o %L`)
     (out === nothing || isempty(strip(out))) && return nothing
     # `nothing` for a time that cannot be read (`NOT_SET`, `INVALID`), as documented: not 0.
     return _slurm_time(out)
 end
 
 function shrink(s::SlurmScheduler, id::AbstractString, nodes::Integer)
-    return s.run(`scontrol update JobId=$id NumNodes=$nodes`) !== nothing
+    return _run(s, `scontrol update JobId=$id NumNodes=$nodes`) !== nothing
 end
 
 """
@@ -634,6 +641,8 @@ function with_ledger(f, l::Ledger; wait::Real=120.0)
     mkpath(dirname(l.path))
     token = string(gethostname(), ":", getpid(), ":", string(rand(UInt64); base=16))
     t0 = time()
+    watched = Ref(-1.0)                 # the lock's timestamp as last read, and since when
+    watched_since = Ref(time())
     while true
         got = try
             mkdir(lockdir)
@@ -644,15 +653,29 @@ function with_ledger(f, l::Ledger; wait::Real=120.0)
             false
         end
         if got
-            write(joinpath(lockdir, "owner"), token)
+            try
+                write(joinpath(lockdir, "owner"), token)
+            catch
+                # A lock with no owner would hold everyone off for as long as a lock may go
+                # unrefreshed: not left behind.
+                rm(lockdir; force=true, recursive=true)
+                rethrow()
+            end
             break
         end
-        # Left behind by a controller that died holding it: its holder refreshes the directory
-        # while it lives, so one this old has none. It is taken by RENAMING it — one of two
-        # waiters that both see it stale gets the rename, the other finds nothing to move, and
-        # neither removes a lock the other has just made.
-        age = time() - _lock_touched(lockdir)
-        if age > _LEDGER_LOCK_STALE[]
+        # Left behind by a controller that died holding it? Its holder refreshes the lock while
+        # it lives, so a dead one stops changing. Judged on what THIS process has watched, not
+        # on the file's timestamp against this host's clock alone: with two hosts' clocks a
+        # waiter that is ahead saw every lock as stale and took it each time. Stale is: old by
+        # the timestamp AND seen not to change for longer than its holder would leave it.
+        touched = _lock_touched(lockdir)
+        if touched != watched[]
+            watched[] = touched
+            watched_since[] = time()
+        end
+        age = time() - touched
+        unchanged = time() - watched_since[]
+        if age > _LEDGER_LOCK_STALE[] && unchanged > 1.5 * _LEDGER_LOCK_STALE[] / 10
             aside = string(lockdir, ".stale.", string(rand(UInt32); base=16))
             try
                 mv(lockdir, aside)
@@ -790,6 +813,8 @@ end
 
 # For how long a job has to have been absent, beside the number of polls, before absence is taken
 # as its end: three polls a second apart are one moment, not three.
+# On how many polls the accounting has to call a job over before that ends it.
+const _GONE_CONFIRM = 2
 const _ENDED_MIN_ABSENT = Ref(120.0)
 # The same, for answers that list no job of the ledger at all: half an hour.
 const _ENDED_MIN_ABSENT_ALONE = Ref(1800.0)
@@ -814,13 +839,16 @@ Bring the ledger up to what the scheduler says, and return what changed
 - A listed job named as one of ours (`names`) that the ledger does not have is ADOPTED, at its
   limit: a job the ledger does not know is one the budget does not see.
 - A job it does not list is ended only on evidence:
-  - `gone(id) === true` (the scheduler's accounting says so), or
-  - the answer is one that can be trusted about absence — it lists at least one job the ledger
-    knows — and the job has been absent for $(_ENDED_AFTER_MISSING) such polls and
-    `_ENDED_MIN_ABSENT` seconds, or
+  - `gone(id) === true` on two polls in a row (the scheduler's accounting says so), or
+  - it has been absent for $(_ENDED_AFTER_MISSING) polls over `_ENDED_MIN_ABSENT` seconds (two
+    minutes) from answers that list at least one other job the ledger knows, or
+  - it has been absent for $(_ENDED_AFTER_MISSING) polls over `_ENDED_MIN_ABSENT_ALONE` seconds
+    (half an hour) from answers that list NONE of the ledger's jobs — empty, another cluster, a
+    filter — or while the accounting still calls it live. This is weak evidence, marked `weak`
+    in what is returned: it is what lets the end of the last live job be seen at all, and it is
+    also what the wrong cluster gives. (Three such answers in a row, with no time required,
+    used to empty the ledger.) Or
   - the clock says it cannot be running: it was seen running and its time limit has passed.
-  An answer that lists none of the ledger's jobs (empty, another cluster, a filter) does not
-  count as an absence: three of those used to empty the ledger, and the fourth round submitted.
 - A job ended by absence is billed for what it can have run since it was last seen (up to its
   time limit). A job that reappears is live again.
 - A row still `submitting` (the controller did not learn the id) takes the id of a listed job
@@ -864,6 +892,7 @@ function observe!(
         j["ended"] === true && continue
         since = Float64(now) - Float64(get(j, "last_seen", now))
         evidence = nothing
+        weak = false
         if j["state"] == "submitting"
             # Never listed. A queued job shows within seconds, so one that has not in
             # `_SUBMIT_UNSEEN` was not taken; if it does turn up later it is adopted by name.
@@ -875,6 +904,7 @@ function observe!(
                     (;
                         id=id,
                         what=:ended,
+                        weak=false,
                         evidence="submitted $(round(Int, since)) s ago and never listed",
                         was="submitting",
                         polls_missed=j["missing"],
@@ -886,12 +916,13 @@ function observe!(
             continue
         end
         g = gone(id)
-        if g === true
-            evidence = "the scheduler's accounting says it ended"
-        elseif g === false
-            j["missing"] = 0
-            delete!(j, "absent_since")           # a later absence is measured from then
-            continue
+        # One answer of the accounting is not acted on by itself: a job id that was reused, or
+        # another cluster's accounting, is enough for one. It has to say so on two polls.
+        j["gone_seen"] = g === true ? Int(get(j, "gone_seen", 0)) + 1 : 0
+        if g === true && j["gone_seen"] >= _GONE_CONFIRM
+            evidence = "the scheduler's accounting says it ended (on $(j["gone_seen"]) polls)"
+        elseif g === true
+            continue                                 # once: asked again on the next poll
         else
             # The scheduler answered and does not list it. An answer that lists other jobs of
             # the ledger can be read for absence after a short while. One that lists NONE of
@@ -902,9 +933,18 @@ function observe!(
             j["missing"] = Int(get(j, "missing", 0)) + 1
             get!(j, "absent_since", Float64(now))
             absent = Float64(now) - Float64(j["absent_since"])
-            need = trusted ? _ENDED_MIN_ABSENT[] : _ENDED_MIN_ABSENT_ALONE[]
+            # The accounting says it is live while the queue does not list it: the queue is
+            # believed only over the long wall time, as an answer listing none of ours is. (It
+            # used to be believed never: a runaway record kept the job live for ever, every
+            # round refused.)
+            sure = trusted && g !== false
+            need = sure ? _ENDED_MIN_ABSENT[] : _ENDED_MIN_ABSENT_ALONE[]
             if j["missing"] >= _ENDED_AFTER_MISSING && absent >= need
-                evidence = if trusted
+                weak = !sure
+                evidence = if g === false
+                    "absent from the queue on $(j["missing"]) answers over " *
+                    "$(round(Int, absent)) s, although the accounting still lists it as live"
+                elseif trusted
                     "absent from $(j["missing"]) answers that listed other jobs of the " *
                     "ledger, over $(round(Int, absent)) s"
                 else
@@ -934,6 +974,8 @@ function observe!(
                 id=id,
                 what=:ended,
                 evidence=evidence,
+                # Ended on what the wrong cluster or a filter would also give: to be looked at.
+                weak=weak,
                 was=String(j["state"]),
                 polls_missed=Int(get(j, "missing", 0)),
                 seconds_billed=billed,
@@ -962,6 +1004,7 @@ function observe!(
             (;
                 id=u.id,
                 what=:adopted,
+                weak=false,
                 evidence="listed under the policy's name and in no ledger row",
                 was=String(u.state),
                 polls_missed=0,
@@ -1087,7 +1130,12 @@ function decide(
         key_time = something(p.key_time, policy.default_key_time)
         cost = isnan(w.cost) ? w.units * key_time : w.cost
         have = sum(
-            j -> j.nodes * p.slots_per_node * max(j.time_limit - j.elapsed, 0.0),
+            # (no nodes: nothing, not `0 * Inf`)
+            j -> if j.nodes == 0
+                0.0
+            else
+                j.nodes * p.slots_per_node * max(j.time_limit - j.elapsed, 0.0)
+            end,
             live;
             init=0.0,
         )
@@ -1309,6 +1357,7 @@ end
 
 # Bring `l` up to the scheduler's answer and log what that changed.
 function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
+    said_gone = Ref(false)
     changes = observe!(
         l,
         states;
@@ -1317,15 +1366,19 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
             job_gone(ctl.scheduler, id)
         catch e
             e isa InterruptException && rethrow()
-            # The accounting could not be asked: no evidence either way, and said.
-            log_event(
-                ctl.log,
-                :job_gone_failed;
-                level=:warn,
-                id=id,
-                err=_short_err(e),
-                dry_run=dry,
-            )
+            # The accounting could not be asked: no evidence either way, and said — once a
+            # round, not once per absent job.
+            if !said_gone[]
+                said_gone[] = true
+                log_event(
+                    ctl.log,
+                    :job_gone_failed;
+                    level=:warn,
+                    id=id,
+                    err=_short_err(e),
+                    dry_run=dry,
+                )
+            end
             nothing
         end,
     )
@@ -1333,9 +1386,12 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
         log_event(
             ctl.log,
             c.what === :ended ? :job_ended : :job_adopted;
-            level=c.what === :adopted ? :warn : :info,
+            # Ended on weak evidence is a warning: the controller is about to submit on top of
+            # a job that may still be there.
+            level=(c.what === :adopted || c.weak) ? :warn : :info,
             id=c.id,
             evidence=c.evidence,
+            weak=c.weak,
             was=c.was,
             polls_missed=c.polls_missed,
             seconds_billed=c.seconds_billed,
