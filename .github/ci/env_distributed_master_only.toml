@@ -1,4 +1,4 @@
-# Env 6: ISSP Slurm-like — workers are added via addprocs, but the user package
+# Env 6: master-only load, as on some Slurm setups — workers are added via addprocs, but the user package
 # is loaded ONLY on the master. This mirrors the real production setup where
 # `init_workers!(mode=:slurm)` spawns worker Julia processes without first
 # doing `@everywhere using SweepRunner`. Exercises the verify_workers!

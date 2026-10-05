@@ -736,7 +736,7 @@ const _CUT_RETRY = Ref(5.0)
 const _KILL_WORKER = Ref{Any}(nothing)
 # What says which process launched a worker. A `Ref` so a test can stand in a cluster manager
 # that gives no handle.
-const _LAUNCHER_OF = Ref{Any}(nothing)
+const _LAUNCHER_OF = Ref{Union{Nothing,Function}}(nothing)
 
 function _cut_release!(m::Master, row::TaskRow, o::StopOrder, tok, pid::Int, log::EventLog)
     v = m.vault

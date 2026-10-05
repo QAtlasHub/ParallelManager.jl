@@ -1191,7 +1191,7 @@ end
     end
 end
 
-# ── found on a cluster (0.6.9, issp-ohtaka, job 3094774) ─────────────────────────────────────────
+# ── found on the first runs on a cluster ─────────────────────────────────────────────────────────
 
 @testset "a need is covered by the smallest worker that fits it, not the first" begin
     nodes = [PoolNode("n1", 64, 128.0)]
@@ -1227,20 +1227,37 @@ end
     _pl_pool(; key_req=k -> KeyReq(1, 1.0)) do pool
         _pl_vault() do v, outdir
             ks = DataVault.keys(v)
-            # Observing takes two seconds on every worker, as it takes six on a cluster. (The
-            # pool's workers inherit the environment they were started in.)
-            r = withenv("SWEEPRUNNER_TEST_OBSERVE_DELAY" => "2") do
+            # Observing takes three seconds on every worker, as it takes six on a cluster.
+            # (The pool's workers inherit the environment they were started in.)
+            r = withenv("SWEEPRUNNER_TEST_OBSERVE_DELAY" => "3") do
                 run!(k -> (sleep(1); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
             end
             @test r.done == length(ks)
             pids = sort(collect(keys(pool.workers)))
             @test length(pids) >= 3
-            # Asked one after the other this takes two seconds per worker; together, about two.
+            # Asked one after the other this takes three seconds per worker; together, about
+            # three — and three seconds short of the bound with three workers.
             log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
             t = @elapsed SweepRunner._observe_late!(v, pids, true, log, :pl)
-            @test 2.0 <= t < 2.0 * (length(pids) - 1)
+            @test 3.0 <= t < 3.0 * (length(pids) - 1)
             said = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid in pids]
             @test length(said) >= 2length(pids)                  # in the run, and just now
+            # One worker that cannot be asked is its own failure: the others' observations
+            # are made and logged, not dropped with it.
+            before = length(said)
+            SweepRunner._observe_late!(v, vcat(pids, 99_999), true, log, :pl)
+            ev = _pl_events(outdir)
+            @test count(e -> e.kind == "observed" && e.pid in pids, ev) ==
+                before + length(pids)
+            @test only([e.pid for e in ev if e.kind == "observe_failed"]) == 99_999
+            # Without observation the others are still told to forget before the failure is
+            # the caller's.
+            token = p -> remotecall_fetch(SweepRunner._observation_token, p, v)
+            @test all(p -> token(p) !== nothing, pids)
+            @test_throws Exception SweepRunner._observe_late!(
+                v, vcat(pids, 99_999), false, log, :pl
+            )
+            @test all(p -> token(p) === nothing, pids)           # every one of them forgot
             # The master is observed once, as the master: with no workers yet `workers()` is
             # `[1]`, and it used to be observed a second time as a worker of itself.
             own = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid == 1]
@@ -1276,26 +1293,9 @@ end
             # What the dispatch task draws: the big key for the big worker although the small
             # one is ahead of it, and a small one once no big key is left.
             draw =
-                pid -> begin
-                    j = SweepRunner.next_task!(
-                        table,
-                        pid;
-                        accept=r -> SweepRunner._pool_accepts(
-                            pool, pid, r, nothing, nothing; tight=true
-                        ),
-                    )
-                    if j === nothing
-                        SweepRunner.next_task!(
-                            table,
-                            pid;
-                            accept=r -> SweepRunner._pool_accepts(
-                                pool, pid, r, nothing, nothing
-                            ),
-                        )
-                    else
-                        j
-                    end
-                end
+                pid -> SweepRunner._next_for_pool!(
+                    table, pid, Returns(true), pool, nothing, nothing
+                )
             nbig = count(r -> r.key.params["N"] == 8, table.rows)
             drawn = [draw(4301) for _ in 1:(nbig + 1)]
             @test all(i -> table.rows[i].key.params["N"] == 8, drawn[1:nbig])
@@ -1307,9 +1307,8 @@ end
 end
 
 @testset "a pool's workers are removed together when it is shut down" begin
-    # Found with 511 workers on a cluster: removed one after the other, `run!` returned 200 s
-    # after its last key. Here six launchers that ignore SIGTERM, as an `srun` that is waiting
-    # for its step does: one after the other that is five seconds each before the SIGKILL.
+    # Six launchers that ignore SIGTERM, as an `srun` that is waiting for its step does: one
+    # after the other that is five seconds each before the SIGKILL.
     _pl_custom((node, size, n, flags) -> Int[]) do pool
         procs_of = Dict{Int,Base.Process}()
         for id in 9001:9006
@@ -1328,6 +1327,51 @@ end
         finally
             SweepRunner._LAUNCHER_OF[] = nothing
             foreach(p -> process_running(p) && kill(p, Base.SIGKILL), values(procs_of))
+        end
+    end
+end
+
+@testset "a worker that cannot be removed at shutdown keeps its room, and is said" begin
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        _pl_vault() do v, outdir
+            log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+            id = only(addprocs(1; exeflags="--project=$(dirname(Base.active_project()))"))
+            launcher = SweepRunner._launcher(id)
+            @test launcher isa Base.Process
+            pool.workers[id] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+            # The worker is inside something that does not yield: it cannot answer. It says
+            # when it is about to go in, so the test does not ask it to leave before that.
+            entered = joinpath(outdir, "entered")
+            remote_do((f -> (touch(f); Libc.systemsleep(60))), id, entered)
+            @test timedwait(() -> isfile(entered), 30.0) === :ok
+            sleep(0.3)
+            try
+                # With no handle on what launched it, it can only be asked — and it stays.
+                SweepRunner._LAUNCHER_OF[] = i -> nothing
+                # ...within the one deadline: `waitfor` covers the asking and the last look
+                # together, not each.
+                t = @elapsed left = shutdown!(pool; wait=0, waitfor=4, log=log, stage=:pl)
+                @test left == [id]
+                @test t < 7
+                @test haskey(pool.workers, id)                   # its room is not given back
+                said = only([e for e in _pl_events(outdir) if e.kind == "pool_kill_failed"])
+                @test said.worker == id
+                @test process_running(launcher)
+                # With the handle, one worker that does not answer does not hold the others up
+                # for the whole wait: it is killed after the short grace.
+                SweepRunner._LAUNCHER_OF[] = nothing
+                t = @elapsed left = shutdown!(pool; wait=1, waitfor=60, log=log, stage=:pl)
+                @test isempty(left) && isempty(pool.workers)
+                @test t < 30
+                @test process_exited(launcher)
+            finally
+                SweepRunner._LAUNCHER_OF[] = nothing
+                process_running(launcher) && kill(launcher, Base.SIGKILL)
+                delete!(pool.workers, id)
+                timedwait(() -> nprocs() == 1, 30.0)
+            end
         end
     end
 end

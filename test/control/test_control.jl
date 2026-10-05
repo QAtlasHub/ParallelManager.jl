@@ -1483,3 +1483,199 @@ end
         end
     end
 end
+
+# ── late workers: readied beside the ticker ──────────────────────────────────────────────────────
+
+# A round over the two workers that are there, with nothing queued, readying with `prepare`.
+function _ct_round(
+    v,
+    outdir,
+    prepare;
+    pool=nothing,
+    log=SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl")),
+)
+    table = TaskTable(DataVault.keys(v))
+    SweepRunner.settle_queued!(table, :stop_flag)
+    m = SweepRunner.Master()
+    m.vault = v
+    return SweepRunner.Round(
+        _ct_ok,
+        v,
+        table,
+        :ct,
+        log,
+        _ct_opts(),
+        m;
+        affinity=nothing,
+        prepare=prepare,
+        key_class=nothing,
+        fits=Returns(true),
+        tick=Returns(nothing),
+        pool=pool,
+        min_time=nothing,
+    )
+end
+
+@testset "a round starts with nothing in its sets but the workers a pool found" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            r = _ct_round(v, outdir, nothing)
+            @test all(isempty, (r.started, r.preparing, r.rejected, r.unidentified))
+            @test isempty(r.first_foreign) && isempty(r.tasks) && isempty(r.task_of)
+            @test (r.out, r.stopped, r.graced, r.queued_now, r.done) ==
+                (0, false, false, false, false)
+            # With a pool the workers already there are the "foreign" ones — and only that set
+            # has them: the four `Set{Int}` fields are next to one another in the constructor.
+            pool = SizedPool(
+                LocalSpawner(; cores=1, mem_gb=1.0); key_req=k -> KeyReq(1, 1.0)
+            )
+            r = _ct_round(v, outdir, nothing; pool=pool)
+            @test r.first_foreign == Set(workers())
+            @test all(isempty, (r.started, r.preparing, r.rejected, r.unidentified))
+            @test r.queued_now == true
+        end
+    end
+end
+
+@testset "late workers are readied beside the ticker; a round that has ended does not adopt them" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            # Readying that takes as long as the test lets it.
+            gate = Channel{Nothing}(2)
+            calls = Ref(0)
+            slow = (pids; quiet=Returns(false)) -> (calls[] += 1; take!(gate); pids)
+            r = _ct_round(v, outdir, slow)
+            push!(r.started, -1)                    # a round under way: these two are late
+            t = @async SweepRunner._round_adopt!(r)
+            # The step returns while the readying goes on: the ticker is not held.
+            @test timedwait(() -> istaskdone(t), 5.0) === :ok
+            @test r.preparing == Set(workers())
+            @test isempty(r.tasks)
+            # The next tick does not ready them a second time.
+            SweepRunner._round_adopt!(r)
+            @test calls[] == 1
+            # The round ends while they are being readied: they get no dispatch task.
+            r.done = true
+            put!(gate, nothing)
+            @test timedwait(() -> isempty(r.preparing), 10.0) === :ok
+            @test isempty(r.tasks) && r.started == Set([-1])
+
+            # A round that has ended starts none, also when the end comes after the readying.
+            r = _ct_round(v, outdir, nothing)
+            r.done = true
+            SweepRunner._round_start!(r, workers(), true)
+            @test isempty(r.tasks) && isempty(r.started)
+
+            # A round that goes on: each gets its task, once, and it is said.
+            r = _ct_round(v, outdir, (pids; quiet=Returns(false)) -> pids)
+            push!(r.started, -1)
+            SweepRunner._round_adopt!(r)
+            @test timedwait(
+                () -> length(r.tasks) == 2 && all(istaskdone, r.tasks), 60.0
+            ) === :ok
+            @test issubset(workers(), r.started) && isempty(r.preparing)
+            SweepRunner._round_adopt!(r)
+            @test length(r.tasks) == 2
+            joined = [e for e in _ct_events(outdir) if e.kind == "workers_joined"]
+            @test [e.n for e in joined] == [2]
+        end
+    end
+end
+
+@testset "a readying that throws counts against its workers, and stops being tried" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            calls = Ref(0)
+            broken = (pids; quiet=Returns(false)) -> (calls[] += 1; error("cannot ready"))
+            r = _ct_round(v, outdir, broken)
+            push!(r.started, -1)
+            for _ in 1:(SweepRunner._PREPARE_TRIES + 2)
+                SweepRunner._round_adopt!(r)
+                @test timedwait(() -> isempty(r.preparing), 10.0) === :ok
+            end
+            # Tried as often as a worker is tried, then left out: not once per tick for ever.
+            @test calls[] == SweepRunner._PREPARE_TRIES
+            @test r.rejected == Set(workers())
+            @test isempty(r.tasks)
+            said = [e for e in _ct_events(outdir) if e.kind == "tick_failed"]
+            @test [e.count for e in said] == collect(1:SweepRunner._PREPARE_TRIES)
+            @test all(e -> e.step == "prepare" && occursin("cannot ready", e.err), said)
+        end
+    end
+end
+
+@testset "a throw after some workers were started does not count against those" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            box = Ref{Any}(nothing)
+            # The readying gets one worker as far as a dispatch task and then throws.
+            late = (pids; quiet=Returns(false)) -> begin
+                push!(box[].started, first(pids))
+                error("thrown after a start")
+            end
+            r = box[] = _ct_round(v, outdir, late)
+            push!(r.started, -1)
+            a, b = sort(workers())
+            SweepRunner._round_adopt!(r)
+            @test timedwait(() -> isempty(r.preparing), 10.0) === :ok
+            # The one that was started is not a worker that could not be readied.
+            @test !haskey(r.prep_tries, a)
+            @test r.prep_tries[b] == 1
+            @test isempty(r.rejected)
+        end
+    end
+end
+
+@testset "a worker the pool no longer has gets no dispatch task" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            pool = SizedPool(
+                LocalSpawner(; cores=1, mem_gb=1.0); key_req=k -> KeyReq(1, 1.0)
+            )
+            r = _ct_round(v, outdir, nothing; pool=pool)
+            r.queued_now = false                    # nothing queued: a task leaves at once
+            empty!(pool.foreign)
+            # Readied, and meanwhile neither the pool's nor a caller's: no task.
+            SweepRunner._round_start!(r, workers(), true)
+            @test isempty(r.tasks) && isempty(r.started)
+            # Known to the pool: each gets one.
+            union!(pool.foreign, workers())
+            SweepRunner._round_start!(r, workers(), true)
+            @test timedwait(
+                () -> length(r.tasks) == 2 && all(istaskdone, r.tasks), 60.0
+            ) === :ok
+            @test r.started == Set(workers())
+        end
+    end
+end
+
+@testset "a worker that cannot be given up on cleanly is still left out, and retired in the pool" begin
+    _ct_workers(1) do
+        _ct_vault() do v, outdir
+            # An event log that cannot be written: telling the pool about the worker throws.
+            blocker = joinpath(outdir, "not-a-dir")
+            write(blocker, "x")
+            broken_log = SweepRunner.EventLog(joinpath(blocker, "events_x.jsonl"))
+            pid = only(workers())
+            pool = SizedPool(
+                LocalSpawner(; cores=1, mem_gb=1.0); key_req=k -> KeyReq(1, 1.0)
+            )
+            empty!(pool.foreign)
+            pool.workers[pid] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+            failing = (pids; quiet=Returns(false)) -> error("cannot ready")
+            r = _ct_round(v, outdir, failing; pool=pool, log=broken_log)
+            push!(r.started, -1)
+            empty!(r.first_foreign)                 # the pool's own worker, to be readied
+            r.prep_tries[pid] = SweepRunner._PREPARE_TRIES - 1     # this is its last try
+            SweepRunner._round_adopt!(r)
+            @test timedwait(() -> isempty(r.preparing), 10.0) === :ok
+            @test pid in r.rejected
+            # Not left as a worker the pool counts and nobody uses.
+            @test timedwait(
+                () -> !haskey(pool.workers, pid) || pool.workers[pid].retiring, 10.0
+            ) === :ok
+        end
+    end
+end

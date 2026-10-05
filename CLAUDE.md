@@ -46,7 +46,10 @@ for how the three layers fit together.
 - Jobs: `Scheduler` (`SlurmScheduler`, `MockScheduler`) · `load_job_policy(meta.toml)` (the
   `[jobs]` table) · `SweepRunner.decide` (pure) · `SweepRunner.manage!(JobController(…), campaign_work(…))` ·
   `bin/sweeprunner jobs <meta.toml> [--submit]`. Submissions are sized to `remaining_work`, held
-  when nothing is runnable, refused past `budget_node_hours`. **`dry_run` is the default; a
+  when nothing is runnable, refused past `budget_node_hours`. **That budget is the package's
+  own count (nodes × hours), not a centre's bill: what an ended job counts for is
+  `JobPolicy(bill = :estimate | :elapsed | :limit)`, and no centre's rules are assumed — do
+  not write one cluster's accounting, partitions or limits into the code or its defaults.** **`dry_run` is the default; a
   change here must not make a path that submits without `dry_run = false` AND an explicit ask.**
   `RunOpts(min_busy_fraction, idle_grace)` lets a master leave an under-used allocation.
 - `control!(vault | outdir, op; …)` / `bin/sweeprunner <op> <outdir>` — requests to a RUNNING

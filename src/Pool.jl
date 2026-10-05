@@ -105,8 +105,10 @@ job step sees the STEP's `--mem` in `SLURM_MEM_PER_NODE`, not the node's: pass
 `mem_per_node_mb`, or set `SWEEPRUNNER_MEM_PER_NODE_MB`, to the allocation's figure.
 
 The defaults (4 GB of headroom, the `srun` reservation, 3 GB for the master) are the values the
-downstream pool this was moved from uses; nothing in this repository measures them, and the
-spawner has not been run on a cluster from here.
+downstream pool this was moved from uses on one cluster; they are not derived from anything
+general. On the one cluster this spawner has been run on, a master of 511 workers peaked at
+5 GB — above the default 3: set `master_gb` (and the others) for the nodes and the pool size at
+hand.
 """
 struct SlurmStepSpawner <: Spawner
     nodes::Vector{PoolNode}
@@ -375,39 +377,76 @@ function _worker_gone(id::Integer, live)::Bool
     return _worker_dead(id, something(_LAUNCHER_OF[], _launcher)(id))
 end
 
-# Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
-# cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
-# a job step dies with its srun client.
-# Remove many workers at the end of a run: all asked at once, then what launched each one
-# killed, together. One after the other — ask, wait, kill, wait — it was 0.4 s a worker on the
-# first run with 511 of them: `run!` returned 200 s after its last key was done.
-function _kill_workers!(ids::AbstractVector{<:Integer}; waitfor::Real=30)
-    isempty(ids) && return nothing
-    launchers = [something(_LAUNCHER_OF[], _launcher)(id) for id in ids]
+# Kill what launched a worker: SIGTERM, and SIGKILL if it is still there five seconds later (an
+# `srun` client waits for its step). With `settle`, a killed launcher is waited for until it is
+# seen gone. Never throws.
+function _terminate!(p; settle::Bool=false)
     try
-        live = intersect(ids, procs())
+        (p isa Base.Process && process_running(p)) || return nothing
+        kill(p)
+        if timedwait(() -> !process_running(p), 5.0; pollint=0.05) !== :ok
+            kill(p, Base.SIGKILL)
+            settle && timedwait(() -> process_exited(p), 5.0; pollint=0.05)
+        end
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return nothing
+end
+
+# How long no worker may have left, after all were asked to, before what launched the rest is
+# killed.
+const _LEAVE_GRACE = 5.0
+
+# Remove many workers at the end of a run, together: all are asked to leave in one call, and
+# what launched those that have not left is killed, all at once. (One after the other — ask,
+# wait, kill, wait — a few hundred workers take minutes.)
+#
+# They are given as long as they keep leaving: several hundred take a while to exit, and a
+# fixed few seconds had a third of them killed that were on their way out. Once none has left
+# for `_LEAVE_GRACE` seconds the rest are not going to — one that does not answer must not hold
+# the others' launchers for the whole of `waitfor`, which is how long `rmprocs` waits for all
+# of them, holding Distributed's worker lock.
+#
+# One deadline, `waitfor` from the start, covers the asking, the kills and the last look: with
+# a worker that neither leaves nor has a launcher to kill it returns then, not twice as late.
+#
+# Returns the ids that are still there: a launcher still running, or — with no handle on what
+# launched it — a worker Distributed does not have as terminated. The caller must not count
+# those as gone.
+function _kill_workers!(ids::AbstractVector{<:Integer}; waitfor::Real=30)
+    isempty(ids) && return Int[]
+    launchers = [something(_LAUNCHER_OF[], _launcher)(id) for id in ids]
+    live = intersect(ids, procs())
+    asking = @async try
         isempty(live) || rmprocs(live; waitfor=waitfor)
     catch e
         e isa InterruptException && rethrow()
         # Some did not leave when asked: what launched them is killed below.
     end
-    asyncmap(launchers; ntasks=256) do p
-        try
-            if p isa Base.Process && process_running(p)
-                kill(p)
-                if timedwait(() -> !process_running(p), 5.0; pollint=0.05) !== :ok
-                    kill(p, Base.SIGKILL)
-                    # ...and seen gone: when this returns, what the pool started is not there.
-                    timedwait(() -> process_exited(p), 5.0; pollint=0.05)
-                end
-            end
-        catch e
-            e isa InterruptException && rethrow()
-        end
+    running() = count(p -> p isa Base.Process && process_running(p), launchers)
+    deadline = time() + waitfor
+    left_at, n = time(), running()
+    while !istaskdone(asking) && time() < deadline
+        sleep(0.05)
+        m = running()
+        m < n && ((n, left_at) = (m, time()))
+        time() - left_at >= _LEAVE_GRACE && break
     end
-    return nothing
+    asyncmap(p -> _terminate!(p; settle=true), launchers; ntasks=256)
+    timedwait(() -> istaskdone(asking), max(deadline - time(), 0.0); pollint=0.05)
+    left = Int[]
+    for (id, p) in zip(ids, launchers)
+        # (Not `id in procs()`: a worker asked to leave is out of that list at once.)
+        there = p isa Base.Process ? process_running(p) : !_worker_dead(id, p)
+        there && push!(left, Int(id))
+    end
+    return left
 end
 
+# Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
+# cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
+# a job step dies with its srun client.
 function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
     p = something(_LAUNCHER_OF[], _launcher)(id)
     if hard
@@ -445,15 +484,7 @@ function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
     catch e
         e isa InterruptException && rethrow()
     end
-    try
-        if p isa Base.Process && process_running(p)
-            kill(p)
-            timedwait(() -> !process_running(p), 5.0) === :ok || kill(p, Base.SIGKILL)
-        end
-    catch e
-        e isa InterruptException && rethrow()
-    end
-    return nothing
+    return _terminate!(p)
 end
 
 """
@@ -535,8 +566,8 @@ how long each has found no room; `covering` are the sizes of the workers that ar
 starting, each of which will take one key it fits. `nodes` are the nodes that may be used: leave
 a drained node out.
 
-In order: a need that a covering worker fits takes it; otherwise the worker is started on the
-node that keeps the most memory free after it; a need that fits nowhere is `blocked`. Smaller
+In order: a need that a covering worker fits takes the smallest such worker; otherwise the
+worker is started on the node that keeps the most memory free after it; a need that fits nowhere is `blocked`. Smaller
 needs behind a blocked one still start (backfill) until it has waited `starve_after` seconds:
 from then on nothing is started ahead of it, so the room it needs is freed by keys finishing.
 At most `room` workers are planned; `capped` says a start was wanted past that.
@@ -564,8 +595,7 @@ function plan_spawns(
     for (i, need) in enumerate(needs)
         # The SMALLEST covering worker that fits, not the first: a two-core need that took
         # an eight-core worker's place left the eight-core need behind it uncovered, and one
-        # more eight-core worker was started for it — a third more workers than keys on the
-        # first job this ran in.
+        # more eight-core worker was started for it.
         j = _best_cover(cover, need)
         if j !== nothing
             deleteat!(cover, j)
@@ -612,8 +642,10 @@ end
 const _POOL_MAX_FAILS = 10
 
 # The most workers one master holds under Slurm when the cluster's limit cannot be read: each
-# worker is an srun client on the master's node. Downstream ran at 1500 after a master that
-# planned 3735 stalled, without a message, at 1782.
+# worker is an srun client on the master's node. The number is one observation on one cluster
+# (a master that planned 3735 stalled, without a message, at 1782, and ran at 1500), kept as a
+# cap because an unknown limit must not be no limit — it is not a property of Slurm. Where the
+# limit can be read it is used instead, and `max_workers` / `SWEEPRUNNER_MAX_WORKERS` override.
 const _POOL_SLURM_CAP = 1500
 
 """
@@ -643,8 +675,9 @@ when the `run!` / `run_loop!` it was given to returns, unless `keep=true` (then 
 - `mem_growth` — a key whose worker died is retried with this much more memory (up to what a
   node has), at most the dispatcher's death bound times. Must be > 1.
 - `max_workers` — the most workers this pool holds at once. Under Slurm it defaults to the
-  per-master limit ([`srun_worker_limit`](@ref), else 1500): past it workers neither join nor
-  fail. Reaching it is logged once (`pool_at_limit`).
+  per-master limit ([`srun_worker_limit`](@ref), else 1500 — one cluster's observation, kept
+  as a cap for when the limit cannot be read): past it workers neither join nor fail. Reaching
+  it is logged once (`pool_at_limit`).
 
 A node whose starts bring no worker, or whose workers cannot be readied, five times in a row
 over at least a minute is taken out (`pool_node_out`) and tried once more five minutes later
@@ -863,10 +896,10 @@ end
 # there before the pool takes anything, as it did without one.
 #
 # `tight`: only a key that uses more than half of the worker (cores or memory). A dispatch task
-# asks for one of those first. Taking the first key that fits, an eight-core worker that came up
-# before the two-core ones took the two-core keys at the head of the queue; the eight-core keys
-# behind them then had no idle worker to cover them and the pool started another for each — a
-# third more workers than keys on the first job this ran in.
+# asks for one of those first (`_next_for_pool!`). Taking the first key that fits, an
+# eight-core worker that came up before the two-core ones took the two-core keys at the head of
+# the queue; the eight-core keys behind them then had no idle worker to cover them and the pool
+# started another worker for each.
 function _pool_accepts(
     pool::SizedPool, pid::Int, row::TaskRow, deadline, min_time; tight::Bool=false
 )::Bool
@@ -1536,23 +1569,54 @@ function pool_summary(pool::SizedPool)
 end
 
 """
-    shutdown!(pool; wait=60.0)
+    shutdown!(pool; wait=60.0, waitfor=30.0, log=nothing, stage=:pool) -> Vector{Int}
 
 Remove every worker the pool started and give their room back. Starts still in flight are waited
 for, up to `wait` seconds, and remove their own workers when they land. `run!` / `run_loop!` call
 it when they return, unless the pool was made with `keep=true`.
+
+The workers are removed together: all are asked to leave, and what launched those that have
+not left is killed once none has left for five seconds. That takes at most `waitfor` seconds
+plus the kills themselves (up to ten more), however many workers there are, after the `wait`
+for starts in flight.
+Returns the workers that are still there after that (none, normally). Those keep their room in
+the pool and are said — a `pool_kill_failed` event when a `log` is given, a warning otherwise:
+a worker that could not be removed is on its cores until the job ends.
 """
-function shutdown!(pool::SizedPool; wait::Real=60.0)
+function shutdown!(
+    pool::SizedPool; wait::Real=60.0, waitfor::Real=30.0, log=nothing, stage::Symbol=:pool
+)
     # Starts still in flight land in a pool nobody ticks any more: each removes its own workers
     # when it sees `closing`. They are waited for, within a bound, so that when this returns
     # what the pool started is gone.
     pool.closing = !isempty(pool.starting)
     timedwait(() -> isempty(pool.starting), Float64(wait); pollint=0.05)
     ids = collect(keys(pool.workers))
-    _kill_workers!(ids)
-    foreach(pid -> _pool_free!(pool, pid), ids)
-    note_workers!(; planned=0, launched=0)
-    return nothing
+    left = _kill_workers!(ids; waitfor=waitfor)
+    for pid in ids
+        pid in left || _pool_free!(pool, pid)
+    end
+    for pid in left
+        w = pool.workers[pid]
+        if log !== nothing
+            log_event(
+                log,
+                :pool_kill_failed;
+                level=:warn,
+                stage=stage,
+                worker=pid,
+                node=w.node,
+                cores=w.size.cores,
+                mem_gb=round(w.size.mem_gb; digits=2),
+            )
+        end
+    end
+    # Without a log: one line for all of them, not one each.
+    (log === nothing && !isempty(left)) &&
+        @warn "SweepRunner: $(length(left)) pool worker(s) could not be removed; they keep their cores until the job ends" workers =
+            left
+    note_workers!(; planned=length(left), launched=length(left))
+    return left
 end
 
 export KeyReq, PoolNode, Spawner, LocalSpawner, SlurmStepSpawner, SizedPool

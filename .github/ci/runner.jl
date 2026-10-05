@@ -27,7 +27,7 @@ ENV["PM_TEST_N_MASTERS"] = string(n_masters)
 using Distributed  # always load; needed for nprocs() etc. in tests
 
 # `preload_workers` controls whether we do `@everywhere using SweepRunner`.
-# Production Slurm setups on ISSP load the package only on the master, which
+# Some production Slurm setups load the package only on the master, which
 # previously masked a bug in verify_workers! (PkgId not found on workers).
 # Keep at least one env that tests the master-only scenario.
 preload_workers = get(env, "preload_workers", true)
