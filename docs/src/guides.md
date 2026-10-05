@@ -648,8 +648,13 @@ What keeps that check from passing on an under-count:
 - The ledger is read again, under a lock, before every decision, and the
   scheduler is asked inside that lock: a job's last act and a login-node loop
   are two controllers on one file. The lock has an owner: it is refreshed while
-  held, taken from a holder that died by one waiter only, released only by its
-  owner, and a controller that lost it does not write. A **dry run writes no
+  held (every minute), taken from a holder that died by one waiter only,
+  released only by its owner, and a controller that lost it does not write. A
+  holder counts as dead when a waiter has watched its lock unchanged for ten
+  minutes — across its rounds, on its own clock — or at once when it was a
+  process on the same host that is no longer there. A single `jobs` call
+  cannot take a lock left by a controller on another host: its error names
+  the holder and the directory to remove. A **dry run writes no
   ledger** (it does log its decisions, marked `dry_run`), and refuses where a
   real round would.
 - A submission that failed is reported as refused, not as made.

@@ -625,9 +625,43 @@ function reload_ledger!(l::Ledger)
 end
 
 # How long a ledger lock may go unrefreshed before it is taken as left behind by a controller
-# that died. Ten minutes: its holder refreshes it every minute, and a round's slowest calls
-# (`squeue`, `sacct`, `sbatch`) are each bounded at one.
+# that died. Ten minutes: its holder refreshes it every minute from a task beside the round, so
+# a round whose own task does not yield for a while (synchronous file-system calls in a campaign
+# scan, a first call that compiles) misses refreshes without being dead — ten of them are
+# allowed. (For a while the threshold was one and a half refresh periods, 90 s, and such a
+# round had its lock taken: its save was refused and the round lost.)
 const _LEDGER_LOCK_STALE = Ref(600.0)
+
+# What this process has seen of the locks it waited for: lock directory => (timestamp, owner,
+# `time_ns()` when that pair was first seen). Kept between calls, so that a controller whose
+# rounds each wait less than the stale time still gets to "unchanged for ten minutes" — and on
+# the monotonic clock: a step of the wall clock (NTP, a resumed VM) is not ten minutes of
+# watching.
+const _LEDGER_WATCH = Dict{String,Tuple{Float64,Any,UInt64}}()
+
+# Seconds this process has seen the lock at `lockdir` unchanged, as of now.
+function _lock_watched_for(lockdir::AbstractString)
+    seen = (_lock_touched(lockdir), _lock_token(lockdir))
+    w = get(_LEDGER_WATCH, lockdir, nothing)
+    if w === nothing || (w[1], w[2]) != seen
+        _LEDGER_WATCH[lockdir] = (seen[1], seen[2], time_ns())
+        return (; secs=0.0, token=seen[2])
+    end
+    return (; secs=(time_ns() - w[3]) / 1e9, token=seen[2])
+end
+
+# Is the holder named by `token` (`host:pid:…`) known to be gone? Only for a holder on THIS
+# host, whose process can be asked for: then there is nothing to watch for.
+function _lock_holder_gone(token)::Bool
+    token isa AbstractString || return false
+    parts = split(token, ':')
+    length(parts) >= 3 || return false
+    parts[1] == gethostname() || return false
+    pid = tryparse(Int, parts[2])
+    pid === nothing && return false
+    pid == getpid() && return false                # another controller in this process
+    return _pid_liveness(pid) === :dead
+end
 
 """
     with_ledger(f, ledger; wait=300.0)
@@ -637,18 +671,18 @@ the ledger re-read from disk first. Two controllers on one ledger then decide on
 other, each on what the other wrote, instead of overwriting each other's rows. Throws if the lock
 cannot be had within `wait` seconds.
 
-A lock whose holder died is taken once this process has WATCHED it unchanged for longer than a
-holder leaves it (a holder refreshes every minute; 90 s). The file's timestamp is not compared
-with this host's clock. A `wait` shorter than that can therefore never take a dead lock.
+A lock whose holder died is taken once this process has WATCHED it unchanged for ten minutes (a
+holder refreshes every minute), on its monotonic clock; the file's timestamp is not compared
+with this host's clock. What was watched is kept between calls, so a controller loop whose
+rounds each wait five minutes takes a dead lock on its second or third round. A holder on this
+host whose process is gone is not waited for at all. A single call from a new process, for a
+holder on another host, cannot take a dead lock: the error says who holds it and where it is.
 """
 function with_ledger(f, l::Ledger; wait::Real=300.0)
     lockdir = l.path * ".lock"
     mkpath(dirname(l.path))
     token = string(gethostname(), ":", getpid(), ":", string(rand(UInt64); base=16))
     t0 = time()
-    watched = Ref(-1.0)                 # the lock's timestamp as last read, and since when
-    watched_since = Ref(time())
-    watched_token = Ref{Any}(nothing)   # ...and whose it was then
     while true
         got = try
             mkdir(lockdir)
@@ -671,26 +705,20 @@ function with_ledger(f, l::Ledger; wait::Real=300.0)
         end
         # Left behind by a controller that died holding it? Its holder refreshes the lock while
         # it lives, so a dead one stops changing. Judged ONLY on what this process has watched
-        # with its own clock: the lock has not changed for longer than its holder would leave
+        # with its own clock: the lock has not changed for as long as no live holder leaves
         # it. The file's timestamp against this host's clock says nothing — a waiter whose
         # clock is ahead saw every lock as old, and one whose clock is behind saw a dead
         # holder's lock as fresh until the skew had passed.
-        touched = _lock_touched(lockdir)
-        tok_now = _lock_token(lockdir)
-        if touched != watched[] || tok_now != watched_token[]
-            watched[] = touched
-            watched_token[] = tok_now
-            watched_since[] = time()
-        end
-        age = time() - watched_since[]
-        if age > _lock_unrefreshed()
-            _take_stale!(lockdir, watched_token[])
-            watched[] = -1.0
+        seen = _lock_watched_for(lockdir)
+        if seen.secs > _LEDGER_LOCK_STALE[] || _lock_holder_gone(seen.token)
+            _take_stale!(lockdir, seen.token)
+            delete!(_LEDGER_WATCH, lockdir)
             continue
         end
         time() - t0 > wait && error(
-            "the ledger $(l.path) is locked by another controller " *
-            "(watched for $(round(Int, time() - t0)) s); nothing decided",
+            "the ledger $(l.path) is locked by another controller ($(repr(seen.token)), " *
+            "unchanged for $(round(Int, seen.secs)) s of the $(round(Int, _LEDGER_LOCK_STALE[])) " *
+            "after which it is taken); nothing decided. If its holder is gone, remove $lockdir",
         )
         sleep(0.2)
     end
@@ -710,6 +738,7 @@ function with_ledger(f, l::Ledger; wait::Real=300.0)
         timedwait(() -> !alive[], _LEDGER_LOCK_STALE[] / 10; pollint=0.05)
     end
     _LEDGER_HELD[l] = (lockdir, token)
+    delete!(_LEDGER_WATCH, lockdir)
     try
         reload_ledger!(l)
         return f()
@@ -726,6 +755,9 @@ end
 # is not the lock that was watched (a waiter that stalled between its read and its rename has
 # renamed the lock another has just made) it is put back. Returns whether a lock was removed.
 function _take_stale!(lockdir::AbstractString, token)::Bool
+    # Not the lock that was watched any more: nothing is renamed, and its holder never sees its
+    # lock gone. (The rename-and-look below is for the change that comes after this read.)
+    _lock_token(lockdir) == token || return false
     aside = string(lockdir, ".stale.", string(rand(UInt32); base=16))
     try
         mv(lockdir, aside)
@@ -747,9 +779,6 @@ function _take_stale!(lockdir::AbstractString, token)::Bool
     return false
 end
 
-# How long a lock may be seen unchanged before it is taken as left behind: one and a half of its
-# holder's refresh periods.
-_lock_unrefreshed() = 1.5 * _LEDGER_LOCK_STALE[] / 10
 # Whether a holder refreshes its lock. A `Ref` so a test can stand in a holder that is stuck.
 const _LEDGER_KEEP = Ref(true)
 
