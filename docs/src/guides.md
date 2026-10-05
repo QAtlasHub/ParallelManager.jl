@@ -618,9 +618,13 @@ What keeps that check from passing on an under-count:
   and holds its place under `max_jobs` until a later poll finds a job of that
   name, or it has gone unlisted for three polls and ten minutes.
 - A job ends **on evidence**, logged as `job_ended` with what the evidence was:
-  the scheduler's accounting says so (`sacct`), or it has been absent for three
+  the scheduler's accounting says so on two polls in a row (`sacct`; a failing
+  `sacct` is logged as `job_gone_failed`), or it has been absent for three
   polls and two minutes from answers that list *other* jobs of the ledger, or
-  it was last seen running and its time limit has passed. It is then billed for
+  it was last seen running and its time limit has passed. Evidence that the
+  wrong cluster would give too — half an hour of answers listing none of the
+  ledger's jobs, or of the accounting calling it live while the queue does
+  not list it — is marked `weak` and logged as a warning. It is then billed for
   what it can have run since it was last seen. A job in any listed state
   (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
   live again.
