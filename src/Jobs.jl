@@ -220,7 +220,7 @@ function submit(s::SlurmScheduler, spec::JobSpec)::String
     exports = join(["ALL"; ["$k=$v" for (k, v) in sort!(collect(spec.env))]], ",")
     mins = _slurm_minutes(spec.time_limit)
     cmd = `sbatch --parsable -J $(spec.name) -p $(spec.partition) -N $(spec.nodes) -t $mins --export=$exports $(spec.script) $(spec.args)`
-    out = s.run(cmd)
+    out = _run(s, cmd)
     out === nothing &&
         error("sbatch failed for job $(spec.name) on $(spec.partition)" * _why_failed())
     id = strip(first(split(strip(out), ';')))
