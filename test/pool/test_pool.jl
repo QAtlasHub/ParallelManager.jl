@@ -1,6 +1,6 @@
 # Pool (#70, #79): workers sized to the keys they run, started where a node has the room.
 
-using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed, LinearAlgebra
+using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed, LinearAlgebra, Dates
 using SweepRunner: StepManager, shutdown!
 
 const _PL_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")       # N in (4, 8)
@@ -959,7 +959,10 @@ end
             # land in a pool made with `keep`), and none of them is a rejected one.
             room = _pl_room(pool, 4)
             @test room.free == room.want
-            @test isempty(intersect(keys(pool.workers), [e.worker for e in retired]))
+            # (Their removal is a task of its own; it is waited for, not caught mid-way.)
+            gone = [e.worker for e in retired]
+            @test timedwait(() -> isempty(intersect(keys(pool.workers), gone)), 60.0) ===
+                :ok
         end
     end
 end
@@ -1185,5 +1188,59 @@ end
         SweepRunner._pool_node_failed!(pool, node, log, :pl)
         @test pool.node_fails[node] == 1
         @test !(node in pool.bad_nodes)
+    end
+end
+
+# ── found on a cluster (0.6.9, issp-ohtaka, job 3094774) ─────────────────────────────────────────
+
+@testset "a need is covered by the smallest worker that fits it, not the first" begin
+    nodes = [PoolNode("n1", 64, 128.0)]
+    free_c, free_m = Dict("n1" => 64), Dict("n1" => 128.0)
+    small, big = KeyReq(2, 1.0), KeyReq(8, 4.0)
+    # Two small needs ahead of two big ones, covered by two big and two small workers: nothing
+    # is started. First-fit gave the small needs the big workers and started two more big ones.
+    p = plan_spawns(
+        [small, small, big, big], zeros(4), nodes, free_c, free_m, [big, big, small, small]
+    )
+    @test isempty(p.starts) && isempty(p.blocked)
+    # With only big workers to cover, the small needs do take them — and the big ones start.
+    p = plan_spawns([small, big], zeros(2), nodes, free_c, free_m, [big])
+    @test [s[2] for s in p.starts] == [big]
+    @test SweepRunner._best_cover([big, small, KeyReq(2, 2.0)], small) == 2
+    @test SweepRunner._best_cover([small], big) === nothing
+end
+
+@testset "starts still on their way are not waited for when no key is left" begin
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        _pl_vault() do v, outdir
+            table = TaskTable(DataVault.keys(v))
+            pool.starting[1] = (gethostname(), KeyReq(1, 1.0), 1)
+            @test SweepRunner._pool_wants(pool, table)           # keys queued: waited for
+            SweepRunner.settle_queued!(table, :stop_flag)
+            @test !SweepRunner._pool_wants(pool, table)          # none left: not
+            delete!(pool.starting, 1)
+        end
+    end
+end
+
+@testset "a pool's workers are readied together, beside the ticker" begin
+    _pl_pool(; key_req=k -> KeyReq(1, 1.0)) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            # Observing takes two seconds on every worker, as it takes six on a cluster. (The
+            # pool's workers inherit the environment they were started in.)
+            r = withenv("SWEEPRUNNER_TEST_OBSERVE_DELAY" => "2") do
+                run!(k -> (sleep(1); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
+            end
+            @test r.done == length(ks)
+            pids = sort(collect(keys(pool.workers)))
+            @test length(pids) >= 3
+            # Asked one after the other this takes two seconds per worker; together, about two.
+            log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+            t = @elapsed SweepRunner._observe_late!(v, pids, true, log, :pl)
+            @test 2.0 <= t < 2.0 * (length(pids) - 1)
+            said = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid in pids]
+            @test length(said) >= 2length(pids)                  # in the run, and just now
+        end
     end
 end

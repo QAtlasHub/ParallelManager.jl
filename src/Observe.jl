@@ -22,6 +22,7 @@ Observe the sources from this process and remember the token for `vault`. On fai
 `observation=unknown` rather than naming an observation of some earlier state.
 """
 function _observe_here!(vault::Vault, role::AbstractString)
+    (d = _observe_delay()) > 0 && sleep(d)
     token, err = try
         DataVault.observe_sources(
             vault;
@@ -40,6 +41,13 @@ function _observe_here!(vault::Vault, role::AbstractString)
         end
     end
     return token, err
+end
+
+# Seconds an observation waits first, from the environment (which a pool's workers inherit): a
+# test makes observing take as long as it does on a cluster's file system and sees that workers
+# are asked together.
+function _observe_delay()
+    return something(tryparse(Float64, get(ENV, "SWEEPRUNNER_TEST_OBSERVE_DELAY", "")), 0.0)
 end
 
 "Forget this process's token for `vault` (a `run!` with `observe=false`)."
@@ -93,13 +101,21 @@ function _observe_processes!(vault::Vault, multi::Bool, observe::Bool, log, stag
 end
 
 # The same, for workers that joined after the round began (see `_drive_workers!`).
+#
+# All of them at once, like the first ones: an observation reads the sources (seconds each on a
+# cluster's file system), and asked one worker after the other a pool of forty was readied for
+# four minutes after its thirty-two keys were done — a pool of 1500 would take hours.
 function _observe_late!(vault::Vault, pids, observe::Bool, log, stage)
-    for pid in pids
-        if !observe
-            remotecall_fetch(SweepRunner._forget_observation!, pid, vault)
-            continue
-        end
-        token, err = remotecall_fetch(SweepRunner._observe_here!, pid, vault, "worker")
+    if !observe
+        asyncmap(
+            pid -> remotecall_fetch(SweepRunner._forget_observation!, pid, vault), pids
+        )
+        return nothing
+    end
+    outcomes = asyncmap(pids) do pid
+        return remotecall_fetch(SweepRunner._observe_here!, pid, vault, "worker")
+    end
+    for (pid, (token, err)) in zip(pids, outcomes)
         if token === nothing
             log_event(
                 log,

@@ -733,15 +733,17 @@ function run!(
     end
     # The same two steps for workers that join after the round began. One that cannot be readied
     # is not handed work, and the round goes on without it.
+    # (`quiet()`: the round is over and its workers are being removed — a failure then is not a
+    # worker that cannot be readied, and is not said as one.)
     prepare =
-        pids -> try
+        (pids; quiet=Returns(false)) -> try
             _ensure_worker_modules(mods; pids=pids)
             _observe_late!(vault, pids, observe, log, stage)
             _redirect_late!(pids)
             pids
         catch e
             e isa InterruptException && rethrow()
-            log_event(
+            quiet() || log_event(
                 log,
                 :workers_rejected;
                 level=:warn,
@@ -1615,6 +1617,8 @@ mutable struct Round
     const rejected::Set{Int}
     const unidentified::Set{Int}
     const prep_tries::Dict{Int,Int}
+    # Workers being readied right now, beside the ticker.
+    const preparing::Set{Int}
     # With a pool: the workers that were there when `run!` began, which it readied itself.
     const first_foreign::Set{Int}
     # Set when the round has to end with an error (a unit that could not be cut, a tick step
@@ -1681,6 +1685,7 @@ function Round(
         Set{Int}(),
         Set{Int}(),
         Dict{Int,Int}(),
+        Set{Int}(),
         pool === nothing ? Set{Int}() : Set{Int}(p for p in workers() if p != myid()),
         nothing,
         Set{Task}(),
@@ -1908,15 +1913,22 @@ function _round_settle!(r::Round, i::Int, row, pid::Int, t0, outcome)
 end
 
 # Start a dispatch task for every worker that does not have one. Workers present when the
-# round began were prepared by `run!`; later ones are prepared here.
+# round began were prepared by `run!`; later ones are prepared here — beside the ticker, not in
+# it. Readying loads modules and reads the sources on each worker, seconds on a cluster's file
+# system: done inside the tick, a pool's forty late workers held the ticker for four minutes,
+# during which no request was read, no stop enforced, nothing flushed, and the dispatch tasks
+# waited on a `queued_now` nobody refreshed.
 function _round_adopt!(r::Round)
-    (; stage, log, master, pool, prepare) = r
+    (; pool, prepare) = r
     # `workers()` is `[1]` when there are none: the master is not one of its own workers.
     # (A worker whose lock was kept is still inside the unit it could not be stopped in:
     # it gets no key from a later round in this process.)
     fresh = [
-        p for p in workers() if
-        !(p in r.started) && p != myid() && !(p in r.rejected) && !(p in _KEPT_WORKERS)
+        p for p in workers() if !(p in r.started) &&
+            !(p in r.preparing) &&
+            p != myid() &&
+            !(p in r.rejected) &&
+            !(p in _KEPT_WORKERS)
     ]
     # A worker the pool is still starting is visible here before the pool knows its size;
     # it gets a dispatch task once it is registered, not before.
@@ -1931,29 +1943,66 @@ function _round_adopt!(r::Round)
         [p for p in fresh if p in r.first_foreign]
     end
     todo = setdiff(fresh, found)
-    ready = if prepare === nothing || isempty(todo)
-        fresh
-    else
-        ok = prepare(todo)
-        if length(ok) < length(todo)
-            # The batch failed as one. Each by itself, so the one that cannot be readied is
-            # the only one left out — and it is set aside: asked again every tick, it was
-            # re-readying every worker and logging the same line each second.
-            ok = Int[]
-            for p in todo
-                if !isempty(prepare([p]))
-                    push!(ok, p)
-                else
-                    _round_give_up_on!(r, p)             # after a few tries; else next tick
-                end
-            end
+    (prepare === nothing || isempty(todo)) && return _round_start!(r, fresh, late)
+    isempty(found) || _round_start!(r, found, late)
+    union!(r.preparing, todo)
+    @async try
+        ok = _round_prepare(r, todo)
+        # The round may have ended in the meantime: its workers are not given dispatch tasks
+        # for a queue that is gone.
+        r.done || _round_start!(r, ok, late)
+    catch e
+        e isa InterruptException && rethrow()
+        try
+            log_event(
+                r.log,
+                :tick_failed;
+                level=:warn,
+                stage=r.stage,
+                step="prepare",
+                count=1,
+                secs=0,
+                err=_short_err(e),
+            )
+        catch e2
+            e2 isa InterruptException && rethrow()
         end
-        vcat(found, ok)
+    finally
+        setdiff!(r.preparing, todo)
+        notify(r.idle)
     end
+    return nothing
+end
+
+# Ready `todo` (modules, source observation, log files); the ones that can be handed work.
+function _round_prepare(r::Round, todo::Vector{Int})
+    quiet = () -> r.done
+    ok = r.prepare(todo; quiet=quiet)
+    length(ok) < length(todo) || return ok
+    # The batch failed as one. Each by itself, so the one that cannot be readied is the only
+    # one left out — and it is set aside: asked again every tick, it was re-readying every
+    # worker and logging the same line each second. (Not for a round that is over: its
+    # workers are being removed, and that is not a worker that cannot be readied.)
+    ok = Int[]
+    for p in todo
+        r.done && break
+        if !isempty(r.prepare([p]; quiet=quiet))
+            push!(ok, p)
+        elseif !r.done
+            _round_give_up_on!(r, p)                     # after a few tries; else next tick
+        end
+    end
+    return ok
+end
+
+# Give each of `ready` a dispatch task, once it has said who it is.
+function _round_start!(r::Round, ready::Vector{Int}, late::Bool)
+    (; stage, log, master) = r
     _identify_workers!(master, ready)
     who = lock(() -> copy(master.who), master.lock)
     n = 0
     for pid in ready
+        pid in r.started && continue
         w = get(who, pid, nothing)
         if w === nothing
             # Could not say who it is: asked again on the next ticks, said once, and given
@@ -3110,7 +3159,7 @@ end
 function _redirect_late!(pids)
     dir = _WORKER_LOG_DIR[]
     dir === nothing && return nothing
-    for p in pids
+    asyncmap(pids) do p
         try
             remotecall_fetch(_redirect_output, p, dir)
         catch e
