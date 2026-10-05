@@ -1,6 +1,6 @@
 # Pool (#70, #79): workers sized to the keys they run, started where a node has the room.
 
-using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed, LinearAlgebra
+using SweepRunner, Test, DataVault, ParamIO, JSON3, Distributed, LinearAlgebra, Dates
 using SweepRunner: StepManager, shutdown!
 
 const _PL_CFG = joinpath(@__DIR__, "..", "run", "fixtures", "study.toml")       # N in (4, 8)
@@ -959,7 +959,10 @@ end
             # land in a pool made with `keep`), and none of them is a rejected one.
             room = _pl_room(pool, 4)
             @test room.free == room.want
-            @test isempty(intersect(keys(pool.workers), [e.worker for e in retired]))
+            # (Their removal is a task of its own; it is waited for, not caught mid-way.)
+            gone = [e.worker for e in retired]
+            @test timedwait(() -> isempty(intersect(keys(pool.workers), gone)), 60.0) ===
+                :ok
         end
     end
 end
@@ -1185,5 +1188,190 @@ end
         SweepRunner._pool_node_failed!(pool, node, log, :pl)
         @test pool.node_fails[node] == 1
         @test !(node in pool.bad_nodes)
+    end
+end
+
+# ── found on the first runs on a cluster ─────────────────────────────────────────────────────────
+
+@testset "a need is covered by the smallest worker that fits it, not the first" begin
+    nodes = [PoolNode("n1", 64, 128.0)]
+    free_c, free_m = Dict("n1" => 64), Dict("n1" => 128.0)
+    small, big = KeyReq(2, 1.0), KeyReq(8, 4.0)
+    # Two small needs ahead of two big ones, covered by two big and two small workers: nothing
+    # is started. First-fit gave the small needs the big workers and started two more big ones.
+    p = plan_spawns(
+        [small, small, big, big], zeros(4), nodes, free_c, free_m, [big, big, small, small]
+    )
+    @test isempty(p.starts) && isempty(p.blocked)
+    # With only big workers to cover, the small needs do take them — and the big ones start.
+    p = plan_spawns([small, big], zeros(2), nodes, free_c, free_m, [big])
+    @test [s[2] for s in p.starts] == [big]
+    @test SweepRunner._best_cover([big, small, KeyReq(2, 2.0)], small) == 2
+    @test SweepRunner._best_cover([small], big) === nothing
+end
+
+@testset "starts still on their way are not waited for when no key is left" begin
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        _pl_vault() do v, outdir
+            table = TaskTable(DataVault.keys(v))
+            pool.starting[1] = (gethostname(), KeyReq(1, 1.0), 1)
+            @test SweepRunner._pool_wants(pool, table)           # keys queued: waited for
+            SweepRunner.settle_queued!(table, :stop_flag)
+            @test !SweepRunner._pool_wants(pool, table)          # none left: not
+            delete!(pool.starting, 1)
+        end
+    end
+end
+
+@testset "a pool's workers are readied together, beside the ticker" begin
+    _pl_pool(; key_req=k -> KeyReq(1, 1.0)) do pool
+        _pl_vault() do v, outdir
+            ks = DataVault.keys(v)
+            # Observing takes three seconds on every worker, as it takes six on a cluster.
+            # (The pool's workers inherit the environment they were started in.)
+            r = withenv("SWEEPRUNNER_TEST_OBSERVE_DELAY" => "3") do
+                run!(k -> (sleep(1); Dict{String,Any}("x" => 1)), v, ks; pool=pool)
+            end
+            @test r.done == length(ks)
+            pids = sort(collect(keys(pool.workers)))
+            @test length(pids) >= 3
+            # Asked one after the other this takes three seconds per worker; together, about
+            # three — and three seconds short of the bound with three workers.
+            log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+            t = @elapsed SweepRunner._observe_late!(v, pids, true, log, :pl)
+            @test 3.0 <= t < 3.0 * (length(pids) - 1)
+            said = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid in pids]
+            @test length(said) >= 2length(pids)                  # in the run, and just now
+            # One worker that cannot be asked is its own failure: the others' observations
+            # are made and logged, not dropped with it.
+            before = length(said)
+            SweepRunner._observe_late!(v, vcat(pids, 99_999), true, log, :pl)
+            ev = _pl_events(outdir)
+            @test count(e -> e.kind == "observed" && e.pid in pids, ev) ==
+                before + length(pids)
+            @test only([e.pid for e in ev if e.kind == "observe_failed"]) == 99_999
+            # Without observation the others are still told to forget before the failure is
+            # the caller's.
+            token = p -> remotecall_fetch(SweepRunner._observation_token, p, v)
+            @test all(p -> token(p) !== nothing, pids)
+            @test_throws Exception SweepRunner._observe_late!(
+                v, vcat(pids, 99_999), false, log, :pl
+            )
+            @test all(p -> token(p) === nothing, pids)           # every one of them forgot
+            # The master is observed once, as the master: with no workers yet `workers()` is
+            # `[1]`, and it used to be observed a second time as a worker of itself.
+            own = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid == 1]
+            @test [String(e.role) for e in own] == ["master"]
+        end
+    end
+end
+
+@testset "a worker takes a key of its own size before a smaller one" begin
+    # N = 8 needs four cores, N = 4 one; the keys with N = 4 come first in the queue.
+    req = k -> KeyReq(k.params["N"] == 8 ? 4 : 1, 1.0)
+    _pl_custom((node, size, n, flags) -> Int[]; key_req=req) do pool
+        _pl_vault() do v, outdir
+            table = TaskTable(DataVault.keys(v))
+            big = findfirst(r -> r.key.params["N"] == 8, table.rows)
+            small = findfirst(r -> r.key.params["N"] == 4, table.rows)
+            @test small < big
+            pool.workers[4301] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(4, 4.0), 0.0, false
+            )
+            pool.workers[4302] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+            ok =
+                (pid, i; kw...) -> SweepRunner._pool_accepts(
+                    pool, pid, table.rows[i], nothing, nothing; kw...
+                )
+            # Both keys fit the big worker; only the big key is its own size.
+            @test ok(4301, small) && ok(4301, big)
+            @test !ok(4301, small; tight=true) && ok(4301, big; tight=true)
+            # The small worker's own size is the small key; the big one does not fit at all.
+            @test ok(4302, small; tight=true) && !ok(4302, big)
+            # What the dispatch task draws: the big key for the big worker although the small
+            # one is ahead of it, and a small one once no big key is left.
+            draw =
+                pid -> SweepRunner._next_for_pool!(
+                    table, pid, Returns(true), pool, nothing, nothing
+                )
+            nbig = count(r -> r.key.params["N"] == 8, table.rows)
+            drawn = [draw(4301) for _ in 1:(nbig + 1)]
+            @test all(i -> table.rows[i].key.params["N"] == 8, drawn[1:nbig])
+            @test table.rows[drawn[end]].key.params["N"] == 4
+            delete!(pool.workers, 4301)
+            delete!(pool.workers, 4302)
+        end
+    end
+end
+
+@testset "a pool's workers are removed together when it is shut down" begin
+    # Six launchers that ignore SIGTERM, as an `srun` that is waiting for its step does: one
+    # after the other that is five seconds each before the SIGKILL.
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        procs_of = Dict{Int,Base.Process}()
+        for id in 9001:9006
+            procs_of[id] = run(`bash -c "trap '' TERM; sleep 120"`; wait=false)
+            pool.workers[id] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+        end
+        sleep(0.5)                                               # the traps are set
+        SweepRunner._LAUNCHER_OF[] = id -> get(procs_of, id, nothing)
+        try
+            t = @elapsed shutdown!(pool; wait=1)
+            @test t < 15                                         # not 6 x 5 s
+            @test all(p -> process_exited(p), values(procs_of))
+            @test isempty(pool.workers)
+        finally
+            SweepRunner._LAUNCHER_OF[] = nothing
+            foreach(p -> process_running(p) && kill(p, Base.SIGKILL), values(procs_of))
+        end
+    end
+end
+
+@testset "a worker that cannot be removed at shutdown keeps its room, and is said" begin
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        _pl_vault() do v, outdir
+            log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+            id = only(addprocs(1; exeflags="--project=$(dirname(Base.active_project()))"))
+            launcher = SweepRunner._launcher(id)
+            @test launcher isa Base.Process
+            pool.workers[id] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+            # The worker is inside something that does not yield: it cannot answer. It says
+            # when it is about to go in, so the test does not ask it to leave before that.
+            entered = joinpath(outdir, "entered")
+            remote_do((f -> (touch(f); Libc.systemsleep(60))), id, entered)
+            @test timedwait(() -> isfile(entered), 30.0) === :ok
+            sleep(0.3)
+            try
+                # With no handle on what launched it, it can only be asked — and it stays.
+                SweepRunner._LAUNCHER_OF[] = i -> nothing
+                # ...within the one deadline: `waitfor` covers the asking and the last look
+                # together, not each.
+                t = @elapsed left = shutdown!(pool; wait=0, waitfor=4, log=log, stage=:pl)
+                @test left == [id]
+                @test t < 7
+                @test haskey(pool.workers, id)                   # its room is not given back
+                said = only([e for e in _pl_events(outdir) if e.kind == "pool_kill_failed"])
+                @test said.worker == id
+                @test process_running(launcher)
+                # With the handle, one worker that does not answer does not hold the others up
+                # for the whole wait: it is killed after the short grace.
+                SweepRunner._LAUNCHER_OF[] = nothing
+                t = @elapsed left = shutdown!(pool; wait=1, waitfor=60, log=log, stage=:pl)
+                @test isempty(left) && isempty(pool.workers)
+                @test t < 30
+                @test process_exited(launcher)
+            finally
+                SweepRunner._LAUNCHER_OF[] = nothing
+                process_running(launcher) && kill(launcher, Base.SIGKILL)
+                delete!(pool.workers, id)
+                timedwait(() -> nprocs() == 1, 30.0)
+            end
+        end
     end
 end

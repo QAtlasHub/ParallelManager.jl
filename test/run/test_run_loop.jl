@@ -84,3 +84,31 @@ end
         @test elapsed < 2.0
     end
 end
+
+@testset "run_loop!: idle_sleep and max_empty_rounds are numbers, not Float64 and Int" begin
+    # `idle_sleep = 5` was a TypeError: found by the first script written against a cluster.
+    with_vault_rl() do v, _
+        r = run_loop!(
+            k -> Dict{String,Any}("x" => 1),
+            v,
+            allk_rl(v);
+            max_empty_rounds=Int32(1),
+            idle_sleep=1,
+        )
+        @test r.remaining == 0
+    end
+end
+
+@testset "run_loop!: its numbers are checked before anything runs" begin
+    with_vault_rl() do v, _
+        wf = k -> Dict{String,Any}("x" => 1)
+        for bad in (-1, NaN, Inf)
+            @test_throws ArgumentError run_loop!(wf, v, allk_rl(v); idle_sleep=bad)
+        end
+        for bad in (0, -2)
+            @test_throws ArgumentError run_loop!(wf, v, allk_rl(v); max_empty_rounds=bad)
+        end
+        @test all(k -> !DataVault.is_done(v, k), allk_rl(v))     # refused, not half run
+        @test run_loop!(wf, v, allk_rl(v); idle_sleep=0, max_empty_rounds=1).remaining == 0
+    end
+end

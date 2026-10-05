@@ -1,4 +1,4 @@
-using SweepRunner, Test
+using SweepRunner, Test, Distributed
 using LinearAlgebra
 
 @testset "detect_mode: no SLURM" begin
@@ -93,4 +93,40 @@ end
     @test wmn(("A", :B)) == [:A, :B]                  # Tuple, mixed String/Symbol
     @test_throws ArgumentError wmn(42)                # clear error, not a deep MethodError
     @test_throws ArgumentError wmn([1, 2])            # bad collection element
+end
+
+@testset "the :slurm backend's step is not ended by one worker being killed" begin
+    # All workers are tasks of one `srun` step; with `KillOnBadExit=1` in the cluster's
+    # configuration Slurm ends the whole step when one of them is killed.
+    env = Dict(SweepRunner._slurm_launch_env(16, 300, Dict{String,String}()))
+    @test env["SLURM_KILL_BAD_EXIT"] == "0"
+    @test env["SLURM_NTASKS"] == "16"
+    @test env["JULIA_WORKER_TIMEOUT"] == "300"
+    # What the job's own script chose is not overridden.
+    mine = Dict("SLURM_KILL_BAD_EXIT" => "1")
+    @test Dict(SweepRunner._slurm_launch_env(4, 60, mine))["SLURM_KILL_BAD_EXIT"] == "1"
+    # ...and it is what `init_workers!` starts `srun` in: the launch is stood in for, and
+    # reads the environment it is called in.
+    # (`init_workers!` starts nothing when workers are already there: none may be.)
+    nprocs() > 1 && rmprocs(workers())
+    @test nprocs() == 1
+    let
+        seen = Ref{Any}(nothing)
+        SweepRunner._SLURM_LAUNCH[] =
+            (timeout, flags) -> begin
+                seen[] = (ENV["SLURM_KILL_BAD_EXIT"], ENV["SLURM_NTASKS"])
+                Int[]
+            end
+        start = () -> init_workers!(; mode=:slurm, verbose=false, max_workers=nothing)
+        try
+            withenv(start, "JULIA_SLURM_N_WORKERS" => "3", "SLURM_KILL_BAD_EXIT" => nothing)
+            @test seen[] == ("0", "3")
+            withenv(start, "JULIA_SLURM_N_WORKERS" => "3", "SLURM_KILL_BAD_EXIT" => "1")
+            @test seen[] == ("1", "3")
+        finally
+            SweepRunner._SLURM_LAUNCH[] = nothing
+            note_workers!(; planned=0, launched=0)
+        end
+        @test !haskey(ENV, "SLURM_NTASKS") || ENV["SLURM_NTASKS"] != "3"   # not left set
+    end
 end

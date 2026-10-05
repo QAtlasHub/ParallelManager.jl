@@ -733,15 +733,17 @@ function run!(
     end
     # The same two steps for workers that join after the round began. One that cannot be readied
     # is not handed work, and the round goes on without it.
+    # (`quiet()`: the round is over and its workers are being removed — a failure then is not a
+    # worker that cannot be readied, and is not said as one.)
     prepare =
-        pids -> try
+        (pids; quiet=Returns(false)) -> try
             _ensure_worker_modules(mods; pids=pids)
             _observe_late!(vault, pids, observe, log, stage)
             _redirect_late!(pids)
             pids
         catch e
             e isa InterruptException && rethrow()
-            log_event(
+            quiet() || log_event(
                 log,
                 :workers_rejected;
                 level=:warn,
@@ -921,7 +923,9 @@ function run!(
         # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
         # when IT returns).
         _guarded(
-            () -> (own && pool !== nothing && !pool.keep) && shutdown!(pool),
+            () ->
+                (own && pool !== nothing && !pool.keep) &&
+                shutdown!(pool; log=log, stage=stage),
             log,
             "shutdown_pool",
         )
@@ -1615,6 +1619,8 @@ mutable struct Round
     const rejected::Set{Int}
     const unidentified::Set{Int}
     const prep_tries::Dict{Int,Int}
+    # Workers being readied right now, beside the ticker.
+    const preparing::Set{Int}
     # With a pool: the workers that were there when `run!` began, which it readied itself.
     const first_foreign::Set{Int}
     # Set when the round has to end with an error (a unit that could not be cut, a tick step
@@ -1681,6 +1687,7 @@ function Round(
         Set{Int}(),
         Set{Int}(),
         Dict{Int,Int}(),
+        Set{Int}(),
         pool === nothing ? Set{Int}() : Set{Int}(p for p in workers() if p != myid()),
         nothing,
         Set{Task}(),
@@ -1734,15 +1741,12 @@ function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
         host in c.drained && break
         # The pool retires its own workers; the task only has to leave.
         (pool !== nothing && _pool_retiring(pool, pid)) && break
-        accept = if pool === nothing
-            nothing
-        else
-            row -> _pool_accepts(pool, pid, row, opts.deadline, r.min_time)
-        end
         i = if c.paused || r.stopped
             nothing
+        elseif pool === nothing
+            _next_fitting!(table, pid, r.fits)
         else
-            _next_fitting!(table, pid, r.fits; accept=accept)
+            _next_for_pool!(table, pid, r.fits, pool, opts.deadline, r.min_time)
         end
         if i === nothing
             # Leave when nothing is out and nothing can arrive. A paused master keeps its
@@ -1908,15 +1912,22 @@ function _round_settle!(r::Round, i::Int, row, pid::Int, t0, outcome)
 end
 
 # Start a dispatch task for every worker that does not have one. Workers present when the
-# round began were prepared by `run!`; later ones are prepared here.
+# round began were prepared by `run!`; later ones are prepared here — beside the ticker, not in
+# it. Readying loads modules and reads the sources on each worker, seconds on a cluster's file
+# system: done inside the tick it holds the ticker for that long, during which no request is
+# read, no stop enforced, nothing flushed, and the dispatch tasks wait on a `queued_now` nobody
+# refreshes.
 function _round_adopt!(r::Round)
-    (; stage, log, master, pool, prepare) = r
+    (; pool, prepare) = r
     # `workers()` is `[1]` when there are none: the master is not one of its own workers.
     # (A worker whose lock was kept is still inside the unit it could not be stopped in:
     # it gets no key from a later round in this process.)
     fresh = [
-        p for p in workers() if
-        !(p in r.started) && p != myid() && !(p in r.rejected) && !(p in _KEPT_WORKERS)
+        p for p in workers() if !(p in r.started) &&
+            !(p in r.preparing) &&
+            p != myid() &&
+            !(p in r.rejected) &&
+            !(p in _KEPT_WORKERS)
     ]
     # A worker the pool is still starting is visible here before the pool knows its size;
     # it gets a dispatch task once it is registered, not before.
@@ -1931,29 +1942,91 @@ function _round_adopt!(r::Round)
         [p for p in fresh if p in r.first_foreign]
     end
     todo = setdiff(fresh, found)
-    ready = if prepare === nothing || isempty(todo)
-        fresh
-    else
-        ok = prepare(todo)
-        if length(ok) < length(todo)
-            # The batch failed as one. Each by itself, so the one that cannot be readied is
-            # the only one left out — and it is set aside: asked again every tick, it was
-            # re-readying every worker and logging the same line each second.
-            ok = Int[]
+    (prepare === nothing || isempty(todo)) && return _round_start!(r, fresh, late)
+    isempty(found) || _round_start!(r, found, late)
+    union!(r.preparing, todo)
+    @async try
+        ok = _round_prepare(r, todo)
+        # The round may have ended in the meantime: its workers are not given dispatch tasks
+        # for a queue that is gone.
+        r.done || _round_start!(r, ok, late)
+    catch e
+        e isa InterruptException && rethrow()
+        # Inside the ticker this was the `:adopt` step, which ends the round when it keeps
+        # failing. Here it counts against the workers instead: each is tried
+        # `_PREPARE_TRIES` times and then left out, so a readying that always throws is not
+        # started again every tick for the rest of the job.
+        n = 1 + maximum(p -> get(r.prep_tries, p, 0), todo; init=0)
+        try
+            log_event(
+                r.log,
+                :tick_failed;
+                level=:warn,
+                stage=r.stage,
+                step="prepare",
+                count=n,
+                secs=0,
+                err=_short_err(e),
+            )
+        catch e2
+            e2 isa InterruptException && rethrow()
+        end
+        # Only the workers that did not get a dispatch task: the throw can have come after
+        # some of them were started (`_round_start!`), and a worker that is running a key is
+        # not one that could not be readied.
+        if !r.done
             for p in todo
-                if !isempty(prepare([p]))
-                    push!(ok, p)
-                else
-                    _round_give_up_on!(r, p)             # after a few tries; else next tick
+                p in r.started && continue
+                try
+                    _round_give_up_on!(r, p)
+                catch e3
+                    e3 isa InterruptException && rethrow()
+                    _round_left_out!(r, p, e3)
                 end
             end
         end
-        vcat(found, ok)
+    finally
+        setdiff!(r.preparing, todo)
+        notify(r.idle)
     end
+    return nothing
+end
+
+# Ready `todo` (modules, source observation, log files); the ones that can be handed work.
+function _round_prepare(r::Round, todo::Vector{Int})
+    quiet = () -> r.done
+    ok = r.prepare(todo; quiet=quiet)
+    length(ok) < length(todo) || return ok
+    # The batch failed as one. Each by itself, so the one that cannot be readied is the only
+    # one left out — and it is set aside: asked again every tick, it was re-readying every
+    # worker and logging the same line each second. (Not for a round that is over: its
+    # workers are being removed, and that is not a worker that cannot be readied.)
+    ok = Int[]
+    for p in todo
+        r.done && break
+        if !isempty(r.prepare([p]; quiet=quiet))
+            push!(ok, p)
+        elseif !r.done
+            _round_give_up_on!(r, p)                     # after a few tries; else next tick
+        end
+    end
+    return ok
+end
+
+# Give each of `ready` a dispatch task, once it has said who it is.
+function _round_start!(r::Round, ready::Vector{Int}, late::Bool)
+    (; stage, log, master, pool) = r
     _identify_workers!(master, ready)
+    # Asking who they are is a call to each worker: the round can have ended meanwhile, and a
+    # dispatch task started now would install the round on a worker nobody tells to drop it —
+    # and, after a stop, could draw a key the round has already reported as not run.
+    r.done && return nothing
     who = lock(() -> copy(master.who), master.lock)
     n = 0
     for pid in ready
+        pid in r.started && continue
+        # Readying takes seconds: a worker the pool retired or lost meanwhile gets no task.
+        (pool === nothing || _pool_adoptable(pool, pid)) || continue
         w = get(who, pid, nothing)
         if w === nothing
             # Could not say who it is: asked again on the next ticks, said once, and given
@@ -1984,6 +2057,26 @@ function _round_adopt!(r::Round)
         push!(r.tasks, t)
     end
     (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
+    return nothing
+end
+
+# Giving up on `pid` threw (telling the pool did). It is left out of the round all the same,
+# and the pool must not go on counting it as a worker it has: one that is neither given work
+# nor retired looks like idle room, and nothing is started in its place.
+function _round_left_out!(r::Round, pid::Int, err)
+    push!(r.rejected, pid)
+    _guarded() do
+        return log_event(
+            r.log,
+            :workers_rejected;
+            level=:warn,
+            stage=r.stage,
+            n=1,
+            err="worker $pid is left out of the round, and giving up on it failed: " *
+                _short_err(err),
+        )
+    end
+    r.pool === nothing || _guarded(() -> _pool_retire!(r.pool, pid, r.log, r.stage))
     return nothing
 end
 
@@ -2244,8 +2337,9 @@ unbounded, a key that reliably kills whoever takes it is handed to worker after 
 A ticker runs beside the dispatch tasks, every `opts.control_interval` seconds. It applies control
 requests ([`poll_control!`](@ref)) and adopts workers that joined since the round began: a pool
 that is still ramping up, or one grown by a `:resize`, is used as it arrives rather than from the
-next round. `prepare(pids)` readies late workers (modules, source observation) and returns the
-ones that can be handed work.
+next round. `prepare(pids; quiet)` readies late workers (modules, source observation) and returns
+the ones that can be handed work; it is run in a task beside the ticker, and `quiet()` tells it
+that the round is over, when a worker that cannot be readied is one that is being removed.
 
 The state these share is one `Round`; the parts are `_round_loop!` (a worker's dispatch
 task), `_round_adopt!`, `_round_tick!` (one pass of the ticker, each step under `_round_step`),
@@ -2597,6 +2691,9 @@ more work to do. This is the infra equivalent of FiniteTemperature.jl's
 
 The loop exits when:
 - a round leaves no key undone (`remaining == 0`), at once, or
+`idle_sleep` is any finite number of seconds >= 0 and `max_empty_rounds` any integer >= 1;
+anything else is an `ArgumentError` before a round runs.
+
 - `max_empty_rounds` consecutive rounds produce zero new completions AND leave nothing held by a
   sibling (once the busy budget below is spent, rounds with keys still held count as empty
   too, so the return with `busy > 0` comes `max_empty_rounds` rounds after it, not at once), or
@@ -2667,8 +2764,18 @@ function run_loop!(
     try
         return _run_loop!(work_fn, vault, keys; pool=pool, kwargs...)
     finally
-        # Whatever way the loop ended, the pool's workers do not outlive it.
-        (pool !== nothing && !pool.keep) && shutdown!(pool)
+        # Whatever way the loop ended, the pool's workers do not outlive it. Guarded: a
+        # removal that throws must not replace the error the loop is ending with. And with the
+        # master's event log: a worker that could not be removed is an event
+        # (`pool_kill_failed`), not only a line on stderr.
+        if pool !== nothing && !pool.keep
+            log = EventLog(
+                joinpath(vault.outdir, "events_$(gethostname())_$(getpid()).jsonl")
+            )
+            _guarded(log, "shutdown_pool") do
+                return shutdown!(pool; log=log, stage=Symbol(vault.run))
+            end
+        end
     end
 end
 
@@ -2677,8 +2784,9 @@ function _run_loop!(
     vault::Vault,
     keys::AbstractVector{DataKey};
     opts::RunOpts=RunOpts(),
-    max_empty_rounds::Int=3,
-    idle_sleep::Float64=30.0,
+    max_empty_rounds::Integer=3,
+    # Any number of seconds, as one writes it (`idle_sleep = 5`).
+    idle_sleep::Real=30.0,
     load=nothing,
     prerequisite=nothing,
     affinity=nothing,
@@ -2689,6 +2797,17 @@ function _run_loop!(
     min_time=nothing,
     pool=nothing,
 )
+    # Checked here, like `RunOpts`' numbers: a negative or NaN `idle_sleep` threw from `sleep`
+    # after rounds had run, an infinite one never stopped waiting, and `max_empty_rounds = 0`
+    # ended the loop after its first empty round without a word.
+    (isfinite(idle_sleep) && idle_sleep >= 0) || throw(
+        ArgumentError(
+            "run_loop!: idle_sleep must be a finite number >= 0, got $idle_sleep"
+        ),
+    )
+    max_empty_rounds >= 1 || throw(
+        ArgumentError("run_loop!: max_empty_rounds must be >= 1, got $max_empty_rounds")
+    )
     pre = nothing
     if prerequisite !== nothing
         pre = run_prerequisite!(prerequisite; opts=opts, load=load, poll=idle_sleep)
@@ -3071,7 +3190,16 @@ function _default_cost(vault::Vault, cost, key_class, todo, log::EventLog, stage
     return measured_cost(table, k -> _class_of(key_class, k); fallback=fallback)
 end
 
+# The next key for a pool's worker: one that uses more than half of the worker (cores or
+# memory) if any is queued, else any it can hold.
+function _next_for_pool!(table::TaskTable, worker::Int, fits, pool, deadline, min_time)
+    accept(tight) = row -> _pool_accepts(pool, worker, row, deadline, min_time; tight=tight)
+    i = _next_fitting!(table, worker, fits; accept=accept(true))
+    return i === nothing ? _next_fitting!(table, worker, fits; accept=accept(false)) : i
+end
+
 # The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
+
 function _next_fitting!(table::TaskTable, worker::Int, fits; accept=nothing)
     while true
         i = next_task!(table, worker; accept=accept)
@@ -3110,7 +3238,7 @@ end
 function _redirect_late!(pids)
     dir = _WORKER_LOG_DIR[]
     dir === nothing && return nothing
-    for p in pids
+    asyncmap(pids) do p
         try
             remotecall_fetch(_redirect_output, p, dir)
         catch e

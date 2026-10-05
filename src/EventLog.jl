@@ -97,7 +97,8 @@ stay within that guarantee.
 | `pool_node_out` | a node's starts brought no worker, or its workers could not be     |
 |                 | readied, five times over a minute (`node`, `why`, `times_out`)     |
 | `pool_node_retry` | a node that was taken out gets one more try                      |
-| `pool_kill_failed` | a retired worker is still there; its room is not given back     |
+| `pool_kill_failed` | a worker that was retired, or removed at shutdown, is still     |
+|                 | there; its room is not given back                                  |
 | `tick_failed`   | a step of the master's periodic work threw (`step`, `count`,       |
 |                 | `secs`); the other steps still ran                                 |
 | `status_tick_failed` | a check of the status tick threw (`step`, `count`)            |
@@ -127,6 +128,8 @@ stay within that guarantee.
 | `profile_too_small` | a campaign profile's `min_nodes` exceeds the allocation        |
 | `job_ended`     | the controller took one of its jobs as ended (`evidence`, `weak`)  |
 | `job_gone_failed` | the scheduler's accounting could not be asked                    |
+| `job_elapsed_failed` | the accounting confirmed a job's end and could not be asked   |
+|                 | how long it ran (`ids`, `err`): billed an estimate                 |
 | `job_submit_failed` | `sbatch` failed or timed out; the ledger row stays committed   |
 | `ledger_new`    | a controller started a ledger where there was none                 |
 | `controller_round_failed` | a round of `controller_loop!` threw                      |

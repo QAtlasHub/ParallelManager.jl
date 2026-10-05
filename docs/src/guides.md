@@ -439,9 +439,14 @@ the unit goes on (`lock_unreadable`); the commit's own owner check decides.
 ### Workers that arrive late
 
 At the same cadence the master adopts workers that joined since the round
-began (`workers_joined`), after loading the modules named by `load=` on them.
-A pool that is still ramping up when `run!` is called is used as it arrives,
-not from the next round.
+began (`workers_joined`), after readying them: loading the modules named by
+`load=` and observing the sources on each. That is done for all of them at
+once, in a task beside the ticker — it takes seconds per worker on a shared
+file system, and requests and stops are still read meanwhile. A worker that
+cannot be readied is tried three times and then left out (`workers_rejected`);
+a round that ends while workers are being readied does not take them. A pool
+that is still ramping up when `run!` is called is used as it arrives, not from
+the next round.
 
 ### Limits
 
@@ -567,9 +572,10 @@ budget_node_hours = 5000          # hard: no default
 max_jobs          = 8
 dry_run           = true
 default_key_time  = "10min"       # used when there is no cost model
+bill              = "estimate"    # what an ended job counts for: estimate | elapsed | limit
 
 [[jobs.partition]]
-name           = "i8cpu"
+name           = "debug"
 nodes          = 8
 time_limit     = "30min"
 script         = "batch/run_campaign.sh"
@@ -578,7 +584,7 @@ max_jobs       = 1
 slots_per_node = 32               # workers per node: how much a job can take
 
 [[jobs.partition]]
-name           = "F16cpu"
+name           = "large"
 nodes          = 16
 time_limit     = "24h"
 script         = "batch/run_campaign.sh"
@@ -595,10 +601,31 @@ bin/sweeprunner jobs configs/campaign.toml --submit --loop 300   # every 5 min u
 
 ```
 budget   812.0 used + 384.0 committed of 5000.0 node-hours
-  hold   i8cpu       nothing runnable under profile short
-  submit F16cpu      1930 unit(s) runnable under profile large, about 5120.4 worker-hours; 2 job(s) there
-  refuse F72cpu      budget: 4871.0 node-hours used or committed, this job needs 1728.0, the budget is 5000.0
+  hold   debug       nothing runnable under profile short
+  submit large       1930 unit(s) runnable under profile large, about 5120.4 worker-hours; 2 job(s) there
+  refuse huge        budget: 4871.0 node-hours used or committed, this job needs 1728.0, the budget is 5000.0
 ```
+
+**The budget is this package's count, not a centre's bill.** The partition
+names, sizes and limits above are an example, and so is every rule the
+controller applies: it counts nodes × hours for whole-node jobs, caps the jobs
+per partition, and refuses past a number of node-hours. Computing centres
+differ in all of that — some charge the time a job ran and some the time it
+asked for; some count cores, or weight partitions, or round up, or charge a
+minimum per job; some have no consumption budget at all and limit the nodes or
+jobs a user may hold; some partitions share a node between jobs. The
+controller was run against one cluster, and nothing in it was derived from any
+centre's regulations. Read the rules of the centre the jobs go to and set:
+
+- `budget_node_hours` to what you are willing to let the controller commit, in
+  the controller's unit;
+- `bill` to what an ended job should count for: `estimate` (the default: the
+  most it can have run since the queue last listed it, at most its limit —
+  never less than it ran), `elapsed` (the time the scheduler's accounting
+  gives, for a centre that charges the time used), or `limit` (its whole time
+  limit once it has run, for a centre that charges the time asked for);
+- `max_jobs` per partition and overall to stay inside the centre's own caps —
+  a cap on nodes per user, or a partition that shares nodes, is not modelled.
 
 Per partition, [`decide`](@ref SweepRunner.decide):
 
@@ -628,8 +655,11 @@ What keeps that check from passing on an under-count:
   it was last seen running and its time limit has passed. Evidence that the
   wrong cluster would give too — half an hour of answers listing none of the
   ledger's jobs, or of the accounting calling it live while the queue does
-  not list it — is marked `weak` and logged as a warning. It is then billed for
-  what it can have run since it was last seen. A job in any listed state
+  not list it — is marked `weak` and logged as a warning. What an ended job
+  then counts for is the policy's `bill` rule (below); `job_ended` and the
+  ledger row say which was applied (`billed_by`), and under `bill = "elapsed"`
+  an accounting that could not be asked for the time is logged as
+  `job_elapsed_failed`. A job in any listed state
   (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
   live again.
 - An answer that lists none of the ledger's live jobs — empty, another
@@ -1058,6 +1088,8 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
 
 - The pool's workers are removed when the `run!` / `run_loop!` it was given
   to returns (`keep = true` keeps them; then call `SweepRunner.shutdown!`).
+  They are removed together; a worker that cannot be removed keeps its room,
+  is logged (`pool_kill_failed`) and is in what `shutdown!` returns.
 - The pool follows requests to the master (guide 11): nothing is started
   while it is paused or stopping, a drained node gets no new worker, and a
   `resize` target caps the pool.
@@ -1067,7 +1099,8 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
 - **The per-master limit.** Under Slurm every worker is an `srun` client on
   the master's node. The pool holds at most `max_workers`:
   `SWEEPRUNNER_MAX_WORKERS`, else the cluster's `SrunPortRange`, else 1500
-  when that cannot be read — an unknown limit is a cap, not no cap. Which
+  when that cannot be read — an unknown limit is a cap, not no cap (the 1500
+  is what one cluster showed, not a property of Slurm: set it for yours). Which
   one it used is logged (`pool_limit`), and reaching it is logged once
   (`pool_at_limit`). Past it, run several masters on node groups:
   `SWEEPRUNNER_NODELIST=<group>` (and `SWEEPRUNNER_MEM_PER_NODE_MB=<the

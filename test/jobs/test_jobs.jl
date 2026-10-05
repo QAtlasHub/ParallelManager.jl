@@ -479,7 +479,7 @@ end
     default_key_time  = "30min"
 
     [[jobs.partition]]
-    name           = "i8cpu"
+    name           = "debug"
     nodes          = 1
     time_limit     = "30min"
     script         = "batch/run.sh"
@@ -492,9 +492,17 @@ end
     p = load_job_policy(meta)
     @test (p.name, p.budget_node_hours, p.max_jobs, p.dry_run) == ("j", 10.0, 4, true)
     @test p.default_key_time == 1800.0
+    # What an ended job counts for comes from the file, and defaults to the rule that assumes
+    # nothing about the centre.
+    @test p.bill === :estimate
+    write(meta, replace(body(true), "[jobs]" => "[jobs]\nbill = \"limit\""; count=1))
+    @test load_job_policy(meta).bill === :limit
+    write(meta, replace(body(true), "[jobs]" => "[jobs]\nbill = \"points\""; count=1))
+    @test_throws ArgumentError load_job_policy(meta)
+    write(meta, body(true))
     part = only(p.partitions)
     @test (part.name, part.nodes, part.time_limit, part.profile) ==
-        ("i8cpu", 1, 1800.0, "short")
+        ("debug", 1, 1800.0, "short")
     @test part.script == joinpath(dir, "batch", "run.sh")
     @test part.env == Dict("MODE" => "x")
     @test_throws ArgumentError load_job_policy(joinpath(dir, "study.toml"))
@@ -1396,4 +1404,181 @@ end
     end
     @test err isa ErrorException && occursin("the vault is gone", err.msg)
     @test calls[] == SweepRunner._CONTROLLER_MAX_FAILED
+end
+
+@testset "what an ended job counts for is the policy's rule, not one centre's" begin
+    spec = JobSpec(; name="t-a", partition="a", nodes=2, time_limit=3600.0, script="s")
+    over = id -> true
+    asked = Ref(0)
+    count_asked = f -> (id -> (asked[] += 1; f(id)))
+    run_as =
+        (bill, elapsed; state=:running) -> begin
+            l = _jb_ledger()
+            SweepRunner.record_submit!(l, "1", spec; now=0.0)
+            seen = [
+                JobState(
+                    "1", "t-a", "a", state, 2, 3600.0, state === :running ? 10.0 : 0.0
+                ),
+            ]
+            SweepRunner.observe!(l, seen; now=100.0)
+            kw = (; gone=over, elapsed=count_asked(elapsed), bill=bill)
+            SweepRunner.observe!(l, JobState[]; now=200.0, kw...)
+            ch = SweepRunner.observe!(l, JobState[]; now=400.0, kw...)
+            return l, only(ch)
+        end
+    # The default assumes nothing about what a centre charges: the most the job can have run
+    # (10 s seen + 300 s until its end was seen), whatever the accounting would say — and the
+    # accounting is not even asked for a time.
+    l, ch = run_as(:estimate, id -> 42.0)
+    @test ch.seconds_billed == 310.0 && ch.billed_by == "estimate"
+    @test l.jobs["1"]["billed_by"] == "estimate"                 # in the row, not only said
+    @test asked[] == 0
+    l0 = _jb_ledger()
+    SweepRunner.record_submit!(l0, "1", spec; now=0.0)
+    SweepRunner.observe!(
+        l0, [JobState("1", "t-a", "a", :running, 2, 3600.0, 10.0)]; now=100.0
+    )
+    SweepRunner.observe!(l0, JobState[]; now=200.0, gone=over, elapsed=id -> 42.0)
+    @test only(
+        SweepRunner.observe!(l0, JobState[]; now=400.0, gone=over, elapsed=id -> 42.0)
+    ).seconds_billed == 310.0                                                     # `bill` left out: the same
+    # A centre that charges the time asked for: the whole limit, once the job has run...
+    l, ch = run_as(:limit, id -> 42.0)
+    @test ch.seconds_billed == 3600.0 && ch.billed_by == "limit"
+    @test l.jobs["1"]["billed_by"] == "limit"
+    @test node_hours(l).used == 2.0
+    @test asked[] == 0
+    # ...and not for a job that was only ever seen waiting.
+    l, ch = run_as(:limit, id -> 42.0; state=:pending)
+    @test ch.billed_by == "estimate" && ch.seconds_billed < 3600.0
+    # A row keeps the rule it was counted by through the file: a ledger continued under
+    # another rule shows which rows were counted how.
+    SweepRunner.save_ledger(l)
+    @test Ledger(l.path).jobs["1"]["billed_by"] == "estimate"
+    # A job with no time limit (one the scheduler lists as unlimited, adopted by name) cannot
+    # be counted by its limit, and is not recorded as if it had been.
+    nolimit = _jb_ledger()
+    free = [JobState("9", "t-a", "a", :running, 2, Inf, 10.0)]
+    SweepRunner.observe!(nolimit, free; now=100.0, names=Set(["t-a"]))
+    @test nolimit.jobs["9"]["time_limit"] == Inf
+    SweepRunner.observe!(nolimit, JobState[]; now=200.0, gone=id -> true, bill=:limit)
+    ch = only(
+        SweepRunner.observe!(nolimit, JobState[]; now=400.0, gone=id -> true, bill=:limit)
+    )
+    @test ch.billed_by == "estimate" && ch.seconds_billed == 310.0
+    @test_throws ArgumentError SweepRunner.observe!(_jb_ledger(), JobState[]; bill=:points)
+    @test_throws ArgumentError JobPolicy(;
+        name="t", partitions=[_jb_part()], budget_node_hours=1.0, bill=:points
+    )
+    @test JobPolicy(; name="t", partitions=[_jb_part()], budget_node_hours=1.0).bill ===
+        :estimate
+    # A centre that charges the time used: what the accounting gives.
+    run_it = elapsed -> run_as(:elapsed, elapsed)
+    # Without an answer: the most it can have run since it was last seen (10 s + 300 s).
+    l, ch = run_it(id -> nothing)
+    @test ch.seconds_billed == 310.0
+    @test asked[] == 1                                           # asked once, at the end
+    # With one: that, also when it is less than what the queue last showed plus the wait.
+    # ...and it is not recorded as the `:estimate` rule: the accounting's time was asked for
+    # and there was none.
+    @test ch.billed_by == "estimate_no_accounting" && ch.elapsed_err == ""
+    l, ch = run_it(id -> 42.0)
+    @test ch.seconds_billed == 42.0
+    @test ch.billed_by == "accounting"
+    @test l.jobs["1"]["elapsed"] == 42.0
+    @test node_hours(l).used == 2 * 42.0 / 3600
+    # An answer that is not a time, or a question that throws, changes nothing.
+    @test run_it(id -> NaN)[2].seconds_billed == 310.0
+    ch = run_it(id -> error("sacct is down"))[2]
+    @test ch.seconds_billed == 310.0
+    # ...and the estimate does not pass for a measurement: which it was, and why.
+    @test ch.billed_by == "estimate_no_accounting"
+    @test occursin("sacct is down", ch.elapsed_err)
+    # The command and what is read from it.
+    answers = Dict{String,Any}("sacct" => "30\n")
+    seen = Cmd[]
+    s = SlurmScheduler(; user="me", run=cmd -> (push!(seen, cmd); answers[cmd.exec[1]]))
+    @test SweepRunner.job_elapsed(s, "7") == 30.0
+    @test last(seen).exec == ["sacct", "-n", "-X", "-P", "-j", "7", "-o", "ElapsedRaw"]
+    for out in ("", "\n", "Unknown\n", "-5\n")
+        answers["sacct"] = out
+        @test SweepRunner.job_elapsed(s, "7") === nothing
+    end
+    # The command failing is not "no time": it throws, like `job_gone`, for the caller to say.
+    answers["sacct"] = nothing
+    @test_throws ErrorException SweepRunner.job_elapsed(s, "7")
+    @test SweepRunner.job_elapsed(MockScheduler(), "7") === nothing
+end
+
+# A scheduler whose accounting also says how long a job ran — or cannot be asked.
+struct _JbTimed <: SweepRunner.Scheduler
+    inner::MockScheduler
+    elapsed::Base.RefValue{Any}
+end
+SweepRunner.submit(s::_JbTimed, spec::JobSpec) = SweepRunner.submit(s.inner, spec)
+SweepRunner.job_states(s::_JbTimed) = SweepRunner.job_states(s.inner)
+SweepRunner.job_gone(s::_JbTimed, id::AbstractString) = SweepRunner.job_gone(s.inner, id)
+function SweepRunner.job_elapsed(s::_JbTimed, ::AbstractString)
+    e = s.elapsed[]
+    return e isa Exception ? throw(e) : e
+end
+
+@testset "the controller bills from the accounting, and says when it had to estimate" begin
+    ended_with =
+        (elapsed; bill=:elapsed, running=false) -> begin
+            outdir = mktempdir()
+            sched = _JbTimed(MockScheduler(), Ref{Any}(elapsed))
+            ctl = JobController(
+                sched,
+                _jb_policy([_jb_part(; max_jobs=1)]; dry_run=false, bill=bill),
+                outdir,
+            )
+            manage!(ctl, _jb_work(100, 60000))
+            if running
+                # The queue shows it running, ten seconds in, before it goes.
+                j = only(sched.inner.jobs)
+                sched.inner.jobs[1] = JobState(
+                    j.id, j.name, j.partition, :running, j.nodes, j.time_limit, 10.0
+                )
+                manage!(ctl, _jb_work(0))
+            end
+            empty!(sched.inner.jobs)                                 # it ended
+            floor = SweepRunner._ENDED_MIN_ABSENT[]
+            SweepRunner._ENDED_MIN_ABSENT[] = 0.3
+            try
+                manage!(ctl, _jb_work(0))
+                sleep(0.35)
+                manage!(ctl, _jb_work(0))
+            finally
+                SweepRunner._ENDED_MIN_ABSENT[] = floor
+            end
+            ev = _jb_events(outdir)
+            return ctl, only([e for e in ev if e.kind == "job_ended"]), ev
+        end
+    ctl, ended, ev = ended_with(42.0)
+    @test ended.seconds_billed == 42 && ended.billed_by == "accounting"
+    @test node_hours(ctl.ledger).used == 2 * 42.0 / 3600         # two nodes
+    @test !any(e -> e.kind == "job_elapsed_failed", ev)
+    ctl, ended, ev = ended_with(ErrorException("sacct failed for job 1001"))
+    @test ended.billed_by == "estimate_no_accounting"
+    @test 0 < ended.seconds_billed < 30                          # about the 0.4 s it took
+    failed = only([e for e in ev if e.kind == "job_elapsed_failed"])
+    @test collect(String, failed.ids) == [String(ended.id)]
+    @test occursin("sacct failed", failed.err)
+    # No time from the accounting: an estimate, and nothing failed.
+    ctl, ended, ev = ended_with(nothing)
+    @test ended.billed_by == "estimate_no_accounting"
+    @test !any(e -> e.kind == "job_elapsed_failed", ev)
+    # A policy that does not ask for the accounting's time does not get it, and an
+    # accounting that cannot be asked is then nobody's failure.
+    ctl, ended, ev = ended_with(42.0; bill=:estimate)
+    @test ended.billed_by == "estimate" && 0 < ended.seconds_billed < 30
+    ctl, ended, ev = ended_with(ErrorException("sacct failed"); bill=:estimate)
+    @test !any(e -> e.kind == "job_elapsed_failed", ev)
+    # The policy's rule reaches the ledger through the controller: a job seen running counts
+    # its whole limit (half an hour on two nodes) under `:limit`, and the row says so.
+    ctl, ended, ev = ended_with(42.0; bill=:limit, running=true)
+    @test ended.billed_by == "limit" && ended.seconds_billed == 1800
+    @test node_hours(ctl.ledger).used == 1.0
+    @test only(values(ctl.ledger.jobs))["billed_by"] == "limit"
 end
