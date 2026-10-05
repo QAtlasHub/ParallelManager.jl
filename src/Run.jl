@@ -2733,8 +2733,9 @@ function _run_loop!(
     vault::Vault,
     keys::AbstractVector{DataKey};
     opts::RunOpts=RunOpts(),
-    max_empty_rounds::Int=3,
-    idle_sleep::Float64=30.0,
+    max_empty_rounds::Integer=3,
+    # A number of seconds, as one writes it: `idle_sleep = 5` used to be a `TypeError`.
+    idle_sleep::Real=30.0,
     load=nothing,
     prerequisite=nothing,
     affinity=nothing,
