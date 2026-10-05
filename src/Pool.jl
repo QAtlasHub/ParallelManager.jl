@@ -105,8 +105,10 @@ job step sees the STEP's `--mem` in `SLURM_MEM_PER_NODE`, not the node's: pass
 `mem_per_node_mb`, or set `SWEEPRUNNER_MEM_PER_NODE_MB`, to the allocation's figure.
 
 The defaults (4 GB of headroom, the `srun` reservation, 3 GB for the master) are the values the
-downstream pool this was moved from uses; nothing in this repository measures them, and the
-spawner has not been run on a cluster from here.
+downstream pool this was moved from uses on one cluster; they are not derived from anything
+general. On the one cluster this spawner has been run on, a master of 511 workers peaked at
+5 GB — above the default 3: set `master_gb` (and the others) for the nodes and the pool size at
+hand.
 """
 struct SlurmStepSpawner <: Spawner
     nodes::Vector{PoolNode}
@@ -394,7 +396,7 @@ end
 
 # How long no worker may have left, after all were asked to, before what launched the rest is
 # killed.
-const _LEAVE_GRACE = Ref(5.0)
+const _LEAVE_GRACE = 5.0
 
 # Remove many workers at the end of a run, together: all are asked to leave in one call, and
 # what launched those that have not left is killed, all at once. (One after the other — ask,
@@ -405,6 +407,9 @@ const _LEAVE_GRACE = Ref(5.0)
 # for `_LEAVE_GRACE` seconds the rest are not going to — one that does not answer must not hold
 # the others' launchers for the whole of `waitfor`, which is how long `rmprocs` waits for all
 # of them, holding Distributed's worker lock.
+#
+# One deadline, `waitfor` from the start, covers the asking, the kills and the last look: with
+# a worker that neither leaves nor has a launcher to kill it returns then, not twice as late.
 #
 # Returns the ids that are still there: a launcher still running, or — with no handle on what
 # launched it — a worker Distributed does not have as terminated. The caller must not count
@@ -420,16 +425,16 @@ function _kill_workers!(ids::AbstractVector{<:Integer}; waitfor::Real=30)
         # Some did not leave when asked: what launched them is killed below.
     end
     running() = count(p -> p isa Base.Process && process_running(p), launchers)
-    t0 = time()
-    left_at, n = t0, running()
-    while !istaskdone(asking) && time() - t0 < waitfor
+    deadline = time() + waitfor
+    left_at, n = time(), running()
+    while !istaskdone(asking) && time() < deadline
         sleep(0.05)
         m = running()
         m < n && ((n, left_at) = (m, time()))
-        time() - left_at >= _LEAVE_GRACE[] && break
+        time() - left_at >= _LEAVE_GRACE && break
     end
     asyncmap(p -> _terminate!(p; settle=true), launchers; ntasks=256)
-    timedwait(() -> istaskdone(asking), Float64(waitfor); pollint=0.05)
+    timedwait(() -> istaskdone(asking), max(deadline - time(), 0.0); pollint=0.05)
     left = Int[]
     for (id, p) in zip(ids, launchers)
         # (Not `id in procs()`: a worker asked to leave is out of that list at once.)
@@ -637,8 +642,10 @@ end
 const _POOL_MAX_FAILS = 10
 
 # The most workers one master holds under Slurm when the cluster's limit cannot be read: each
-# worker is an srun client on the master's node. Downstream ran at 1500 after a master that
-# planned 3735 stalled, without a message, at 1782.
+# worker is an srun client on the master's node. The number is one observation on one cluster
+# (a master that planned 3735 stalled, without a message, at 1782, and ran at 1500), kept as a
+# cap because an unknown limit must not be no limit — it is not a property of Slurm. Where the
+# limit can be read it is used instead, and `max_workers` / `SWEEPRUNNER_MAX_WORKERS` override.
 const _POOL_SLURM_CAP = 1500
 
 """
@@ -668,8 +675,9 @@ when the `run!` / `run_loop!` it was given to returns, unless `keep=true` (then 
 - `mem_growth` — a key whose worker died is retried with this much more memory (up to what a
   node has), at most the dispatcher's death bound times. Must be > 1.
 - `max_workers` — the most workers this pool holds at once. Under Slurm it defaults to the
-  per-master limit ([`srun_worker_limit`](@ref), else 1500): past it workers neither join nor
-  fail. Reaching it is logged once (`pool_at_limit`).
+  per-master limit ([`srun_worker_limit`](@ref), else 1500 — one cluster's observation, kept
+  as a cap for when the limit cannot be read): past it workers neither join nor fail. Reaching
+  it is logged once (`pool_at_limit`).
 
 A node whose starts bring no worker, or whose workers cannot be readied, five times in a row
 over at least a minute is taken out (`pool_node_out`) and tried once more five minutes later
@@ -1568,8 +1576,9 @@ for, up to `wait` seconds, and remove their own workers when they land. `run!` /
 it when they return, unless the pool was made with `keep=true`.
 
 The workers are removed together: all are asked to leave, and what launched those that have
-not left is killed once none has left for five seconds; the whole takes at most about `waitfor`
-seconds however many there are.
+not left is killed once none has left for five seconds. That takes at most `waitfor` seconds
+plus the kills themselves (up to ten more), however many workers there are, after the `wait`
+for starts in flight.
 Returns the workers that are still there after that (none, normally). Those keep their room in
 the pool and are said — a `pool_kill_failed` event when a `log` is given, a warning otherwise:
 a worker that could not be removed is on its cores until the job ends.
@@ -1589,10 +1598,7 @@ function shutdown!(
     end
     for pid in left
         w = pool.workers[pid]
-        if log === nothing
-            @warn "SweepRunner: a pool worker could not be removed; it keeps its cores until the job ends" worker =
-                pid node = w.node cores = w.size.cores
-        else
+        if log !== nothing
             log_event(
                 log,
                 :pool_kill_failed;
@@ -1605,6 +1611,10 @@ function shutdown!(
             )
         end
     end
+    # Without a log: one line for all of them, not one each.
+    (log === nothing && !isempty(left)) &&
+        @warn "SweepRunner: $(length(left)) pool worker(s) could not be removed; they keep their cores until the job ends" workers =
+            left
     note_workers!(; planned=length(left), launched=length(left))
     return left
 end

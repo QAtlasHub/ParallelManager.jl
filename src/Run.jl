@@ -1971,13 +1971,17 @@ function _round_adopt!(r::Round)
         catch e2
             e2 isa InterruptException && rethrow()
         end
+        # Only the workers that did not get a dispatch task: the throw can have come after
+        # some of them were started (`_round_start!`), and a worker that is running a key is
+        # not one that could not be readied.
         if !r.done
             for p in todo
+                p in r.started && continue
                 try
                     _round_give_up_on!(r, p)
                 catch e3
                     e3 isa InterruptException && rethrow()
-                    push!(r.rejected, p)                 # left out, whatever telling the pool did
+                    _round_left_out!(r, p, e3)
                 end
             end
         end
@@ -2053,6 +2057,26 @@ function _round_start!(r::Round, ready::Vector{Int}, late::Bool)
         push!(r.tasks, t)
     end
     (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
+    return nothing
+end
+
+# Giving up on `pid` threw (telling the pool did). It is left out of the round all the same,
+# and the pool must not go on counting it as a worker it has: one that is neither given work
+# nor retired looks like idle room, and nothing is started in its place.
+function _round_left_out!(r::Round, pid::Int, err)
+    push!(r.rejected, pid)
+    _guarded() do
+        return log_event(
+            r.log,
+            :workers_rejected;
+            level=:warn,
+            stage=r.stage,
+            n=1,
+            err="worker $pid is left out of the round, and giving up on it failed: " *
+                _short_err(err),
+        )
+    end
+    r.pool === nothing || _guarded(() -> _pool_retire!(r.pool, pid, r.log, r.stage))
     return nothing
 end
 
@@ -2667,6 +2691,9 @@ more work to do. This is the infra equivalent of FiniteTemperature.jl's
 
 The loop exits when:
 - a round leaves no key undone (`remaining == 0`), at once, or
+`idle_sleep` is any finite number of seconds >= 0 and `max_empty_rounds` any integer >= 1;
+anything else is an `ArgumentError` before a round runs.
+
 - `max_empty_rounds` consecutive rounds produce zero new completions AND leave nothing held by a
   sibling (once the busy budget below is spent, rounds with keys still held count as empty
   too, so the return with `busy > 0` comes `max_empty_rounds` rounds after it, not at once), or
@@ -2737,8 +2764,18 @@ function run_loop!(
     try
         return _run_loop!(work_fn, vault, keys; pool=pool, kwargs...)
     finally
-        # Whatever way the loop ended, the pool's workers do not outlive it.
-        (pool !== nothing && !pool.keep) && shutdown!(pool)
+        # Whatever way the loop ended, the pool's workers do not outlive it. Guarded: a
+        # removal that throws must not replace the error the loop is ending with. And with the
+        # master's event log: a worker that could not be removed is an event
+        # (`pool_kill_failed`), not only a line on stderr.
+        if pool !== nothing && !pool.keep
+            log = EventLog(
+                joinpath(vault.outdir, "events_$(gethostname())_$(getpid()).jsonl")
+            )
+            _guarded(log, "shutdown_pool") do
+                return shutdown!(pool; log=log, stage=Symbol(vault.run))
+            end
+        end
     end
 end
 
@@ -3153,7 +3190,6 @@ function _default_cost(vault::Vault, cost, key_class, todo, log::EventLog, stage
     return measured_cost(table, k -> _class_of(key_class, k); fallback=fallback)
 end
 
-# The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
 # The next key for a pool's worker: one that uses more than half of the worker (cores or
 # memory) if any is queued, else any it can hold.
 function _next_for_pool!(table::TaskTable, worker::Int, fits, pool, deadline, min_time)
@@ -3161,6 +3197,8 @@ function _next_for_pool!(table::TaskTable, worker::Int, fits, pool, deadline, mi
     i = _next_fitting!(table, worker, fits; accept=accept(true))
     return i === nothing ? _next_fitting!(table, worker, fits; accept=accept(false)) : i
 end
+
+# The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
 
 function _next_fitting!(table::TaskTable, worker::Int, fits; accept=nothing)
     while true

@@ -1252,9 +1252,12 @@ end
             @test only([e.pid for e in ev if e.kind == "observe_failed"]) == 99_999
             # Without observation the others are still told to forget before the failure is
             # the caller's.
+            token = p -> remotecall_fetch(SweepRunner._observation_token, p, v)
+            @test all(p -> token(p) !== nothing, pids)
             @test_throws Exception SweepRunner._observe_late!(
                 v, vcat(pids, 99_999), false, log, :pl
             )
+            @test all(p -> token(p) === nothing, pids)           # every one of them forgot
             # The master is observed once, as the master: with no workers yet `workers()` is
             # `[1]`, and it used to be observed a second time as a worker of itself.
             own = [e for e in _pl_events(outdir) if e.kind == "observed" && e.pid == 1]
@@ -1338,14 +1341,20 @@ end
             pool.workers[id] = SweepRunner.PoolWorker(
                 gethostname(), KeyReq(1, 1.0), 0.0, false
             )
-            # The worker is inside something that does not yield: it cannot answer.
-            remote_do(() -> Libc.systemsleep(60), id)
-            sleep(1.0)
+            # The worker is inside something that does not yield: it cannot answer. It says
+            # when it is about to go in, so the test does not ask it to leave before that.
+            entered = joinpath(outdir, "entered")
+            remote_do((f -> (touch(f); Libc.systemsleep(60))), id, entered)
+            @test timedwait(() -> isfile(entered), 30.0) === :ok
+            sleep(0.3)
             try
                 # With no handle on what launched it, it can only be asked — and it stays.
                 SweepRunner._LAUNCHER_OF[] = i -> nothing
-                left = shutdown!(pool; wait=1, waitfor=2, log=log, stage=:pl)
+                # ...within the one deadline: `waitfor` covers the asking and the last look
+                # together, not each.
+                t = @elapsed left = shutdown!(pool; wait=0, waitfor=4, log=log, stage=:pl)
                 @test left == [id]
+                @test t < 7
                 @test haskey(pool.workers, id)                   # its room is not given back
                 said = only([e for e in _pl_events(outdir) if e.kind == "pool_kill_failed"])
                 @test said.worker == id

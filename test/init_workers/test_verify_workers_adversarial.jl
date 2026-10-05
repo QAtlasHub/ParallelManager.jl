@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Adversarial tests for verify_workers! and init_workers! probing.
 #
-# These tests reproduce the ISSP production scenario that the original
+# These tests reproduce a production scenario (seen on one cluster) that the original
 # "happy path" tests missed: compute.jl loads SweepRunner on the
 # master, addprocs() spawns workers that do NOT have SweepRunner
 # loaded, then calls init_workers!(verbose=true) which invokes
@@ -27,7 +27,7 @@ using Distributed, LinearAlgebra
     @test nprocs() == 1
 
     # Spawn 2 workers with ONLY the current project — critically, we do
-    # NOT `@everywhere using SweepRunner`. This mirrors the ISSP
+    # NOT `@everywhere using SweepRunner`. This mirrors that
     # Slurm case where init_workers! adds SlurmManager workers before
     # compute.jl could possibly have loaded anything on them.
     project = dirname(Base.active_project())

@@ -439,9 +439,14 @@ the unit goes on (`lock_unreadable`); the commit's own owner check decides.
 ### Workers that arrive late
 
 At the same cadence the master adopts workers that joined since the round
-began (`workers_joined`), after loading the modules named by `load=` on them.
-A pool that is still ramping up when `run!` is called is used as it arrives,
-not from the next round.
+began (`workers_joined`), after readying them: loading the modules named by
+`load=` and observing the sources on each. That is done for all of them at
+once, in a task beside the ticker — it takes seconds per worker on a shared
+file system, and requests and stops are still read meanwhile. A worker that
+cannot be readied is tried three times and then left out (`workers_rejected`);
+a round that ends while workers are being readied does not take them. A pool
+that is still ramping up when `run!` is called is used as it arrives, not from
+the next round.
 
 ### Limits
 
@@ -650,12 +655,11 @@ What keeps that check from passing on an under-count:
   it was last seen running and its time limit has passed. Evidence that the
   wrong cluster would give too — half an hour of answers listing none of the
   ledger's jobs, or of the accounting calling it live while the queue does
-  not list it — is marked `weak` and logged as a warning. A job whose end the
-  accounting confirmed is billed the time the accounting gives for it (`sacct
-  -o ElapsedRaw`); any other, or one the accounting has no time for, is billed
-  what it can have run since it was last seen, up to its limit. `job_ended`
-  says which (`billed_by`), and an accounting that could not be asked for the
-  time is logged as `job_elapsed_failed`. A job in any listed state
+  not list it — is marked `weak` and logged as a warning. What an ended job
+  then counts for is the policy's `bill` rule (below); `job_ended` and the
+  ledger row say which was applied (`billed_by`), and under `bill = "elapsed"`
+  an accounting that could not be asked for the time is logged as
+  `job_elapsed_failed`. A job in any listed state
   (`CONFIGURING`, `COMPLETING`, `SUSPENDED`, …) exists; one that reappears is
   live again.
 - An answer that lists none of the ledger's live jobs — empty, another
@@ -1084,6 +1088,8 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
 
 - The pool's workers are removed when the `run!` / `run_loop!` it was given
   to returns (`keep = true` keeps them; then call `SweepRunner.shutdown!`).
+  They are removed together; a worker that cannot be removed keeps its room,
+  is logged (`pool_kill_failed`) and is in what `shutdown!` returns.
 - The pool follows requests to the master (guide 11): nothing is started
   while it is paused or stopping, a drained node gets no new worker, and a
   `resize` target caps the pool.
@@ -1093,7 +1099,8 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
 - **The per-master limit.** Under Slurm every worker is an `srun` client on
   the master's node. The pool holds at most `max_workers`:
   `SWEEPRUNNER_MAX_WORKERS`, else the cluster's `SrunPortRange`, else 1500
-  when that cannot be read — an unknown limit is a cap, not no cap. Which
+  when that cannot be read — an unknown limit is a cap, not no cap (the 1500
+  is what one cluster showed, not a property of Slurm: set it for yours). Which
   one it used is logged (`pool_limit`), and reaching it is logged once
   (`pool_at_limit`). Past it, run several masters on node groups:
   `SWEEPRUNNER_NODELIST=<group>` (and `SWEEPRUNNER_MEM_PER_NODE_MB=<the

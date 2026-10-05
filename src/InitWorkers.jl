@@ -302,7 +302,7 @@ function _slurm_addprocs(launch_timeout::Float64, exeflags)
 end
 # What `init_workers!` calls to start them. A `Ref` so a test can see the environment `srun`
 # would be started in without a scheduler.
-const _SLURM_LAUNCH = Ref{Any}(nothing)
+const _SLURM_LAUNCH = Ref{Union{Nothing,Function}}(nothing)
 
 # The environment `srun` is started in for the `:slurm` backend's workers.
 function _slurm_launch_env(n_workers::Integer, worker_timeout, env=ENV)

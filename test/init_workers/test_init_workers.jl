@@ -107,7 +107,10 @@ end
     @test Dict(SweepRunner._slurm_launch_env(4, 60, mine))["SLURM_KILL_BAD_EXIT"] == "1"
     # ...and it is what `init_workers!` starts `srun` in: the launch is stood in for, and
     # reads the environment it is called in.
-    if nprocs() == 1
+    # (`init_workers!` starts nothing when workers are already there: none may be.)
+    nprocs() > 1 && rmprocs(workers())
+    @test nprocs() == 1
+    let
         seen = Ref{Any}(nothing)
         SweepRunner._SLURM_LAUNCH[] =
             (timeout, flags) -> begin

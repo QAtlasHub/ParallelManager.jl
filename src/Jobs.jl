@@ -33,6 +33,17 @@ What job management needs from a batch system. A backend implements
 - `remaining_time(s, id) -> Union{Float64,Nothing}` — seconds left, `nothing` when unknown;
 - `shrink(s, id, nodes) -> Bool` — give nodes back, `false` where the scheduler cannot.
 
+and may implement, where the batch system has an accounting to ask:
+
+- [`job_gone`](@ref)`(s, id) -> Union{Bool,Nothing}` — has a job the queue no longer lists
+  ended;
+- [`job_elapsed`](@ref)`(s, id) -> Union{Float64,Nothing}` — how long an ended job ran.
+
+For those two, **`nothing` means "the accounting has no answer" and a command that failed is
+an exception**: the controller logs a failure (`job_gone_failed`, `job_elapsed_failed`) and
+takes `nothing` as no evidence. A backend that returned `nothing` or `false` for a failed
+command would hide an accounting that is down. `remaining_time` and `shrink` do not throw.
+
 [`SlurmScheduler`](@ref) and [`MockScheduler`](@ref) are the two provided.
 """
 abstract type Scheduler end
@@ -462,10 +473,12 @@ go to; nothing here was derived from any centre's regulations.
 - `:elapsed`: the time the scheduler's accounting gives for it ([`job_elapsed`](@ref)), when the
   accounting has confirmed its end and has a time; the estimate otherwise. For a centre that
   charges the time used.
-- `:limit`: its whole time limit, once it has been seen running. For a centre that charges the
-  time asked for.
+- `:limit`: its whole time limit, once it has been seen running (a job with no limit counts as
+  estimated). For a centre that charges the time asked for.
 
-A live job always counts its whole limit as committed.
+A live job always counts its whole limit as committed. Each ended row records the rule it was
+counted by (`billed_by`): changing `bill` on a ledger that already has rows leaves the old ones
+as they were counted, and the file shows which is which.
 """
 struct JobPolicy
     name::String
@@ -957,8 +970,9 @@ answer (the default). May throw when the accounting cannot be asked: that is log
 (`job_elapsed_failed`) and the job counts as estimated.
 
 Asked only under `JobPolicy(bill = :elapsed)`, for a job whose end the accounting has confirmed
-([`job_gone`](@ref), on two polls). The `job_ended` event says which rule a job was counted by
-(`billed_by`: `accounting`, `limit` or `estimate`).
+([`job_gone`](@ref), on two polls). The `job_ended` event and the ledger row say which rule a job
+was counted by (`billed_by`: `accounting`, `limit`, `estimate`, `estimate_no_accounting` when
+`:elapsed` was asked for and the accounting gave no time, or `none` for a job that never ran).
 """
 job_elapsed(::Scheduler, ::AbstractString) = nothing
 
@@ -987,8 +1001,9 @@ Bring the ledger up to what the scheduler says, and return what changed
 - A job that has ended counts, by `bill` (see [`JobPolicy`](@ref)): for what it can have run
   since it was last seen, up to its time limit (`:estimate`); for the time `elapsed(id)` gives
   when the accounting confirmed its end (`:elapsed`); or for its whole limit once it has run
-  (`:limit`). Each `:ended` change says which rule was applied (`billed_by`) and carries the
-  error of an `elapsed` that threw (`elapsed_err`). A job that reappears is live again.
+  (`:limit`). Each `:ended` change, and the row, say which rule was applied (`billed_by`: see
+  [`job_elapsed`](@ref)); the change carries the error of an `elapsed` that threw
+  (`elapsed_err`). A job that reappears is live again.
 - A row still `submitting` (the controller did not learn the id) takes the id of a listed job
   with its name that the ledger does not have yet.
 """
@@ -1054,6 +1069,8 @@ function observe!(
                         was="submitting",
                         polls_missed=j["missing"],
                         seconds_billed=0.0,
+                        billed_by="none",
+                        elapsed_err="",
                     ),
                 )
                 j["state"] = "ended"
@@ -1114,9 +1131,15 @@ function observe!(
         evidence === nothing && continue
         j["ended"] = true
         billed = 0.0
-        billed_by = "estimate"
+        # Which rule a row was counted by — said in the event AND kept in the row, so that a
+        # ledger counted by one rule and continued under another can be seen in the file.
+        # `none`: it never ran. `estimate_no_accounting`: the policy asked for the accounting's
+        # time and there was none (end not confirmed by it, no answer, or the question failed)
+        # — an estimate, and not the same thing as a policy that asks for estimates.
+        billed_by = "none"
         elapsed_err = ""
         if j["state"] != "submitting"
+            billed_by = bill === :elapsed ? "estimate_no_accounting" : "estimate"
             # It ran, at most, from when it was last seen until now.
             before = Float64(j["elapsed"])
             j["elapsed"] = min(Float64(j["time_limit"]), before + max(since, 0.0))
@@ -1126,10 +1149,11 @@ function observe!(
             # function's to assume. Which one a job was counted by is recorded, and a question
             # that failed is returned for the caller to say: an estimate counts against the
             # budget like a measurement and must not look like one.
-            if bill === :limit && (j["state"] == "running" || before > 0)
-                # The time it asked for, once it has run at all.
-                isfinite(Float64(j["time_limit"])) &&
-                    (j["elapsed"] = Float64(j["time_limit"]))
+            limit = Float64(j["time_limit"])
+            if bill === :limit && isfinite(limit) && (j["state"] == "running" || before > 0)
+                # The time it asked for, once it has run at all. (A job with no limit has
+                # nothing to be counted by but the estimate, and is recorded as that.)
+                j["elapsed"] = limit
                 billed_by = "limit"
             elseif bill === :elapsed && confirmed
                 # The time the accounting, having confirmed that it is over, gives for it.
@@ -1147,6 +1171,7 @@ function observe!(
             end
             billed = j["elapsed"]
         end
+        j["billed_by"] = billed_by
         push!(
             changes,
             (;
@@ -1190,6 +1215,8 @@ function observe!(
                 was=String(u.state),
                 polls_missed=0,
                 seconds_billed=u.elapsed,
+                billed_by="",
+                elapsed_err="",
             ),
         )
     end
@@ -1579,13 +1606,13 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
             was=c.was,
             polls_missed=c.polls_missed,
             seconds_billed=c.seconds_billed,
-            billed_by=get(c, :billed_by, "estimate"),
+            billed_by=c.billed_by,
             dry_run=dry,
         )
     end
     # The accounting confirmed these ends and could not be asked for how long they ran: they
     # were billed an estimate. Said once a round, like a failing `job_gone`.
-    unasked = [c for c in changes if !isempty(get(c, :elapsed_err, ""))]
+    unasked = [c for c in changes if !isempty(c.elapsed_err)]
     isempty(unasked) || log_event(
         ctl.log,
         :job_elapsed_failed;

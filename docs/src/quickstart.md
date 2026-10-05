@@ -127,7 +127,9 @@ go to one log per master, `out/events_<host>_<pid>.jsonl`
 
 ## SLURM
 
-Use `templateHPC.jl`'s `batch/issp-example.sh` as the baseline. The Julia
+A batch script is the centre's business — partitions, limits, modules and
+accounting differ from one to the next. `templateHPC.jl`'s
+`batch/issp-example.sh` is one centre's, to adapt, not a baseline. The Julia
 side looks like:
 
 ```julia
