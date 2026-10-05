@@ -1356,3 +1356,75 @@ end
         @test SweepRunner.cli(["pause", outdir, "--wait", "-1"]; io=IOBuffer()) == 2
     end
 end
+
+# ── fifth review (#181) ──────────────────────────────────────────────────────────────────────────
+
+@testset "workers: asked to leave is not gone — a worker with no launcher handle keeps its lock (#181)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            target = ks[1]
+            long = ParamIO.canonical(target)
+            sel = Dict(String(n) => val for (n, val) in target.params)
+            # A unit that does not yield: the worker never reads the request to exit.
+            work = k -> begin
+                if ParamIO.canonical(k) == long
+                    t0 = time()
+                    while time() - t0 < 150
+                    end
+                end
+                return Dict{String,Any}("x" => 1)
+            end
+            # A cluster manager that gives no process handle: the master can only ASK. The
+            # real kill runs (it is not replaced), and the real process is kept for the end.
+            real = Dict(p => SweepRunner._launcher(p) for p in workers())
+            SweepRunner._LAUNCHER_OF[] = pid -> nothing
+            SweepRunner._CUT_RETRY[] = 0.2
+            try
+                t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
+                t0 = time()
+                while !DataVault.is_running(v, target) && time() - t0 < 60
+                    sleep(0.05)
+                end
+                owner = DataVault.running_owner(v, target)
+                control!(v, :stop; select=sel, grace=0.2)
+                @test timedwait(() -> istaskdone(t), 120.0) === :ok
+                err = try
+                    fetch(t)
+                    nothing
+                catch e
+                    e isa TaskFailedException ? e.task.exception : e
+                end
+                @test err isa ErrorException && occursin("could not be removed", err.msg)
+                # It was asked to leave, so Distributed no longer lists it — and it is still
+                # computing. The lock is its own, and nobody else takes the key.
+                @test DataVault.is_running(v, target)
+                @test DataVault.running_owner(v, target) == owner
+                cuts = [e for e in _ct_events(outdir) if e.kind == "key_cut"]
+                @test !isempty(cuts)
+                @test all(e -> e.worker_removed == false && e.lock_released == false, cuts)
+                @test count(e -> e.kind == "lock_kept", _ct_events(outdir)) == 1
+                SweepRunner._release_all_at_exit()
+                @test DataVault.running_owner(v, target) == owner
+                # The process is in fact there.
+                @test any(p -> p isa Base.Process && process_running(p), values(real))
+            finally
+                SweepRunner._LAUNCHER_OF[] = nothing
+                SweepRunner._CUT_RETRY[] = 5.0
+                for p in values(real)
+                    p isa Base.Process && process_running(p) && kill(p, Base.SIGKILL)
+                end
+                empty!(SweepRunner._KEPT_WORKERS)
+            end
+        end
+    end
+end
+
+@testset "_worker_dead: the launcher's exit, or Distributed's word that it terminated (#181)" begin
+    p = run(`sleep 30`; wait=false)
+    @test SweepRunner._worker_dead(4242, p) == false             # its launcher is running
+    kill(p)
+    wait(p)
+    @test SweepRunner._worker_dead(4242, p) == true
+    @test SweepRunner._worker_dead(987654, nothing) == true      # Distributed does not know it
+end

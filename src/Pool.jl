@@ -370,49 +370,82 @@ end
 # for memory under a running key left the master's remote call waiting for minutes, the worker
 # still counted busy.
 function _worker_gone(id::Integer, live)::Bool
-    id in live || return true
-    p = _launcher(id)
-    return p isa Base.Process && process_exited(p)
+    # Its process, not its place in `procs()` (`live`): a worker that was asked to leave is out
+    # of that list at once, and its room is not free until it has gone (see `_worker_dead`).
+    return _worker_dead(id, something(_LAUNCHER_OF[], _launcher)(id))
 end
 
 # Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
 # cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
 # a job step dies with its srun client.
 function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
-    p = _launcher(id)
+    p = something(_LAUNCHER_OF[], _launcher)(id)
     if hard
         # For a worker known to be busy (a cut, a master on its way out): asking first is
         # seconds of waiting behind Distributed's worker lock, one worker at a time, during
-        # which the unit goes on — and, in a cut, can return and take its next key. What
-        # launched it is killed at once, and Distributed is told without waiting.
-        try
-            if p isa Base.Process && process_running(p)
-                kill(p)                      # SIGTERM: an `srun` client takes its step with it
-                timedwait(() -> !process_running(p), 1.0; pollint=0.02) === :ok ||
-                    kill(p, Base.SIGKILL)
+        # which the unit goes on — and, in a cut, can return and take its next key.
+        if p isa Base.Process
+            # What launched it is killed. Distributed notices the dropped connection by itself:
+            # `rmprocs` is NOT called. (`rmprocs(waitfor=0)` is not "do not wait": it holds
+            # Distributed's worker lock until the worker has terminated, and with it every
+            # later `addprocs` and `rmprocs` in this process.)
+            try
+                if process_running(p)
+                    kill(p)                  # SIGTERM: an `srun` client takes its step with it
+                    timedwait(() -> !process_running(p), 5.0; pollint=0.02) === :ok ||
+                        kill(p, Base.SIGKILL)
+                end
+            catch e
+                e isa InterruptException && rethrow()
             end
-        catch
+            timedwait(() -> process_exited(p), Float64(waitfor); pollint=0.02)
+        else
+            # No handle on what launched it: it can only be asked. In a task of its own, with a
+            # bound, so that a worker that does not answer does not hold the worker lock.
+            @async try
+                rmprocs(id; waitfor=waitfor)
+            catch
+            end
+            timedwait(() -> _worker_dead(id, nothing), Float64(waitfor); pollint=0.02)
         end
-        try
-            id in procs() && rmprocs(id; waitfor=0)
-        catch
-        end
-        # Gone from `procs()` once Distributed has seen the connection drop.
-        timedwait(() -> !(id in procs()), Float64(waitfor); pollint=0.02)
         return nothing
     end
     try
         id in procs() && rmprocs(id; waitfor=waitfor)
-    catch
+    catch e
+        e isa InterruptException && rethrow()
     end
     try
         if p isa Base.Process && process_running(p)
             kill(p)
             timedwait(() -> !process_running(p), 5.0) === :ok || kill(p, Base.SIGKILL)
         end
-    catch
+    catch e
+        e isa InterruptException && rethrow()
     end
     return nothing
+end
+
+"""
+    _worker_dead(id, launcher) -> Bool
+
+Is worker `id`'s PROCESS known to have ended? `launcher` is what started it (taken BEFORE any
+attempt to remove it), or `nothing`.
+
+Positive evidence only: the launcher has exited, or Distributed has the worker as terminated (or
+has forgotten it). `!(id in procs())` is NOT evidence — `procs()` lists connected workers, and
+`rmprocs` marks a worker as terminating, which takes it out of `procs()`, the moment it is ASKED
+to leave, whether or not it ever does. A worker inside a unit that does not yield, on a manager
+that gives no process handle, was "removed" by that reading, and its key's lock was released
+under it.
+"""
+function _worker_dead(id::Integer, launcher)::Bool
+    launcher isa Base.Process && return process_exited(launcher)
+    w = lock(Distributed.worker_lock) do
+        return get(Distributed.map_pid_wrkr, Int(id), nothing)
+    end
+    w === nothing && return true                       # deregistered: it terminated
+    return w isa Distributed.Worker && w.state === Distributed.W_TERMINATED
 end
 
 # ── the planner ─────────────────────────────────────────────────────────────────────────────────
