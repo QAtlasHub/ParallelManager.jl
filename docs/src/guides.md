@@ -768,8 +768,17 @@ N=64                             212   61804.0   94310.5      7   55%    11.72
 `used` is CPU time over wall time over cores: 39% at 4 cores is the number
 that says a key class would run more work per node-hour on fewer threads.
 
-`run_loop!` writes the same table to `<state_root>/costs.json` when it ends,
-so the next job reads measurements instead of a hand-fitted formula:
+A round given a `key_class` or a `pool` keeps the same table in
+`<state_root>/costs.json` (`cost_table = true` keeps it without either,
+`false` never does), so the next job reads measurements instead of a
+hand-fitted formula. Keeping it reads what the master's own event log gained
+during the round and one record file per stage
+(`<state_root>/cost_records.jsonl`) — not the event files under the outdir,
+however many a long campaign has left there. A stage that ran under an
+earlier version has no record file: with up to 200 event files it is built
+from them once, with more it starts empty and says so
+(`cost_table_not_seeded`); `write_cost_table(vault)` is the full rescan that
+brings the history in.
 
 ```julia
 table = SweepRunner.load_cost_table(vault)

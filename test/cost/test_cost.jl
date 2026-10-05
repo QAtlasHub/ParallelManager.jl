@@ -260,3 +260,180 @@ end
     @test key_seconds(x -> error("no model"), k) === nothing
     @test key_seconds(x -> "soon", k) === nothing
 end
+
+# ── a round's end does not read the outdir (#198) ────────────────────────────────────────────────
+
+function _co_events(outdir)
+    return [
+        JSON3.read(l) for f in readdir(outdir) if startswith(f, "events_") &&
+            endswith(f, ".jsonl") &&
+            filesize(joinpath(outdir, f)) > 0 &&
+            (stat(joinpath(outdir, f)).mode & 0o400) != 0 for
+        l in readlines(joinpath(outdir, f))
+    ]
+end
+
+# Event files of other processes and other jobs, as a long campaign leaves them — and not
+# readable, so that anything that opens them fails.
+function _co_foreign_logs(outdir, n)
+    paths = [joinpath(outdir, "events_other_$i.jsonl") for i in 1:n]
+    for p in paths
+        write(p, "{\"kind\":\"key_done\",\"stage\":\"co\",\"key\":\"old\",\"secs\":99}\n")
+        chmod(p, 0o000)
+    end
+    return paths
+end
+
+@testset "a run! that nobody reads a cost table from does not keep one, and reads no event file (#198)" begin
+    _co_vault() do v, outdir
+        ks = DataVault.keys(v)
+        foreign = _co_foreign_logs(outdir, 50)
+        try
+            # One key per `run!`, on this process, with no class and no pool: the shape of a
+            # caller that drives its own workers. Under 0.6.9 each of these reread the outdir.
+            for k in ks
+                r = run!(
+                    k -> Dict{String,Any}("x" => 1),
+                    v,
+                    [k];
+                    opts=RunOpts(; workers=:sequential),
+                )
+                @test r.done == 1
+            end
+            @test !isfile(SweepRunner.cost_table_path(v))
+            @test !isfile(SweepRunner.cost_records_path(v))
+            @test !any(
+                e -> e.kind in ("cost_table_failed", "cost_table_not_seeded"),
+                _co_events(outdir),
+            )
+        finally
+            foreach(p -> chmod(p, 0o600), foreign)
+        end
+    end
+end
+
+@testset "a round keeps the table from its own records, whatever else is under the outdir (#198)" begin
+    _co_vault() do v, outdir
+        ks = DataVault.keys(v)
+        class = k -> "N=$(k.params["N"])"
+        SweepRunner._COST_SEED_MAX_FILES[] = 20
+        foreign = _co_foreign_logs(outdir, 50)                   # more than it will seed from
+        try
+            r = run!(
+                k -> Dict{String,Any}("x" => 1),
+                v,
+                ks[1:2];
+                key_class=class,
+                opts=RunOpts(; workers=:sequential),
+            )
+            @test r.done == 2
+            # Not one of the fifty was opened: the table is there, nothing failed, and the
+            # history that was not read is said once.
+            ev = _co_events(outdir)
+            @test !any(e -> e.kind == "cost_table_failed", ev)
+            said = only([e for e in ev if e.kind == "cost_table_not_seeded"])
+            @test said.event_files >= 50 && said.max == 20
+            @test sum(c.n for c in values(load_cost_table(v))) == 2
+            records = readlines(SweepRunner.cost_records_path(v))
+            @test length(records) == 2
+            # The next round adds its own records to the same file and reads only those.
+            r = run!(
+                k -> Dict{String,Any}("x" => 1),
+                v,
+                ks[3:end];
+                key_class=class,
+                opts=RunOpts(; workers=:sequential),
+            )
+            @test r.done == length(ks) - 2
+            @test length(readlines(SweepRunner.cost_records_path(v))) == length(ks)
+            @test sum(c.n for c in values(load_cost_table(v))) == length(ks)
+            @test count(e -> e.kind == "cost_table_not_seeded", _co_events(outdir)) == 1
+        finally
+            SweepRunner._COST_SEED_MAX_FILES[] = 200
+            foreach(p -> chmod(p, 0o600), foreign)
+        end
+        # The explicit rebuild is the full rescan: it brings in what the fifty hold.
+        t = write_cost_table(v)
+        @test sum(c.n for c in values(t)) == length(ks) + 1      # the fifty all name one old key
+        @test length(readlines(SweepRunner.cost_records_path(v))) == length(ks) + 50
+    end
+end
+
+@testset "a stage with a short history is seeded from it once; cost_table says when to keep one (#198)" begin
+    _co_vault() do v, outdir
+        ks = DataVault.keys(v)
+        class = k -> "N=$(k.params["N"])"
+        # An earlier job of this stage, under a version without the record file.
+        old = joinpath(outdir, "events_earlier_1.jsonl")
+        write(
+            old,
+            """{"kind":"key_done","stage":"co","key":"old","class":"N=4","secs":5.0,"cores":1,"rss":1}\n""",
+        )
+        run!(
+            k -> Dict{String,Any}("x" => 1),
+            v,
+            ks[1:1];
+            key_class=class,
+            opts=RunOpts(; workers=:sequential),
+        )
+        @test sum(c.n for c in values(load_cost_table(v))) == 2  # the old key and the new one
+        @test !any(e -> e.kind == "cost_table_not_seeded", _co_events(outdir))
+        # A record that is both in the seed and appended later counts once.
+        line = first(readlines(SweepRunner.cost_records_path(v)))
+        open(io -> println(io, line), SweepRunner.cost_records_path(v), "a")
+        run!(
+            k -> Dict{String,Any}("x" => 1),
+            v,
+            ks[2:2];
+            key_class=class,
+            opts=RunOpts(; workers=:sequential),
+        )
+        @test sum(c.n for c in values(load_cost_table(v))) == 3
+    end
+    _co_vault() do v, outdir
+        ks = DataVault.keys(v)
+        seq = RunOpts(; workers=:sequential)
+        wf = k -> Dict{String,Any}("x" => 1)
+        # Asked for without a class; refused with one; and only those three values.
+        run!(wf, v, ks[1:1]; cost_table=true, opts=seq)
+        @test isfile(SweepRunner.cost_table_path(v))
+        rm(SweepRunner.cost_table_path(v))
+        run!(wf, v, ks[2:2]; cost_table=false, key_class=k -> "c", opts=seq)
+        @test !isfile(SweepRunner.cost_table_path(v))
+        @test_throws ArgumentError run!(wf, v, ks[3:3]; cost_table=:always, opts=seq)
+        r = run_loop!(
+            wf, v, ks[3:3]; cost_table=true, opts=seq, max_empty_rounds=1, idle_sleep=0
+        )
+        @test r.done == 1 && isfile(SweepRunner.cost_table_path(v))
+    end
+end
+
+@testset "a round of a few keys reads those keys' progress stamps, not the stage's (#198)" begin
+    _co_vault() do v, outdir
+        ks = DataVault.keys(v)
+        # Stamps of other units of the stage, partly done somewhere else — and damaged, so that
+        # reading them is noticed.
+        dir = SweepRunner.progress_dir(v)
+        mkpath(dir)
+        foreach(i -> write(joinpath(dir, "other$i.json"), "{ not json"), 1:5)
+        seq = RunOpts(; workers=:sequential)
+        r = run!(k -> Dict{String,Any}("x" => 1), v, ks[1:1]; opts=seq)
+        @test r.done == 1
+        @test !any(e -> e.kind == "progress_unreadable", _co_events(outdir))
+        # Asked about the whole stage, they are read, and said.
+        lost = Ref(0)
+        read_progress(v; unreadable=lost)
+        @test lost[] == 5
+        # A round's own key that left a stamp still gets its resume point.
+        @test SweepRunner._PROGRESS_LIST_ABOVE >= 2             # this round is a "few keys" one
+        k = ks[2]
+        got = Ref{Any}(nothing)
+        stamp = Dict("key" => ParamIO.canonical(k), "step" => 3, "of" => 10, "at" => time())
+        write(SweepRunner._progress_file(v, ParamIO.canonical(k)), JSON3.write(stamp))
+        run!(v, [k]; opts=seq) do key
+            got[] = SweepRunner.resume_point()
+            return Dict{String,Any}("x" => 1)
+        end
+        @test got[].step == 3
+    end
+end

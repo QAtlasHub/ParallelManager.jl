@@ -162,6 +162,8 @@ stay within that guarantee.
 | `status_write_failed` | the status file could not be written; once per run of        |
 |                 | failures                                                           |
 | `cost_table_failed` | the per-class cost table could not be written                  |
+| `cost_table_not_seeded` | a stage has no cost record file and too many event files to |
+|                 | build one from at a round's end (`event_files`, `max`): rebuild it  |
 | `key_stopped`   | a unit told to stop left at a safe point ([`stop_point`](@ref));   |
 |                 | no attempt spent                                                   |
 | `key_cut`       | a unit told to stop was still running after its grace: its worker  |

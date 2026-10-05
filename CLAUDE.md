@@ -36,8 +36,12 @@ for how the three layers fit together.
   `job_account` when it ends; `bin/sweeprunner account <outdir>` prints it.
 - Cost: every `key_done` records wall, CPU, cores, peak RSS, host and `class`
   (`run!(…; key_class = key -> label)`); `SweepRunner.note_key!(…)` adds fields from `work_fn`.
-  `key_costs` / `cost_summary` / `bin/sweeprunner costs <outdir>` read them back, `run_loop!`
-  leaves `state_root/costs.json`, and `measured_cost` / `measured_mem` are hooks built from it.
+  `key_costs` / `cost_summary` / `bin/sweeprunner costs <outdir>` read them back; a round with
+  a `key_class` or a `pool` (or `cost_table = true`) keeps `state_root/costs.json`, and
+  `measured_cost` / `measured_mem` are hooks built from it. **A round's end must not read the
+  outdir**: it reads its own event log's new part and one record file per stage. A caller may
+  run one key per `run!` in an outdir with tens of thousands of event files — anything a
+  `run!` does per call is done per key there.
 - `load_campaign(meta.toml)` / `validate_campaign` / `plan_campaign` / `run_campaign!(open_stage,
   campaign; profile, cost)` — a META config names the per-stage configs of a campaign, their
   order (`needs`, `priority`), which studies are `enabled`, and per-job-kind `[profile.*]`
