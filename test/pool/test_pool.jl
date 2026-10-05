@@ -1305,3 +1305,29 @@ end
         end
     end
 end
+
+@testset "a pool's workers are removed together when it is shut down" begin
+    # Found with 511 workers on a cluster: removed one after the other, `run!` returned 200 s
+    # after its last key. Here six launchers that ignore SIGTERM, as an `srun` that is waiting
+    # for its step does: one after the other that is five seconds each before the SIGKILL.
+    _pl_custom((node, size, n, flags) -> Int[]) do pool
+        procs_of = Dict{Int,Base.Process}()
+        for id in 9001:9006
+            procs_of[id] = run(`bash -c "trap '' TERM; sleep 120"`; wait=false)
+            pool.workers[id] = SweepRunner.PoolWorker(
+                gethostname(), KeyReq(1, 1.0), 0.0, false
+            )
+        end
+        sleep(0.5)                                               # the traps are set
+        SweepRunner._LAUNCHER_OF[] = id -> get(procs_of, id, nothing)
+        try
+            t = @elapsed shutdown!(pool; wait=1)
+            @test t < 15                                         # not 6 x 5 s
+            @test all(p -> process_exited(p), values(procs_of))
+            @test isempty(pool.workers)
+        finally
+            SweepRunner._LAUNCHER_OF[] = nothing
+            foreach(p -> process_running(p) && kill(p, Base.SIGKILL), values(procs_of))
+        end
+    end
+end
