@@ -630,20 +630,25 @@ end
 const _LEDGER_LOCK_STALE = Ref(600.0)
 
 """
-    with_ledger(f, ledger; wait=120.0)
+    with_ledger(f, ledger; wait=300.0)
 
 Run `f()` holding the ledger's lock (a directory beside the file: `mkdir` is atomic on NFS), with
 the ledger re-read from disk first. Two controllers on one ledger then decide one after the
 other, each on what the other wrote, instead of overwriting each other's rows. Throws if the lock
 cannot be had within `wait` seconds.
+
+A lock whose holder died is taken once this process has WATCHED it unchanged for longer than a
+holder leaves it (a holder refreshes every minute; 90 s). The file's timestamp is not compared
+with this host's clock. A `wait` shorter than that can therefore never take a dead lock.
 """
-function with_ledger(f, l::Ledger; wait::Real=120.0)
+function with_ledger(f, l::Ledger; wait::Real=300.0)
     lockdir = l.path * ".lock"
     mkpath(dirname(l.path))
     token = string(gethostname(), ":", getpid(), ":", string(rand(UInt64); base=16))
     t0 = time()
     watched = Ref(-1.0)                 # the lock's timestamp as last read, and since when
     watched_since = Ref(time())
+    watched_token = Ref{Any}(nothing)   # ...and whose it was then
     while true
         got = try
             mkdir(lockdir)
@@ -665,30 +670,27 @@ function with_ledger(f, l::Ledger; wait::Real=120.0)
             break
         end
         # Left behind by a controller that died holding it? Its holder refreshes the lock while
-        # it lives, so a dead one stops changing. Judged on what THIS process has watched, not
-        # on the file's timestamp against this host's clock alone: with two hosts' clocks a
-        # waiter that is ahead saw every lock as stale and took it each time. Stale is: old by
-        # the timestamp AND seen not to change for longer than its holder would leave it.
+        # it lives, so a dead one stops changing. Judged ONLY on what this process has watched
+        # with its own clock: the lock has not changed for longer than its holder would leave
+        # it. The file's timestamp against this host's clock says nothing — a waiter whose
+        # clock is ahead saw every lock as old, and one whose clock is behind saw a dead
+        # holder's lock as fresh until the skew had passed.
         touched = _lock_touched(lockdir)
-        if touched != watched[]
+        tok_now = _lock_token(lockdir)
+        if touched != watched[] || tok_now != watched_token[]
             watched[] = touched
+            watched_token[] = tok_now
             watched_since[] = time()
         end
-        age = time() - touched
-        unchanged = time() - watched_since[]
-        if age > _LEDGER_LOCK_STALE[] && unchanged > 1.5 * _LEDGER_LOCK_STALE[] / 10
-            aside = string(lockdir, ".stale.", string(rand(UInt32); base=16))
-            try
-                mv(lockdir, aside)
-                rm(aside; force=true, recursive=true)
-            catch e
-                e isa InterruptException && rethrow()
-            end
+        age = time() - watched_since[]
+        if age > _lock_unrefreshed()
+            _take_stale!(lockdir, watched_token[])
+            watched[] = -1.0
             continue
         end
         time() - t0 > wait && error(
             "the ledger $(l.path) is locked by another controller " *
-            "($(round(Int, age)) s); nothing decided",
+            "(watched for $(round(Int, time() - t0)) s); nothing decided",
         )
         sleep(0.2)
     end
@@ -699,8 +701,11 @@ function with_ledger(f, l::Ledger; wait::Real=120.0)
         try
             # Only while it is still ours: a holder that lost the lock must not keep another's
             # fresh, nor put an owner file back.
-            _lock_token(lockdir) == token && touch(joinpath(lockdir, "owner"))
-        catch
+            (_LEDGER_KEEP[] && _lock_token(lockdir) == token) &&
+                touch(joinpath(lockdir, "owner"))
+        catch e
+            e isa InterruptException && rethrow()
+            # Not refreshed this time; the next try is a tenth of the stale time away.
         end
         timedwait(() -> !alive[], _LEDGER_LOCK_STALE[] / 10; pollint=0.05)
     end
@@ -715,6 +720,38 @@ function with_ledger(f, l::Ledger; wait::Real=120.0)
         _lock_token(lockdir) == token && rm(lockdir; force=true, recursive=true)
     end
 end
+
+# Remove the lock at `lockdir` if it is still the one whose owner was read as `token`. Taken by
+# renaming it, so that of two waiters one gets it; what was renamed is then looked at, and if it
+# is not the lock that was watched (a waiter that stalled between its read and its rename has
+# renamed the lock another has just made) it is put back. Returns whether a lock was removed.
+function _take_stale!(lockdir::AbstractString, token)::Bool
+    aside = string(lockdir, ".stale.", string(rand(UInt32); base=16))
+    try
+        mv(lockdir, aside)
+    catch e
+        e isa InterruptException && rethrow()
+        return false                    # another waiter got it first
+    end
+    if _lock_token(aside) == token
+        rm(aside; force=true, recursive=true)
+        return true
+    end
+    try
+        # `mv` of a directory onto an existing one fails, so a lock made meanwhile stays.
+        mv(aside, lockdir)
+    catch e
+        e isa InterruptException && rethrow()
+        rm(aside; force=true, recursive=true)
+    end
+    return false
+end
+
+# How long a lock may be seen unchanged before it is taken as left behind: one and a half of its
+# holder's refresh periods.
+_lock_unrefreshed() = 1.5 * _LEDGER_LOCK_STALE[] / 10
+# Whether a holder refreshes its lock. A `Ref` so a test can stand in a holder that is stuck.
+const _LEDGER_KEEP = Ref(true)
 
 # Ledgers this process holds the lock of: the ledger object => (lock directory, token). By
 # object, not by path: two controllers in one process are two holders.
@@ -842,7 +879,8 @@ Bring the ledger up to what the scheduler says, and return what changed
 - A listed job named as one of ours (`names`) that the ledger does not have is ADOPTED, at its
   limit: a job the ledger does not know is one the budget does not see.
 - A job it does not list is ended only on evidence:
-  - `gone(id) === true` on two polls in a row (the scheduler's accounting says so), or
+  - `gone(id) === true` on two polls in a row, the first and the last `_ENDED_MIN_ABSENT`
+    seconds apart, with the job not listed in between (the scheduler's accounting says so), or
   - it has been absent for $(_ENDED_AFTER_MISSING) polls over `_ENDED_MIN_ABSENT` seconds (two
     minutes) from answers that list at least one other job the ledger knows, or
   - it has been absent for $(_ENDED_AFTER_MISSING) polls over `_ENDED_MIN_ABSENT_ALONE` seconds
@@ -890,6 +928,9 @@ function observe!(
             j["last_seen"] = Float64(now)
             j["ended"] = false
             delete!(j, "absent_since")
+            # Seen again: what the accounting said before does not count towards "twice".
+            j["gone_seen"] = 0
+            delete!(j, "gone_since")
             continue
         end
         j["ended"] === true && continue
@@ -922,8 +963,16 @@ function observe!(
         # One answer of the accounting is not acted on by itself: a job id that was reused, or
         # another cluster's accounting, is enough for one. It has to say so on two polls.
         j["gone_seen"] = g === true ? Int(get(j, "gone_seen", 0)) + 1 : 0
-        if g === true && j["gone_seen"] >= _GONE_CONFIRM
-            evidence = "the scheduler's accounting says it ended (on $(j["gone_seen"]) polls)"
+        g === true ? get!(j, "gone_since", Float64(now)) : delete!(j, "gone_since")
+        # ...and over some time: two rounds seconds apart are one answer asked twice.
+        confirmed =
+            g === true &&
+            j["gone_seen"] >= _GONE_CONFIRM &&
+            Float64(now) - Float64(j["gone_since"]) >= _ENDED_MIN_ABSENT[]
+        if confirmed
+            evidence =
+                "the scheduler's accounting says it ended (on $(j["gone_seen"]) polls over " *
+                "$(round(Int, Float64(now) - Float64(j["gone_since"]))) s)"
         elseif g === true
             continue                                 # once: asked again on the next poll
         else
@@ -1360,7 +1409,8 @@ end
 
 # Bring `l` up to the scheduler's answer and log what that changed.
 function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
-    said_gone = Ref(false)
+    gone_failed = String[]
+    gone_err = Ref("")
     changes = observe!(
         l,
         states;
@@ -1369,21 +1419,21 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
             job_gone(ctl.scheduler, id)
         catch e
             e isa InterruptException && rethrow()
-            # The accounting could not be asked: no evidence either way, and said — once a
-            # round, not once per absent job.
-            if !said_gone[]
-                said_gone[] = true
-                log_event(
-                    ctl.log,
-                    :job_gone_failed;
-                    level=:warn,
-                    id=id,
-                    err=_short_err(e),
-                    dry_run=dry,
-                )
-            end
+            # The accounting could not be asked: no evidence either way. Said once a round,
+            # below, with every job it was asked about.
+            push!(gone_failed, String(id))
+            gone_err[] = _short_err(e)
             nothing
         end,
+    )
+    isempty(gone_failed) || log_event(
+        ctl.log,
+        :job_gone_failed;
+        level=:warn,
+        id=first(gone_failed),
+        ids=gone_failed,
+        err=gone_err[],
+        dry_run=dry,
     )
     for c in changes
         log_event(
