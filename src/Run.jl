@@ -2190,6 +2190,7 @@ function _round_pool_gave_up(r::Round)
         :pool_gave_up;
         level=:error,
         stage=stage,
+        why=String(something(_pool_gave_up_why(pool), :unknown)),
         fails=pool.fails,
         rejects=pool.rejects,
         nodes_out=sort!(collect(pool.bad_nodes)),

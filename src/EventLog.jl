@@ -92,8 +92,8 @@ stay within that guarantee.
 | `pool_stalled`  | starts have neither joined nor failed for `stall_after`            |
 | `pool_gave_up`  | the pool has nothing left to try with keys still queued — every    |
 |                 | node taken out twice, or ten starts / ten readied workers in a row |
-|                 | failed over a minute (`fails`, `rejects`, `nodes_out`); `run!`     |
-|                 | throws                                                             |
+|                 | failed over two minutes (`why`: nodes / starts / rejects, `fails`, |
+|                 | `rejects`, `nodes_out`); `run!` throws                             |
 | `pool_node_out` | a node's starts brought no worker, or its workers could not be     |
 |                 | readied, five times over a minute (`node`, `why`, `times_out`)     |
 | `pool_node_retry` | a node that was taken out gets one more try                      |

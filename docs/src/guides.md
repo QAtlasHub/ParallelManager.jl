@@ -1078,9 +1078,10 @@ run_loop!(work_fn, vault, keys; pool = pool, load = MyModel)    # no init_worker
   no worker, or when one of its workers starts and cannot be readied; five in
   a row over at least a minute take it out (`pool_node_out`, with why). It is
   tried once more five minutes later (`pool_node_retry`); a worker of that node
-  taking a key clears it. `run!` throws (`pool_gave_up`) — instead of the round
-  quietly ending — when every node has been taken out twice, or when ten starts
-  (or ten readied workers) in a row have failed over at least a minute. The
+  started since then taking a key clears it. `run!` throws (`pool_gave_up`,
+  with `why`) — instead of the round quietly ending — when every node has been
+  taken out twice, or when ten starts (or ten readied workers) in a row have
+  failed over at least two minutes: the node rule has its minute first. The
   spans are there because a job's first tick starts more than ten batches at
   once, and a few seconds of `srun` refusing fails them together.
 - A worker whose launching process has exited is treated as gone even before
