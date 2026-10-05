@@ -684,8 +684,13 @@ function _cut!(m::Master, table::TaskTable, row::TaskRow, o::StopOrder, log::Eve
         if same
             removed = false
             if pid != 0 && pid != myid()
+                # What launched it, taken before anything is done to it: afterwards
+                # Distributed may no longer say.
+                launcher = something(_LAUNCHER_OF[], _launcher)(pid)
                 something(_KILL_WORKER[], _kill_hard!)(pid)
-                removed = !(pid in procs())
+                # Gone means its process has ended — not that it left `procs()`, which it does
+                # as soon as it is asked to (see `_worker_dead`).
+                removed = _worker_dead(pid, launcher)
             end
             if removed
                 _cut_release!(m, row, o, tok, pid, log)
@@ -729,6 +734,9 @@ const _CUT_TRIES = 3
 const _CUT_RETRY = Ref(5.0)
 # What removes a worker. A `Ref` so a test can stand in a worker that cannot be removed.
 const _KILL_WORKER = Ref{Any}(nothing)
+# What says which process launched a worker. A `Ref` so a test can stand in a cluster manager
+# that gives no handle.
+const _LAUNCHER_OF = Ref{Any}(nothing)
 
 function _cut_release!(m::Master, row::TaskRow, o::StopOrder, tok, pid::Int, log::EventLog)
     v = m.vault
@@ -809,7 +817,13 @@ function _order_stops_all!(m::Master, table::TaskTable, grace::Real, why::Abstra
     end
     n = 0
     for r in rows
-        haskey(m.ctl.stopping, r.kstr) && continue
+        old = get(m.ctl.stopping, r.kstr, nothing)
+        if old !== nothing
+            # It has an order already: this bound applies to it too (an order with no grace
+            # would otherwise never be cut).
+            old.deadline = min(old.deadline, time() + grace)
+            continue
+        end
         m.ctl.stopping[r.kstr] = StopOrder(time() + grace, false, String(why), false)
         n += 1
     end
