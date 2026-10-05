@@ -1565,6 +1565,661 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
     return length(cut)
 end
 
+# ── a round over the workers ─────────────────────────────────────────────────────────────────────
+#
+# What one call of `_drive_workers!` shares between its dispatch tasks, its ticker and its ending.
+# These were sixteen variables captured by closures inside one function; a fix to one of them had
+# to be read against all the others. Here each part is a function over the one struct, and what a
+# part reads or writes is `r.<field>` at the place it does so.
+#
+# All of a round's tasks are `@async` on the task that runs `_drive_workers!`, so the fields are
+# plain values and `idle` a plain `Condition`: nothing between a check and the `wait` that follows
+# it can yield.
+mutable struct Round
+    # What the round was asked to do.
+    const work_fn::Function
+    const vault::Vault
+    const table::TaskTable
+    const stage::Symbol
+    const log::EventLog
+    const opts::RunOpts
+    const master::Master
+    const affinity::Any
+    const prepare::Any
+    const key_class::Any
+    const fits::Any
+    const tick::Any
+    const pool::Any
+    const min_time::Any
+    # The name the workers know this round's context by.
+    const rid::UInt64
+    # How often the ticker runs.
+    const every::Float64
+    # Units out on a worker, and what the tasks that have nothing to do wait on.
+    out::Int
+    const idle::Condition
+    # A stop was seen and the queue settled with it; the job's own stop was given its grace.
+    stopped::Bool
+    graced::Bool
+    # With a pool: whether anything is queued, kept by the ticker, so a dispatch task whose size
+    # fits nothing right now waits for a key that will come back rather than leaving.
+    queued_now::Bool
+    # Whether keys are being held back by other masters' locks: why an idle worker is idle.
+    held_now::Bool
+    # Workers with a dispatch task, the tasks in the order they were started, and whose is whose.
+    const started::Set{Int}
+    const tasks::Vector{Task}
+    const task_of::Dict{Int,Task}
+    # Workers that could not be readied in this round (left out, not asked again every tick),
+    # ones that did not say who they are (said once), and how often each was tried.
+    const rejected::Set{Int}
+    const unidentified::Set{Int}
+    const prep_tries::Dict{Int,Int}
+    # With a pool: the workers that were there when `run!` began, which it readied itself.
+    const first_foreign::Set{Int}
+    # Set when the round has to end with an error (a unit that could not be cut, a tick step
+    # that keeps failing): no more keys are handed out, the units running finish, and the error
+    # is thrown. `abandoned` are the dispatch tasks not waited for: each is inside a call to a
+    # worker that could not be removed.
+    abort::Any
+    const abandoned::Set{Task}
+    # The round is over: the ticker leaves.
+    done::Bool
+    # Since when the allocation has been under-used (`_leave_if_underused!`).
+    const idle_since::Base.RefValue{Float64}
+    # Per ticker step: failures in a row, and since when.
+    const fails::Dict{Symbol,Int}
+    const failing_since::Dict{Symbol,Float64}
+end
+
+function Round(
+    work_fn,
+    vault,
+    table,
+    stage,
+    log,
+    opts,
+    master;
+    affinity,
+    prepare,
+    key_class,
+    fits,
+    tick,
+    pool,
+    min_time,
+)
+    # `every`: a pool is looked at more often than requests are — a start it does not make is
+    # idle room.
+    every = opts.control_interval > 0 ? Float64(opts.control_interval) : 10.0
+    pool === nothing || (every = min(every, Float64(pool.poll)))
+    return Round(
+        work_fn,
+        vault,
+        table,
+        stage,
+        log,
+        opts,
+        master,
+        affinity,
+        prepare,
+        key_class,
+        fits,
+        tick,
+        pool,
+        min_time,
+        rand(UInt64),
+        every,
+        0,
+        Condition(),
+        false,
+        false,
+        pool !== nothing,
+        any(row -> row.state === :held, table.rows),
+        Set{Int}(),
+        Task[],
+        Dict{Int,Task}(),
+        Set{Int}(),
+        Set{Int}(),
+        Dict{Int,Int}(),
+        pool === nothing ? Set{Int}() : Set{Int}(p for p in workers() if p != myid()),
+        nothing,
+        Set{Task}(),
+        false,
+        Ref(0.0),
+        Dict{Symbol,Int}(),
+        Dict{Symbol,Float64}(),
+    )
+end
+
+# The dispatch task of one worker: draw a row, hand it over, settle it; until nothing is out and
+# nothing can arrive, or the worker is gone.
+function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
+    (; vault, table, stage, log, opts, master, pool) = r
+    c = master.ctl
+    # What launched this worker, while Distributed can still say.
+    launcher = something(_LAUNCHER_OF[], _launcher)(pid)
+    # The round's context goes to the worker once. Sent with every key, the work function,
+    # the vault (its whole spec), the log and the options were serialised again per
+    # dispatch, through the master's one core.
+    try
+        remotecall_fetch(_install_round, pid, r.rid, r.work_fn, vault, stage, log, opts)
+    catch e
+        e isa ProcessExitedException && return nothing
+        log_event(log, :workers_rejected; level=:warn, stage=stage, n=1, err=_short_err(e))
+        pool === nothing || _pool_rejected!(pool, pid, log, stage)
+        return nothing
+    end
+    while true
+        if !r.stopped
+            stop = _stop_reason(opts, master)
+            if stop !== nothing
+                settle_queued!(table, _stop_outcome(stop))
+                r.stopped = true
+            end
+        end
+        r.abort === nothing || break
+        # A worker that went away while this loop was waiting must not be handed a key: the
+        # call would fail at once and be counted against the key as a death.
+        pid in workers() || break
+        if pid in c.retired
+            # A `:resize` took this worker out. It leaves the pool, which is what frees its
+            # cores; it was between units, so nothing is cut.
+            log_event(log, :worker_retired; stage=stage, worker=pid, host=host)
+            @async try
+                rmprocs(pid; waitfor=30)
+            catch
+            end
+            break
+        end
+        host in c.drained && break
+        # The pool retires its own workers; the task only has to leave.
+        (pool !== nothing && _pool_retiring(pool, pid)) && break
+        accept = if pool === nothing
+            nothing
+        else
+            row -> _pool_accepts(pool, pid, row, opts.deadline, r.min_time)
+        end
+        i = if c.paused || r.stopped
+            nothing
+        else
+            _next_fitting!(table, pid, r.fits; accept=accept)
+        end
+        if i === nothing
+            # Leave when nothing is out and nothing can arrive. A paused master keeps its
+            # queue, and its dispatch tasks with it; so does a pool with keys still queued
+            # that this worker's size does not fit yet.
+            r.out == 0 &&
+                !(c.paused && !r.stopped && _has_queued(table)) &&
+                !(r.queued_now && !r.stopped) &&
+                break
+            w0 = time()
+            why = if c.paused
+                :paused
+            elseif r.stopped
+                :stopping
+            elseif r.held_now
+                :lock_busy
+            else
+                :queue_empty
+            end
+            wait(r.idle)
+            _acct_idle!(master.acct, pid, why, w0, time())
+            continue
+        end
+        row = table.rows[i]
+        tok = owner_token(host, ospid)
+        # Settled since it was drawn (a stop's `settle_queued!`): not started after all.
+        start_task!(table, i, tok, pid) || continue
+        pool === nothing || _pool_served!(pool, pid)
+        _out_add!(tok, vault, row.key)
+        r.out += 1
+        t0 = time()
+        died = false
+        kept = false
+        outcome = try
+            last(
+                remotecall_fetch(
+                    _run_installed,
+                    pid,
+                    r.rid,
+                    row.key;
+                    tok=tok,
+                    resume=row.progress,
+                    reap=false,
+                    watch=StopWatch(master.started, master.id, master.job),
+                    class=_class_of(r.key_class, row.key),
+                ),
+            )
+        catch e
+            # The round stopped waiting for this task; what its worker does now is not the
+            # round's (no death counted, no memory raised for a key it gave up on).
+            current_task() in r.abandoned && return nothing
+            failed = _round_call_failed!(r, e, row, tok, pid, host, launcher, t0)
+            died, kept = failed.died, failed.kept
+            failed.outcome
+        finally
+            r.out -= 1
+            if !kept
+                _out_remove!(tok)
+                _out_unkeep!(tok)
+            end
+        end
+        # A task the round stopped waiting for (its worker could not be removed): the round
+        # has reported without it. What comes back now changes nothing it reported.
+        current_task() in r.abandoned && return nothing
+        _round_settle!(r, i, row, pid, t0, outcome)
+        notify(r.idle)
+        died && break
+    end
+    return nothing
+end
+
+# The call to the worker threw. What the unit's outcome is (`nothing`: hand the key out again),
+# whether this dispatch task is over (`died`), and whether the key's lock is kept.
+function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0)
+    (; vault, table, stage, log, master, pool) = r
+    if !(e isa ProcessExitedException)
+        log_event(log, :error; stage=stage, key=row.kstr, attempt=0, err=_short_err(e))
+        return (; outcome=:error, died=false, kept=false)
+    end
+    # Distributed reports the exit when its side closes, which can be a moment before the
+    # process is seen to have ended: that moment is waited for.
+    gone =
+        timedwait(() -> _worker_dead(pid, launcher), _EXIT_CONFIRM[]; pollint=0.05) === :ok
+    if !gone
+        # Distributed has closed its side (the worker was asked to leave, or the connection
+        # dropped) and the PROCESS is not known to have ended: it may be computing. Its lock is
+        # not released under it; the key is held, by it.
+        _out_keep!(tok)
+        push!(_KEPT_WORKERS, pid)
+        log_event(
+            log,
+            :lock_kept;
+            level=:warn,
+            stage=stage,
+            key=row.kstr,
+            owner=tok,
+            worker=pid,
+            why="the connection to the worker is closed and its process is not " *
+                "known to have ended",
+        )
+        return (; outcome=:lock_busy, died=true, kept=true)
+    end
+    _release_dead!(vault, row, tok, stage, log)
+    # The worker cannot say what the attempt cost; the master knows how long.
+    log_event(
+        log,
+        :key_spent;
+        stage=stage,
+        key=row.kstr,
+        outcome="worker_died",
+        secs=time() - t0,
+        cores=get(master.acct.cores, pid, 0),
+        host=host,
+        class=_class_of(r.key_class, row.key),
+    )
+    ord = get(master.ctl.stopping, row.kstr, nothing)
+    if ord !== nothing && (ord.cut || ord.tries > 0)
+        # Removed on purpose — also when the exit comes between two tries of the cut: not a
+        # death of the key, and not its memory.
+        return (; outcome=:stopped, died=true, kept=false)
+    end
+    lock(() -> row.deaths += 1, table.lock)
+    # More memory for the next hand-out, when there is one: a key that is given up on now is
+    # not "retried with more".
+    (pool === nothing || row.deaths > _WORKER_DEATH_REDISPATCHES) ||
+        _pool_death!(pool, row, pid, log, stage)
+    return (; outcome=_after_death(row, log, stage), died=true, kept=false)
+end
+
+# A unit came back (or did not): what it counts as, and the row settled or handed out again.
+function _round_settle!(r::Round, i::Int, row, pid::Int, t0, outcome)
+    (; vault, table, master) = r
+    c = master.ctl
+    order = get(c.stopping, row.kstr, nothing)
+    if order !== nothing
+        delete!(c.stopping, row.kstr)
+        # A unit that was cut comes back as a lost lock, an error from the interrupt, or
+        # not at all. Whatever it is, the unit was stopped, not failed.
+        order.cut && outcome !== :ok && (outcome = :stopped)
+        # Told to stop, and its worker died before it left: it stays stopped. Requeued,
+        # it would be the next key handed out.
+        outcome === nothing && (outcome = :stopped)
+    end
+    # The same for a key a request cancelled while it was running.
+    if outcome === nothing && any(f -> matches(f, row.key), c.cancels)
+        outcome = :cancelled
+    end
+    outcome === :lock_busy && (master.collisions += 1)
+    _account_key!(master, vault, row, pid, t0, outcome)
+    if outcome === nothing
+        # What it had reported before it died is where the next worker starts.
+        row.progress = _read_progress_one(vault, row.kstr)
+        requeue!(table, i; front=true)
+    else
+        settle!(table, i, outcome)
+    end
+    return nothing
+end
+
+# Start a dispatch task for every worker that does not have one. Workers present when the
+# round began were prepared by `run!`; later ones are prepared here.
+function _round_adopt!(r::Round)
+    (; stage, log, master, pool, prepare) = r
+    # `workers()` is `[1]` when there are none: the master is not one of its own workers.
+    # (A worker whose lock was kept is still inside the unit it could not be stopped in:
+    # it gets no key from a later round in this process.)
+    fresh = [
+        p for p in workers() if
+        !(p in r.started) && p != myid() && !(p in r.rejected) && !(p in _KEPT_WORKERS)
+    ]
+    # A worker the pool is still starting is visible here before the pool knows its size;
+    # it gets a dispatch task once it is registered, not before.
+    pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)
+    isempty(fresh) && return nothing
+    late = !isempty(r.started)
+    # Workers `run!` found when it began were readied by it; a pool's own, and any that
+    # join later, here.
+    found = if pool === nothing
+        (late ? Int[] : fresh)
+    else
+        [p for p in fresh if p in r.first_foreign]
+    end
+    todo = setdiff(fresh, found)
+    ready = if prepare === nothing || isempty(todo)
+        fresh
+    else
+        ok = prepare(todo)
+        if length(ok) < length(todo)
+            # The batch failed as one. Each by itself, so the one that cannot be readied is
+            # the only one left out — and it is set aside: asked again every tick, it was
+            # re-readying every worker and logging the same line each second.
+            ok = Int[]
+            for p in todo
+                if !isempty(prepare([p]))
+                    push!(ok, p)
+                else
+                    _round_give_up_on!(r, p)             # after a few tries; else next tick
+                end
+            end
+        end
+        vcat(found, ok)
+    end
+    _identify_workers!(master, ready)
+    who = lock(() -> copy(master.who), master.lock)
+    n = 0
+    for pid in ready
+        w = get(who, pid, nothing)
+        if w === nothing
+            # Could not say who it is: asked again on the next ticks, said once, and given
+            # up on after a few — it was asked, and readied again, every tick for ever.
+            _round_give_up_on!(r, pid)
+            if !(pid in r.unidentified)
+                push!(r.unidentified, pid)
+                log_event(
+                    log,
+                    :workers_rejected;
+                    level=:warn,
+                    stage=stage,
+                    n=1,
+                    err="worker $pid did not answer who it is; it gets no work until it does",
+                )
+            end
+            continue
+        end
+        push!(r.started, pid)
+        n += 1
+        t = @async try
+            _round_loop!(r, pid, w.host, w.pid)
+        finally
+            # A loop that leaves on an exception must not strand the ones waiting on it.
+            notify(r.idle)
+        end
+        r.task_of[pid] = t
+        push!(r.tasks, t)
+    end
+    (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
+    return nothing
+end
+
+# One more failed try at readying `pid`. After `_PREPARE_TRIES` it is left out of the round and
+# — if it is the pool's — retired there, so that it is not counted as a worker any more. The one
+# place a worker is given up on: the pool is told wherever the round decides it.
+function _round_give_up_on!(r::Round, pid::Int)
+    n = r.prep_tries[pid] = get(r.prep_tries, pid, 0) + 1
+    n >= _PREPARE_TRIES || return false
+    push!(r.rejected, pid)
+    r.pool === nothing || _pool_rejected!(r.pool, pid, r.log, r.stage)
+    return true
+end
+
+# One step of the ticker, by name. A failure is logged on its first occurrence and then every
+# `_TICK_SAY_EVERY`-th, with the count. One of `_TICK_FATAL_STEPS` that has failed for
+# `_TICK_FATAL_AFTER` seconds ends the round with an error: a master whose pool tick cannot run
+# is not doing its job.
+function _round_step(f, r::Round, name::Symbol)
+    try
+        f()
+        r.fails[name] = 0
+        delete!(r.failing_since, name)
+    catch e
+        e isa InterruptException && rethrow()
+        n = r.fails[name] = get(r.fails, name, 0) + 1
+        since = get!(r.failing_since, name, time())
+        try
+            (n == 1 || n % _TICK_SAY_EVERY == 0) && log_event(
+                r.log,
+                :tick_failed;
+                level=:warn,
+                stage=r.stage,
+                step=String(name),
+                count=n,
+                secs=round(Int, time() - since),
+                err=_short_err(e),
+            )
+        catch e2
+            # The log is what failed. The ticker must outlive that: it is what cuts,
+            # flushes and plans.
+            e2 isa InterruptException && rethrow()
+        end
+        # By time, not by ticks (with a pool a tick is a second), and only for the steps a
+        # round cannot do without: a pool that cannot plan, stops that cannot be enforced.
+        # A flush or a request poll that cannot reach the file system is said and retried.
+        if name in _TICK_FATAL_STEPS &&
+            time() - since >= _TICK_FATAL_AFTER[] &&
+            r.abort === nothing
+            r.abort = ErrorException(
+                "run!: the master's `$name` step has failed for " *
+                "$(round(Int, time() - since)) s, $n times in a row " *
+                "(last: $(_short_err(e))); see kind=\"tick_failed\" in the event log",
+            )
+            # The round is ending: the units still running are given a bound, so that it
+            # does end. (Hand-outs stopped, and `run!` then waited for every unit, with
+            # no bound by default.)
+            try
+                grace = isfinite(r.opts.stop_grace) ? r.opts.stop_grace : _ABORT_GRACE[]
+                _order_stops_all!(r.master, r.table, grace, "abort")
+            catch e3
+                e3 isa InterruptException && rethrow()
+            end
+        end
+    end
+    return nothing
+end
+
+# One pass of the ticker. Each step under its own guard: one that throws used to switch off
+# every step after it, each tick — the cut of units past their grace, the manifest, the pool.
+function _round_tick!(r::Round)
+    (; table, stage, log, opts, master, pool) = r
+    c = master.ctl
+    _round_step(r, :control) do
+        # Without a pool the ticker runs once per `control_interval`, so every tick is a
+        # poll. With one it runs at the pool's pace, and requests are still read only
+        # every `control_interval`.
+        return poll_control!(
+            master, table, log, opts; affinity=r.affinity, force=pool === nothing
+        )
+    end
+    if pool !== nothing
+        # Not for a round that is ending with an error: nothing more is started for it.
+        r.abort === nothing && _round_step(r, :pool) do
+            return _pool_tick!(pool, table, master, log, stage, opts, r.min_time; fits=r.fits)
+        end
+        # Whatever the tick did, the wait loop decides on what is true now.
+        _round_step(r, :pool_wants) do
+            return r.queued_now = _pool_wants(pool, table)
+        end
+    end
+    _round_step(() -> _round_adopt!(r), r, :adopt)
+    _round_step(r, :underused) do
+        return _leave_if_underused!(master, table, r.out, r.idle_since, opts, log)
+    end
+    _round_step(r, :stop_grace) do
+        # The job's own stop — its flag, its deadline, leaving an under-used allocation —
+        # gets its grace once, when it is first seen.
+        own_stop =
+            _stop_reason(opts) !== nothing || (c.stop_all && c.stop_why === :underused)
+        if !r.graced && own_stop
+            r.graced = true
+            _order_stops_all!(master, table, opts.stop_grace, "stop_grace")
+        end
+    end
+    _round_step(r, :enforce_stops) do
+        _enforce_stops!(master, table, log)
+        # A unit that could not be cut: the round ends, saying which worker is still there.
+        # EVERY such unit's dispatch task stops being waited for; only the error is the
+        # first one's. With two workers that could not be removed, the second used to be
+        # waited for, and `run!` still did not return.
+        for (kstr, o) in c.stopping
+            o.failed || continue
+            r.abort === nothing && (r.abort = ErrorException("run!: " * o.why))
+            i = get(table.index, kstr, 0)
+            t = i == 0 ? nothing : get(r.task_of, table.rows[i].worker, nothing)
+            t === nothing || push!(r.abandoned, t)
+        end
+    end
+    _round_step(r.tick, r, :flush)
+    _round_step(r, :held) do
+        return r.held_now = lock(
+            () -> any(row -> row.state === :held, table.rows), table.lock
+        )
+    end
+    # Wakes the idle dispatch tasks: a resume, a new key or a new stop is theirs to act on.
+    notify(r.idle)
+    return nothing
+end
+
+# Wait for the dispatch tasks. Returns the first exception one of them ended with, if any.
+function _round_wait!(r::Round)
+    (; table, opts, master, pool) = r
+    failure = nothing
+    i = 1
+    while true
+        while i <= length(r.tasks)                 # the list grows as workers are adopted
+            t = r.tasks[i]
+            # Woken by every dispatch task that ends and by every tick. A task whose worker
+            # could not be removed is not waited for: its call does not return.
+            while !istaskdone(t) && !(r.abort !== nothing && t in r.abandoned)
+                wait(r.idle)
+            end
+            if istaskdone(t)
+                try
+                    wait(t)
+                catch e
+                    failure === nothing && (failure = e)
+                end
+            end
+            i += 1
+        end
+        r.abort === nothing || break
+        # A pool may have nothing started yet, or be starting the workers the queue still
+        # needs: the round is not over while it is working towards them.
+        (
+            pool !== nothing &&
+            failure === nothing &&
+            _stop_reason(opts, master) === nothing
+        ) || break
+        _pool_wants(pool, table) || break
+        sleep(min(r.every, 0.2))
+    end
+    return failure
+end
+
+# The round's ending: its errors thrown, in the order they outrank each other, and what is
+# still queued settled.
+function _round_finish!(r::Round, failure)
+    (; table, stage, log, opts, master, pool) = r
+    c = master.ctl
+    # A cut removes a worker and then releases its lock; the round is over when that is done,
+    # so what it reports (and what the next round finds on disk) is settled.
+    for t in c.cuts
+        try
+            wait(t)
+        catch
+        end
+    end
+    empty!(c.cuts)
+    failure === nothing || throw(failure)
+    r.abort === nothing || throw(r.abort)
+    # A pool that cannot start workers is not a round that ended: said, and an error.
+    (pool !== nothing && _pool_gave_up(pool) && _has_queued(table)) &&
+        _round_pool_gave_up(r)
+
+    # Keys still queued with nobody left to take them. Under a stop they are attributed to it;
+    # otherwise every worker died (or was drained or retired) while they were pending: they were
+    # never attempted, so they are retriable rather than failed, and `run!` counts them with
+    # `busy`.
+    stop = _stop_reason(opts, master)
+    if stop !== nothing
+        settle_queued!(table, _stop_outcome(stop))
+    else
+        for (i, row) in enumerate(table.rows)
+            row.state === :todo || continue
+            log_event(log, :worker_lost; stage=stage, key=row.kstr)
+            settle!(table, i, :worker_lost)
+        end
+    end
+    return nothing
+end
+
+# Say that the pool gave up, and throw what a person should look for.
+function _round_pool_gave_up(r::Round)
+    (; table, stage, log, pool) = r
+    log_event(
+        log,
+        :pool_gave_up;
+        level=:error,
+        stage=stage,
+        fails=pool.fails,
+        rejects=pool.rejects,
+        nodes_out=sort!(collect(pool.bad_nodes)),
+        queued=count(row -> row.state === :todo, table.rows),
+    )
+    nodes_out = if isempty(pool.bad_nodes)
+        ""
+    else
+        " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
+    end
+    # What to look for depends on what failed: starts that brought nothing, or workers that
+    # started and could not be readied. By the rule that fired, not by which count happens to
+    # be larger.
+    why = _pool_gave_up_why(pool)
+    what, where = if why === :rejects
+        "$(pool.rejects) workers in a row started and could not be readied",
+        "kind=\"workers_rejected\" / \"pool_retire\""
+    elseif why === :starts
+        "$(pool.fails) worker starts failed in a row",
+        "kind=\"pool_spawn_failed\" / \"pool_spawn_short\""
+    else
+        "no node is left to start workers on", "kind=\"pool_node_out\", with why each node went"
+    end
+    return error(
+        "SizedPool: $what with keys still queued." *
+        nodes_out *
+        " The reasons are in the event log ($where).",
+    )
+end
+
 """
     _drive_workers!(work_fn, vault, table, stage, log, opts, master; affinity, prepare)
 
@@ -1585,6 +2240,10 @@ requests ([`poll_control!`](@ref)) and adopts workers that joined since the roun
 that is still ramping up, or one grown by a `:resize`, is used as it arrives rather than from the
 next round. `prepare(pids)` readies late workers (modules, source observation) and returns the
 ones that can be handed work.
+
+The state these share is one `Round`; the parts are `_round_loop!` (a worker's dispatch
+task), `_round_adopt!`, `_round_tick!` (one pass of the ticker, each step under `_round_step`),
+`_round_wait!` and `_round_finish!`.
 """
 function _drive_workers!(
     work_fn::Function,
@@ -1602,551 +2261,40 @@ function _drive_workers!(
     pool=nothing,
     min_time=nothing,
 )
-    c = master.ctl
-    # All dispatch tasks and the ticker are `@async` on this task's thread, so a plain counter and
-    # Condition are enough: nothing between a check and the `wait` that follows it can yield.
-    out = Ref(0)
-    idle = Condition()
-    stopped = Ref(false)
-    rid = rand(UInt64)
-    unidentified = Set{Int}()
-    graced = Ref(false)
-    # With a pool: whether anything is queued, kept by the ticker, so a dispatch task whose size
-    # fits nothing right now waits for a key that will come back rather than leaving.
-    queued_now = Ref(pool !== nothing)
-    # Whether keys are being held back by other masters' locks: why an idle worker is idle.
-    held_now = Ref(any(r -> r.state === :held, table.rows))
-    started = Set{Int}()
-    tasks = Task[]
-    task_of = Dict{Int,Task}()
-    # Workers that could not be readied in this round: left out, not asked again every tick.
-    rejected = Set{Int}()
-    prep_tries = Dict{Int,Int}()
-    # With a pool: the workers that were there when `run!` began, which it readied itself.
-    first_foreign = pool === nothing ? Set{Int}() : Set(p for p in workers() if p != myid())
-    # Set when the round has to end with an error (a unit that could not be cut, a tick step
-    # that keeps failing): no more keys are handed out, the units running finish, and the error
-    # is thrown. `abandoned` are the dispatch tasks not waited for: each is inside a call to a
-    # worker that could not be removed.
-    abort = Ref{Any}(nothing)
-    abandoned = Set{Task}()
-
-    function _loop(pid::Int, host::String, ospid::Int)
-        # What launched this worker, while Distributed can still say.
-        launcher = something(_LAUNCHER_OF[], _launcher)(pid)
-        # The round's context goes to the worker once. Sent with every key, the work function,
-        # the vault (its whole spec), the log and the options were serialised again per
-        # dispatch, through the master's one core.
-        try
-            remotecall_fetch(_install_round, pid, rid, work_fn, vault, stage, log, opts)
-        catch e
-            e isa ProcessExitedException && return nothing
-            log_event(
-                log, :workers_rejected; level=:warn, stage=stage, n=1, err=_short_err(e)
-            )
-            pool === nothing || _pool_rejected!(pool, pid, log, stage)
-            return nothing
-        end
-        while true
-            if !stopped[]
-                stop = _stop_reason(opts, master)
-                if stop !== nothing
-                    settle_queued!(table, _stop_outcome(stop))
-                    stopped[] = true
-                end
-            end
-            abort[] === nothing || break
-            # A worker that went away while this loop was waiting must not be handed a key: the
-            # call would fail at once and be counted against the key as a death.
-            pid in workers() || break
-            if pid in c.retired
-                # A `:resize` took this worker out. It leaves the pool, which is what frees its
-                # cores; it was between units, so nothing is cut.
-                log_event(log, :worker_retired; stage=stage, worker=pid, host=host)
-                @async try
-                    rmprocs(pid; waitfor=30)
-                catch
-                end
-                break
-            end
-            host in c.drained && break
-            # The pool retires its own workers; the task only has to leave.
-            (pool !== nothing && _pool_retiring(pool, pid)) && break
-            accept = if pool === nothing
-                nothing
-            else
-                row -> _pool_accepts(pool, pid, row, opts.deadline, min_time)
-            end
-            i = if c.paused || stopped[]
-                nothing
-            else
-                _next_fitting!(table, pid, fits; accept=accept)
-            end
-            if i === nothing
-                # Leave when nothing is out and nothing can arrive. A paused master keeps its
-                # queue, and its dispatch tasks with it; so does a pool with keys still queued
-                # that this worker's size does not fit yet.
-                out[] == 0 &&
-                    !(c.paused && !stopped[] && _has_queued(table)) &&
-                    !(queued_now[] && !stopped[]) &&
-                    break
-                w0 = time()
-                why = if c.paused
-                    :paused
-                elseif stopped[]
-                    :stopping
-                elseif held_now[]
-                    :lock_busy
-                else
-                    :queue_empty
-                end
-                wait(idle)
-                _acct_idle!(master.acct, pid, why, w0, time())
-                continue
-            end
-            row = table.rows[i]
-            tok = owner_token(host, ospid)
-            # Settled since it was drawn (a stop's `settle_queued!`): not started after all.
-            start_task!(table, i, tok, pid) || continue
-            pool === nothing || _pool_served!(pool, pid)
-            _out_add!(tok, vault, row.key)
-            out[] += 1
-            t0 = time()
-            died = false
-            kept = false
-            outcome = try
-                last(
-                    remotecall_fetch(
-                        _run_installed,
-                        pid,
-                        rid,
-                        row.key;
-                        tok=tok,
-                        resume=row.progress,
-                        reap=false,
-                        watch=StopWatch(master.started, master.id, master.job),
-                        class=_class_of(key_class, row.key),
-                    ),
-                )
-            catch e
-                # The round stopped waiting for this task; what its worker does now is not the
-                # round's (no death counted, no memory raised for a key it gave up on).
-                current_task() in abandoned && return nothing
-                # Distributed reports the exit when its side closes, which can be a moment
-                # before the process is seen to have ended: that moment is waited for.
-                gone =
-                    e isa ProcessExitedException &&
-                    timedwait(
-                        () -> _worker_dead(pid, launcher), _EXIT_CONFIRM[]; pollint=0.05
-                    ) === :ok
-                if e isa ProcessExitedException && !gone
-                    # Distributed has closed its side (the worker was asked to leave, or the
-                    # connection dropped) and the PROCESS is not known to have ended: it may be
-                    # computing. Its lock is not released under it; the key is held, by it.
-                    kept = true
-                    _out_keep!(tok)
-                    push!(_KEPT_WORKERS, pid)
-                    log_event(
-                        log,
-                        :lock_kept;
-                        level=:warn,
-                        stage=stage,
-                        key=row.kstr,
-                        owner=tok,
-                        worker=pid,
-                        why="the connection to the worker is closed and its process is not " *
-                            "known to have ended",
-                    )
-                    died = true                          # this dispatch task is over
-                    :lock_busy
-                elseif e isa ProcessExitedException
-                    died = true
-                    _release_dead!(vault, row, tok, stage, log)
-                    # The worker cannot say what the attempt cost; the master knows how long.
-                    log_event(
-                        log,
-                        :key_spent;
-                        stage=stage,
-                        key=row.kstr,
-                        outcome="worker_died",
-                        secs=time() - t0,
-                        cores=get(master.acct.cores, pid, 0),
-                        host=host,
-                        class=_class_of(key_class, row.key),
-                    )
-                    ord = get(c.stopping, row.kstr, nothing)
-                    if ord !== nothing && (ord.cut || ord.tries > 0)
-                        # Removed on purpose — also when the exit comes between two tries of
-                        # the cut: not a death of the key, and not its memory.
-                        :stopped
-                    else
-                        lock(() -> row.deaths += 1, table.lock)
-                        # More memory for the next hand-out, when there is one: a key that is
-                        # given up on now is not "retried with more".
-                        (pool === nothing || row.deaths > _WORKER_DEATH_REDISPATCHES) ||
-                            _pool_death!(pool, row, pid, log, stage)
-                        _after_death(row, log, stage)
-                    end
-                else
-                    log_event(
-                        log,
-                        :error;
-                        stage=stage,
-                        key=row.kstr,
-                        attempt=0,
-                        err=_short_err(e),
-                    )
-                    :error
-                end
-            finally
-                out[] -= 1
-                if !kept
-                    _out_remove!(tok)
-                    _out_unkeep!(tok)
-                end
-            end
-            # A task the round stopped waiting for (its worker could not be removed): the round
-            # has reported without it. What comes back now changes nothing it reported.
-            current_task() in abandoned && return nothing
-            order = get(c.stopping, row.kstr, nothing)
-            if order !== nothing
-                delete!(c.stopping, row.kstr)
-                # A unit that was cut comes back as a lost lock, an error from the interrupt, or
-                # not at all. Whatever it is, the unit was stopped, not failed.
-                order.cut && outcome !== :ok && (outcome = :stopped)
-                # Told to stop, and its worker died before it left: it stays stopped. Requeued,
-                # it would be the next key handed out.
-                outcome === nothing && (outcome = :stopped)
-            end
-            # The same for a key a request cancelled while it was running.
-            if outcome === nothing && any(f -> matches(f, row.key), c.cancels)
-                outcome = :cancelled
-            end
-            outcome === :lock_busy && (master.collisions += 1)
-            _account_key!(master, vault, row, pid, t0, outcome)
-            if outcome === nothing
-                # What it had reported before it died is where the next worker starts.
-                row.progress = _read_progress_one(vault, row.kstr)
-                requeue!(table, i; front=true)
-            else
-                settle!(table, i, outcome)
-            end
-            notify(idle)
-            died && break
-        end
-        return nothing
-    end
-
-    # Start a dispatch task for every worker that does not have one. Workers present when the
-    # round began were prepared by `run!`; later ones are prepared here.
-    function _adopt!()
-        # `workers()` is `[1]` when there are none: the master is not one of its own workers.
-        # (A worker whose lock was kept is still inside the unit it could not be stopped in:
-        # it gets no key from a later round in this process.)
-        fresh = [
-            p for p in workers() if
-            !(p in started) && p != myid() && !(p in rejected) && !(p in _KEPT_WORKERS)
-        ]
-        # A worker the pool is still starting is visible here before the pool knows its size;
-        # it gets a dispatch task once it is registered, not before.
-        pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)
-        isempty(fresh) && return nothing
-        late = !isempty(started)
-        # Workers `run!` found when it began were readied by it; a pool's own, and any that
-        # join later, here.
-        found = if pool === nothing
-            (late ? Int[] : fresh)
-        else
-            [p for p in fresh if p in first_foreign]
-        end
-        todo = setdiff(fresh, found)
-        ready = if prepare === nothing || isempty(todo)
-            fresh
-        else
-            ok = prepare(todo)
-            if length(ok) < length(todo)
-                # The batch failed as one. Each by itself, so the one that cannot be readied is
-                # the only one left out — and it is set aside: asked again every tick, it was
-                # re-readying every worker and logging the same line each second.
-                ok = Int[]
-                for p in todo
-                    if !isempty(prepare([p]))
-                        push!(ok, p)
-                    elseif (prep_tries[p] = get(prep_tries, p, 0) + 1) >= _PREPARE_TRIES
-                        # Given up on: left out of the round, and — if it is the pool's —
-                        # retired there, so that it is not counted as a worker any more.
-                        push!(rejected, p)
-                        pool === nothing || _pool_rejected!(pool, p, log, stage)
-                    end                                 # else: once more, next tick
-                end
-            end
-            vcat(found, ok)
-        end
-        _identify_workers!(master, ready)
-        who = lock(() -> copy(master.who), master.lock)
-        n = 0
-        for pid in ready
-            w = get(who, pid, nothing)
-            if w === nothing
-                # Could not say who it is: asked again on the next ticks, said once, and given
-                # up on after a few — it was asked, and readied again, every tick for ever.
-                if (prep_tries[pid] = get(prep_tries, pid, 0) + 1) >= _PREPARE_TRIES
-                    push!(rejected, pid)
-                    pool === nothing || _pool_rejected!(pool, pid, log, stage)
-                end
-                if !(pid in unidentified)
-                    push!(unidentified, pid)
-                    log_event(
-                        log,
-                        :workers_rejected;
-                        level=:warn,
-                        stage=stage,
-                        n=1,
-                        err="worker $pid did not answer who it is; it gets no work until it does",
-                    )
-                end
-                continue
-            end
-            push!(started, pid)
-            n += 1
-            t = @async try
-                _loop(pid, w.host, w.pid)
-            finally
-                # A loop that leaves on an exception must not strand the ones waiting on it.
-                notify(idle)
-            end
-            task_of[pid] = t
-            push!(tasks, t)
-        end
-        (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
-        return nothing
-    end
-
+    r = Round(
+        work_fn,
+        vault,
+        table,
+        stage,
+        log,
+        opts,
+        master;
+        affinity,
+        prepare,
+        key_class,
+        fits,
+        tick,
+        pool,
+        min_time,
+    )
     pool === nothing ||
         _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
-    _adopt!()
-    done = Ref(false)
-    idle_since = Ref(0.0)
-    # One step of the ticker, by name. A failure is logged on its first occurrence and then
-    # every `_TICK_SAY_EVERY`-th, with the count. One of `_TICK_FATAL_STEPS` that has failed
-    # for `_TICK_FATAL_AFTER` seconds ends the round with an error: a master whose pool tick
-    # cannot run is not doing its job.
-    fails = Dict{Symbol,Int}()
-    failing_since = Dict{Symbol,Float64}()
-    function step(f, name::Symbol)
-        try
-            f()
-            fails[name] = 0
-            delete!(failing_since, name)
-        catch e
-            e isa InterruptException && rethrow()
-            n = fails[name] = get(fails, name, 0) + 1
-            since = get!(failing_since, name, time())
-            try
-                (n == 1 || n % _TICK_SAY_EVERY == 0) && log_event(
-                    log,
-                    :tick_failed;
-                    level=:warn,
-                    stage=stage,
-                    step=String(name),
-                    count=n,
-                    secs=round(Int, time() - since),
-                    err=_short_err(e),
-                )
-            catch e2
-                # The log is what failed. The ticker must outlive that: it is what cuts,
-                # flushes and plans.
-                e2 isa InterruptException && rethrow()
-            end
-            # By time, not by ticks (with a pool a tick is a second), and only for the steps a
-            # round cannot do without: a pool that cannot plan, stops that cannot be enforced.
-            # A flush or a request poll that cannot reach the file system is said and retried.
-            if name in _TICK_FATAL_STEPS &&
-                time() - since >= _TICK_FATAL_AFTER[] &&
-                abort[] === nothing
-                abort[] = ErrorException(
-                    "run!: the master's `$name` step has failed for " *
-                    "$(round(Int, time() - since)) s, $n times in a row " *
-                    "(last: $(_short_err(e))); see kind=\"tick_failed\" in the event log",
-                )
-                # The round is ending: the units still running are given a bound, so that it
-                # does end. (Hand-outs stopped, and `run!` then waited for every unit, with
-                # no bound by default.)
-                try
-                    grace = isfinite(opts.stop_grace) ? opts.stop_grace : _ABORT_GRACE[]
-                    _order_stops_all!(master, table, grace, "abort")
-                catch e3
-                    e3 isa InterruptException && rethrow()
-                end
-            end
-        end
-        return nothing
-    end
-    # `every`, not `tick`: `tick` is the caller's per-tick callback (a keyword of this function).
-    every = opts.control_interval > 0 ? opts.control_interval : 10.0
-    # A pool is looked at more often than requests are: a start it does not make is idle room.
-    pool === nothing || (every = min(every, pool.poll))
+    _round_adopt!(r)
     @async while true
-        sleep(every)
-        done[] && break
-        # Each step under its own guard: one that throws used to switch off every step after
-        # it, each tick — the cut of units past their grace, the manifest, the pool.
-        step(:control) do
-            # Without a pool the ticker runs once per `control_interval`, so every tick is a
-            # poll. With one it runs at the pool's pace, and requests are still read only
-            # every `control_interval`.
-            poll_control!(
-                master, table, log, opts; affinity=affinity, force=pool === nothing
-            )
-        end
-        if pool !== nothing
-            # Not for a round that is ending with an error: nothing more is started for it.
-            abort[] === nothing && step(:pool) do
-                _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
-            end
-            # Whatever the tick did, the wait loop decides on what is true now.
-            step(:pool_wants) do
-                queued_now[] = _pool_wants(pool, table)
-            end
-        end
-        step(_adopt!, :adopt)
-        step(:underused) do
-            _leave_if_underused!(master, table, out[], idle_since, opts, log)
-        end
-        step(:stop_grace) do
-            # The job's own stop — its flag, its deadline, leaving an under-used allocation —
-            # gets its grace once, when it is first seen.
-            own_stop =
-                _stop_reason(opts) !== nothing || (c.stop_all && c.stop_why === :underused)
-            if !graced[] && own_stop
-                graced[] = true
-                _order_stops_all!(master, table, opts.stop_grace, "stop_grace")
-            end
-        end
-        step(:enforce_stops) do
-            _enforce_stops!(master, table, log)
-            # A unit that could not be cut: the round ends, saying which worker is still there.
-            # EVERY such unit's dispatch task stops being waited for; only the error is the
-            # first one's. With two workers that could not be removed, the second used to be
-            # waited for, and `run!` still did not return.
-            for (kstr, o) in c.stopping
-                o.failed || continue
-                abort[] === nothing && (abort[] = ErrorException("run!: " * o.why))
-                i = get(table.index, kstr, 0)
-                t = i == 0 ? nothing : get(task_of, table.rows[i].worker, nothing)
-                t === nothing || push!(abandoned, t)
-            end
-        end
-        step(tick, :flush)
-        step(:held) do
-            held_now[] = lock(() -> any(r -> r.state === :held, table.rows), table.lock)
-        end
-        # Wakes the idle dispatch tasks: a resume, a new key or a new stop is theirs to act on.
-        notify(idle)
+        sleep(r.every)
+        r.done && break
+        _round_tick!(r)
     end
-
-    failure = nothing
-    try
-        i = 1
-        while true
-            while i <= length(tasks)               # the list grows as workers are adopted
-                t = tasks[i]
-                # Woken by every dispatch task that ends and by every tick. A task whose worker
-                # could not be removed is not waited for: its call does not return.
-                while !istaskdone(t) && !(abort[] !== nothing && t in abandoned)
-                    wait(idle)
-                end
-                if istaskdone(t)
-                    try
-                        wait(t)
-                    catch e
-                        failure === nothing && (failure = e)
-                    end
-                end
-                i += 1
-            end
-            abort[] === nothing || break
-            # A pool may have nothing started yet, or be starting the workers the queue still
-            # needs: the round is not over while it is working towards them.
-            (
-                pool !== nothing &&
-                failure === nothing &&
-                _stop_reason(opts, master) === nothing
-            ) || break
-            _pool_wants(pool, table) || break
-            sleep(min(every, 0.2))
-        end
+    failure = try
+        _round_wait!(r)
     finally
-        done[] = true
+        r.done = true
         # The workers can forget this round.
-        for pid in started
-            pid in workers() && remote_do(_drop_round, pid, rid)
+        for pid in r.started
+            pid in workers() && remote_do(_drop_round, pid, r.rid)
         end
     end
-    # A cut removes a worker and then releases its lock; the round is over when that is done,
-    # so what it reports (and what the next round finds on disk) is settled.
-    for t in c.cuts
-        try
-            wait(t)
-        catch
-        end
-    end
-    empty!(c.cuts)
-    failure === nothing || throw(failure)
-    abort[] === nothing || throw(abort[])
-    # A pool that cannot start workers is not a round that ended: said, and an error.
-    if pool !== nothing && _pool_gave_up(pool) && _has_queued(table)
-        log_event(
-            log,
-            :pool_gave_up;
-            level=:error,
-            stage=stage,
-            fails=pool.fails,
-            rejects=pool.rejects,
-            nodes_out=sort!(collect(pool.bad_nodes)),
-            queued=count(r -> r.state === :todo, table.rows),
-        )
-        nodes_out = if isempty(pool.bad_nodes)
-            ""
-        else
-            " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
-        end
-        # What to look for depends on what failed: starts that brought nothing, or workers that
-        # started and could not be readied.
-        # By the rule that fired, not by which count happens to be larger.
-        why = _pool_gave_up_why(pool)
-        what, where = if why === :rejects
-            "$(pool.rejects) workers in a row started and could not be readied",
-            "kind=\"workers_rejected\" / \"pool_retire\""
-        elseif why === :starts
-            "$(pool.fails) worker starts failed in a row",
-            "kind=\"pool_spawn_failed\" / \"pool_spawn_short\""
-        else
-            "no node is left to start workers on",
-            "kind=\"pool_node_out\", with why each node went"
-        end
-        error(
-            "SizedPool: $what with keys still queued." *
-            nodes_out *
-            " The reasons are in the event log ($where).",
-        )
-    end
-
-    # Keys still queued with nobody left to take them. Under a stop they are attributed to it;
-    # otherwise every worker died (or was drained or retired) while they were pending: they were
-    # never attempted, so they are retriable rather than failed, and `run!` counts them with
-    # `busy`.
-    stop = _stop_reason(opts, master)
-    if stop !== nothing
-        settle_queued!(table, _stop_outcome(stop))
-    else
-        for (i, r) in enumerate(table.rows)
-            r.state === :todo || continue
-            log_event(log, :worker_lost; stage=stage, key=r.kstr)
-            settle!(table, i, :worker_lost)
-        end
-    end
-    return nothing
+    return _round_finish!(r, failure)
 end
 
 # What becomes of a key whose worker died under it: back on the queue (`nothing`), or, once it
