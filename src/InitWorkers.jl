@@ -141,10 +141,13 @@ function init_workers!(;
             #
             # `JULIA_WORKER_TIMEOUT` is nested inside the same block so
             # srun-spawned workers inherit a longer handshake window.
-            withenv(
-                "SLURM_NTASKS" => string(n_workers),
-                "JULIA_WORKER_TIMEOUT" => string(worker_timeout),
-            ) do
+            #
+            # `SLURM_KILL_BAD_EXIT=0` (what `srun -K0` sets): all workers are tasks of ONE
+            # `srun` step, and on a cluster configured with `KillOnBadExit=1` a single worker
+            # that is killed — out of memory, most often — has Slurm terminate the whole step,
+            # every other worker with it. Seen on the first run on a cluster: one `kill -9`,
+            # sixteen workers gone. A value the job's own script set is left alone.
+            withenv(_slurm_launch_env(n_workers, worker_timeout)...) do
                 mgr = SlurmClusterManager.SlurmManager(;
                     launch_timeout=Float64(launch_timeout)
                 )
@@ -288,6 +291,15 @@ function verify_workers!()
     println()
     flush(stdout)
     return nothing
+end
+
+# The environment `srun` is started in for the `:slurm` backend's workers.
+function _slurm_launch_env(n_workers::Integer, worker_timeout, env=ENV)
+    return [
+        "SLURM_NTASKS" => string(n_workers),
+        "JULIA_WORKER_TIMEOUT" => string(worker_timeout),
+        "SLURM_KILL_BAD_EXIT" => get(env, "SLURM_KILL_BAD_EXIT", "0"),
+    ]
 end
 
 # Load `modnames` (e.g. [:ParamIO, :DataVault, :SweepRunner, :MyWork]) into `Main` on EVERY

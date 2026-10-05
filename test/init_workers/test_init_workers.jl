@@ -94,3 +94,16 @@ end
     @test_throws ArgumentError wmn(42)                # clear error, not a deep MethodError
     @test_throws ArgumentError wmn([1, 2])            # bad collection element
 end
+
+@testset "the :slurm backend's step is not ended by one worker being killed" begin
+    # All workers are tasks of one `srun` step; with `KillOnBadExit=1` in the cluster's
+    # configuration Slurm ends the whole step when one of them is killed. On issp-ohtaka one
+    # `kill -9` took sixteen workers (job 3094855); with this set, one (job 3094870).
+    env = Dict(SweepRunner._slurm_launch_env(16, 300, Dict{String,String}()))
+    @test env["SLURM_KILL_BAD_EXIT"] == "0"
+    @test env["SLURM_NTASKS"] == "16"
+    @test env["JULIA_WORKER_TIMEOUT"] == "300"
+    # What the job's own script chose is not overridden.
+    mine = Dict("SLURM_KILL_BAD_EXIT" => "1")
+    @test Dict(SweepRunner._slurm_launch_env(4, 60, mine))["SLURM_KILL_BAD_EXIT"] == "1"
+end

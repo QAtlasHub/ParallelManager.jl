@@ -483,6 +483,19 @@ function worker_size(
     )
 end
 
+# The index of the smallest worker in `cover` that fits `need` (fewest cores, then least
+# memory), or `nothing`.
+function _best_cover(cover::AbstractVector{KeyReq}, need::KeyReq)
+    best = nothing
+    for (j, c) in enumerate(cover)
+        _fits(c, need) || continue
+        if best === nothing || (c.cores, c.mem_gb) < (cover[best].cores, cover[best].mem_gb)
+            best = j
+        end
+    end
+    return best
+end
+
 """
     plan_spawns(needs, waited, nodes, free_cores, free_mem, covering; threads, max_threads,
                 starve_after, room) -> (; starts, blocked, capped)
@@ -519,7 +532,11 @@ function plan_spawns(
     blocked = Int[]
     capped = false
     for (i, need) in enumerate(needs)
-        j = findfirst(c -> _fits(c, need), cover)
+        # The SMALLEST covering worker that fits, not the first: a two-core need that took
+        # an eight-core worker's place left the eight-core need behind it uncovered, and one
+        # more eight-core worker was started for it — a third more workers than keys on the
+        # first job this ran in.
+        j = _best_cover(cover, need)
         if j !== nothing
             deleteat!(cover, j)
             continue
@@ -814,11 +831,21 @@ end
 
 # May worker `pid` take `row`? A worker the pool started takes what its size holds; one that was
 # there before the pool takes anything, as it did without one.
-function _pool_accepts(pool::SizedPool, pid::Int, row::TaskRow, deadline, min_time)::Bool
+#
+# `tight`: only a key that uses more than half of the worker (cores or memory). A dispatch task
+# asks for one of those first. Taking the first key that fits, an eight-core worker that came up
+# before the two-core ones took the two-core keys at the head of the queue; the eight-core keys
+# behind them then had no idle worker to cover them and the pool started another for each — a
+# third more workers than keys on the first job this ran in.
+function _pool_accepts(
+    pool::SizedPool, pid::Int, row::TaskRow, deadline, min_time; tight::Bool=false
+)::Bool
     w = get(pool.workers, pid, nothing)
-    w === nothing && return pid in pool.foreign
+    w === nothing && return !tight && pid in pool.foreign
     w.retiring && return false
-    return _fits(w.size, _pool_need(pool, row, deadline, min_time))
+    need = _pool_need(pool, row, deadline, min_time)
+    _fits(w.size, need) || return false
+    return !tight || 2 * need.cores > w.size.cores || 2 * need.mem_gb > w.size.mem_gb
 end
 
 # May the dispatcher give worker `pid` a dispatch task yet? Not between the moment `addprocs`
@@ -1458,8 +1485,10 @@ end
 # Is there still something the pool is working towards?
 function _pool_wants(pool::SizedPool, table::TaskTable)
     _pool_gave_up(pool) && return false
-    isempty(pool.starting) || return true
-    return _has_queued(table) && !pool.stuck
+    # Only while there is a key for it: starts still on their way when the last key is done are
+    # for nobody, and a round that waited for them ended minutes after its work.
+    _has_queued(table) || return false
+    return !isempty(pool.starting) || !pool.stuck
 end
 
 """

@@ -300,6 +300,18 @@ function job_gone(s::SlurmScheduler, id::AbstractString)
     return nothing
 end
 
+# How long the accounting says a job ran, in seconds; `nothing` when it cannot say. (First run
+# against a cluster: a 30-second job that the ledger saw end through the accounting was billed
+# its whole two-minute limit, because the last time the queue listed it was all it had.)
+function job_elapsed(s::SlurmScheduler, id::AbstractString)
+    out = _run(s, `sacct -n -X -P -j $id -o ElapsedRaw`)
+    out === nothing && return nothing
+    lines = split(out, '\n'; keepempty=false)
+    isempty(lines) && return nothing
+    secs = tryparse(Float64, strip(first(lines)))
+    return (secs === nothing || !isfinite(secs) || secs < 0) ? nothing : secs
+end
+
 function remaining_time(s::SlurmScheduler, id::AbstractString)
     out = _run(s, `squeue -h -j $id -o %L`)
     (out === nothing || isempty(strip(out))) && return nothing
@@ -899,6 +911,15 @@ Positive evidence about a job the queue no longer lists: `true` it has ended, `f
 job_gone(::Scheduler, ::AbstractString) = nothing
 
 """
+    job_elapsed(scheduler, id) -> Union{Float64,Nothing}
+
+How long a job that has ended ran, by the scheduler's accounting; `nothing` when it cannot say
+(the default). The ledger bills a job that the accounting says is over for this, instead of for
+the most it can have run since the queue last listed it.
+"""
+job_elapsed(::Scheduler, ::AbstractString) = nothing
+
+"""
     observe!(ledger, states; now=time(), names=(), gone=id -> nothing) -> Vector{NamedTuple}
 
 Bring the ledger up to what the scheduler says, and return what changed
@@ -930,6 +951,7 @@ function observe!(
     now::Real=time(),
     names=(),
     gone=id -> nothing,
+    elapsed=id -> nothing,
 )
     changes = NamedTuple[]
     by = Dict(j.id => j for j in states)
@@ -1047,6 +1069,17 @@ function observe!(
             before = Float64(j["elapsed"])
             j["elapsed"] = min(Float64(j["time_limit"]), before + max(since, 0.0))
             isfinite(j["elapsed"]) || (j["elapsed"] = before + max(since, 0.0))
+            # ...unless the accounting, which is what says it is over, also says for how long:
+            # a job that finished its work early is not billed its whole limit.
+            if confirmed
+                ran = try
+                    elapsed(id)
+                catch e
+                    e isa InterruptException && rethrow()
+                    nothing
+                end
+                (ran isa Real && isfinite(ran) && ran >= 0) && (j["elapsed"] = Float64(ran))
+            end
             billed = j["elapsed"]
         end
         push!(
@@ -1444,6 +1477,7 @@ function _observe_and_say!(ctl::JobController, l::Ledger, states; dry::Bool)
         l,
         states;
         names=_job_names(ctl.policy),
+        elapsed=id -> job_elapsed(ctl.scheduler, id),
         gone=id -> try
             job_gone(ctl.scheduler, id)
         catch e
