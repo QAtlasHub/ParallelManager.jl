@@ -940,8 +940,9 @@ run_loop!(work_fn, vault, keys;
   job runs down the long keys drop out and the short ones still run. This
   replaces per-partition filters by hand: the keys that occupied half the
   workers of every short job without advancing are the ones held back.
-- `run_loop!` returns at once (`stopped_by = :deadline`) when all that is left
-  was held back, rather than sitting out idle rounds.
+- `run_loop!` returns at once when all that is left was held back, rather than
+  sitting out idle rounds: `stopped_by = :deadline`, or `:cost_unknown` when
+  every key left was held back because nobody could say how long it takes.
 - With `RunOpts(min_busy_fraction = …)` (guide 13) the master then leaves when
   what is running is too little to hold the allocation for.
 

@@ -589,9 +589,12 @@ While it runs, the master rewrites `<state_root>/masters/<id>/status.json` every
 `opts.status_interval` seconds; [`read_status`](@ref) / [`print_status`](@ref) read it from any
 process, during the job or after it.
 
-Returns `(; stage, done, err, busy, gave_up, stop, cancelled, held_back, collisions, skipped,
-total, remaining, stopped_by)`. `cancelled` counts the keys a request took out of this job;
-`held_back` the keys not started because they could not get anywhere before the deadline;
+Returns `(; stage, done, err, busy, gave_up, stop, cancelled, held_back, cost_unknown,
+explore_again, collisions, skipped, total, remaining, stopped_by)`. `cancelled` counts the keys a
+request took out of this job; `held_back` the keys not started because they could not get
+anywhere before the deadline, `cost_unknown` how many of those were held back because nobody
+could say how long they take, and `explore_again` the classes whose explored key did not finish
+(the next round tries another);
 `collisions` the keys that were handed to a worker and came back because another master took
 them first; `total` includes the
 keys a request added; `remaining` is how many keys are not done after the round (`0`: the sweep
@@ -748,7 +751,8 @@ function run!(
     )
     # A hook that throws is said — here, whatever the options: the ordering, the pool's sizing
     # and the campaign's filter ask it too, and there its error only read as "unknown".
-    _say_hook_error(log, stage, something(min_time, cost, Some(nothing)), todo)
+    hook_said = Ref(false)
+    _say_hook_error(log, stage, something(min_time, cost, Some(nothing)), todo, hook_said)
     todo = _ordered(todo, opts, cost)
     t_scan = time()
     # Whether a key can still get somewhere before the deadline; asked at each hand-out.
@@ -786,7 +790,12 @@ function run!(
             key=kstr,
             why="its time is not known; one key of the class is started to measure it",
         ),
-        # A hook that throws was said by `_say_hook_error` before the queue was ordered.
+        # A hook that throws for the first queued key was said before the queue was ordered;
+        # one that throws only for others is said here, the first time it does.
+        on_error=err -> if !hook_said[]
+            hook_said[] = true
+            log_event(log, :cost_hook_failed; level=:warn, stage=stage, err=err)
+        end,
         on_cap=n -> log_event(
             log,
             :cost_explore_capped;
@@ -2367,9 +2376,10 @@ The loop exits when:
   sibling (once the busy budget below is spent, rounds with keys still held count as empty
   too, so the return with `busy > 0` comes `max_empty_rounds` rounds after it, not at once), or
 - `opts.stop_flag` is raised, or `opts.deadline` has passed, or
-- a round held keys back because they could not get anywhere before `opts.deadline`
-  (`held_back > 0`): the loop returns `stopped_by = :deadline` instead of sitting out idle rounds
-  over keys it will not start, or
+- a round held keys back and did nothing else (`held_back > 0`): the loop returns instead of
+  sitting out idle rounds over keys it will not start — `stopped_by = :deadline` when they could
+  not get anywhere before `opts.deadline`, `:cost_unknown` when every one of them was held back
+  because nobody could say how long it takes — or
 - a round ended `:underused` (`opts.min_busy_fraction`) or on a `:stop` request with no scope, or
 - keys are still held by a sibling after the busy budget below: the loop returns with
   `busy > 0`, `remaining > 0`.
@@ -2521,7 +2531,9 @@ function _run_loop!(
         if result.done == 0 &&
             result.busy == 0 &&
             result.held_back > 0 &&
-            result.explore_again == 0
+            result.explore_again == 0 &&
+            # ...and the round was not itself stopped: that is then the reason, not this.
+            result.stopped_by === nothing
             # Held for the deadline, or held because nobody knows how long they take: two
             # things. The second is not the job running out of time, and a campaign goes on to
             # its next stage after it.
@@ -2722,13 +2734,13 @@ const _EXPLORE_MAX = Ref(8)
 
 # Ask the cost hook about the first queued key, to say an error it throws: once, with what it
 # threw. (Later calls go through `key_seconds`, which turns a throw into "unknown".)
-function _say_hook_error(log::EventLog, stage::Symbol, hook, todo)
+function _say_hook_error(log::EventLog, stage::Symbol, hook, todo, said=Ref(false))
     (hook === nothing || isempty(todo)) && return nothing
     failure = Ref{Any}(nothing)
     key_seconds(hook, first(todo); failure=failure)
-    failure[] === nothing || log_event(
-        log, :cost_hook_failed; level=:warn, stage=stage, err=_short_err(failure[])
-    )
+    failure[] === nothing && return nothing
+    said[] = true
+    log_event(log, :cost_hook_failed; level=:warn, stage=stage, err=_short_err(failure[]))
     return nothing
 end
 

@@ -1308,3 +1308,51 @@ end
         end
     end
 end
+
+# ── fourth review (#173) ─────────────────────────────────────────────────────────────────────────
+
+@testset "cli: cancel and prioritise need a filter, or --all said aloud (#173)" begin
+    _ct_vault() do v, outdir
+        run!(_ct_ok, v, DataVault.keys(v))
+        reqs = joinpath(state_root(v), "control", "requests")
+        n0 = isdir(reqs) ? length(readdir(reqs)) : 0
+        for op in ("cancel", "prioritise")
+            io = IOBuffer()
+            @test SweepRunner.cli([op, outdir]; io=io) == 2
+            @test occursin("needs --select", String(take!(io)))
+            @test SweepRunner.cli([op, outdir, "--running"]; io=IOBuffer()) == 2
+        end
+        # Nothing was sent: an empty filter matches every key, and that has to be asked for.
+        @test (isdir(reqs) ? length(readdir(reqs)) : 0) == n0
+        @test SweepRunner.cli(
+            ["cancel", outdir, "--all", "--select", "N=4"]; io=IOBuffer()
+        ) == 2
+        # Asked for, it is sent (to nobody here: exit 3), and so is one with a filter.
+        @test SweepRunner.cli(["cancel", outdir, "--all"]; io=IOBuffer()) == 3
+        @test SweepRunner.cli(["cancel", outdir, "--select", "N=4"]; io=IOBuffer()) == 3
+        @test SweepRunner.cli(["prioritise", outdir, "--samples", "1"]; io=IOBuffer()) == 3
+        @test length(readdir(reqs)) == n0 + 3
+    end
+end
+
+@testset "cli: the reading commands refuse a flag they do not know and a path with no sweep (#173)" begin
+    empty = mktempdir()
+    for cmd in ("status", "locks", "account", "costs")
+        io = IOBuffer()
+        @test SweepRunner.cli([cmd, empty]; io=io) == 1
+        @test occursin("no sweep state under", String(take!(io)))
+        @test SweepRunner.cli([cmd]; io=IOBuffer()) == 2
+    end
+    _ct_vault() do v, outdir
+        run!(_ct_ok, v, DataVault.keys(v))
+        @test SweepRunner.cli(["locks", outdir, "--Reap"]; io=IOBuffer()) == 2   # not a listing
+        @test SweepRunner.cli(["status", outdir, "--verbose"]; io=IOBuffer()) == 2
+        @test SweepRunner.cli(["account", outdir, "--json"]; io=IOBuffer()) == 2
+        for cmd in ("status", "locks", "account", "costs")
+            @test SweepRunner.cli([cmd, outdir]; io=IOBuffer()) == 0
+        end
+        @test SweepRunner.cli(["status", outdir, "--workers"]; io=IOBuffer()) == 0
+        @test SweepRunner.cli(["pause", outdir, "--wait", "NaN"]; io=IOBuffer()) == 2
+        @test SweepRunner.cli(["pause", outdir, "--wait", "-1"]; io=IOBuffer()) == 2
+    end
+end

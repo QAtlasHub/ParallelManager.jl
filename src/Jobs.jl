@@ -1507,6 +1507,7 @@ function controller_loop!(
     last::Union{Base.RefValue,Nothing}=nothing,
 )
     rounds = 0
+    failed_rounds = 0
     while !stop()
         rounds += 1
         decisions = try
@@ -1526,6 +1527,10 @@ function controller_loop!(
             # A wrong configuration is not a round to try again: it fails the same way for ever
             # (a `max_key_time` profile with no cost model was "round N failed", every round).
             e isa ArgumentError && rethrow()
+            # Nor is any other error that comes back every round: after a few in a row it is
+            # raised, instead of "round N failed" for as long as the loop is left running.
+            failed_rounds += 1
+            failed_rounds >= _CONTROLLER_MAX_FAILED && rethrow()
             (max_rounds !== nothing && rounds >= max_rounds) && break
             ctl.policy.dry_run && rethrow()
             sleep(interval)
@@ -1540,6 +1545,7 @@ function controller_loop!(
             end
             flush(io)
         end
+        failed_rounds = 0
         last === nothing || (last[] = decisions)
         live = _ledger_live(ctl.ledger)
         idle = all(
@@ -1559,6 +1565,9 @@ function controller_loop!(
     end
     return rounds
 end
+
+# How many rounds in a row may fail before the controller's loop raises the error.
+const _CONTROLLER_MAX_FAILED = 5
 
 """
     print_decisions([io], decisions, ledger, policy)

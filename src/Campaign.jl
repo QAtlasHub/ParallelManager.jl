@@ -584,7 +584,9 @@ What the job ran is on record: `events_campaign_<host>_<pid>.jsonl` under the ca
 gets `campaign_start` (the meta file, its sha256, the profile, the stages in order), one
 `campaign_stage` per stage (ran or why not, and its counts) and `campaign_done`.
 
-Returns `(; campaign, profile, stages, stopped_by)`; `stages` is a vector of
+Returns `(; campaign, profile, stages, stopped_by, cost_unknown)` — `cost_unknown` the stages
+that ended with keys held back for want of a cost (the campaign goes on past them, and is not
+complete); `stages` is a vector of
 `(; stage, ran, reason, keys, result)`.
 """
 function run_campaign!(
@@ -742,11 +744,18 @@ function run_campaign!(
         ran=count(x -> x.ran, results),
         stopped_by=stopped === nothing ? nothing : String(stopped),
     )
+    # Stages that ended with keys nobody could give a time for: the campaign went on, and it is
+    # not complete. (`stopped_by === nothing` alone read as "everything ran".)
+    unknown = String[
+        String(x.stage) for
+        x in results if x.result !== nothing && x.result.stopped_by === :cost_unknown
+    ]
     return (;
         campaign=c.name,
         profile=p === nothing ? nothing : p.name,
         stages=results,
         stopped_by=stopped,
+        cost_unknown=unknown,
     )
 end
 
