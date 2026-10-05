@@ -848,6 +848,13 @@ end
                 @test cuts[end].gave_up == true
                 kept = only([e for e in _ct_events(outdir) if e.kind == "lock_kept"])
                 @test kept.key == long
+                # ...and "kept" holds when the master leaves: its exit hook releases what
+                # this process has out, and this lock is not among that (#169). Left there,
+                # it was cleared with the worker's own token as the master exited.
+                SweepRunner._release_all_at_exit()
+                @test DataVault.is_running(v, target)
+                @test DataVault.running_owner(v, target) == owner
+                @test owner in SweepRunner._out_tokens()       # still listed for a sibling
                 @test DataVault.is_done(v, ks[2])              # the other key was not affected
             finally
                 SweepRunner._KILL_WORKER[] = nothing
@@ -888,6 +895,8 @@ end
                 gave_up = [e for e in ev if e.kind == "key_cut" && get(e, :gave_up, false)]
                 @test Set(e.key for e in gave_up) == Set(ParamIO.canonical.(ks))
                 @test count(e -> e.kind == "lock_kept", ev) == 2
+                SweepRunner._release_all_at_exit()                # the master leaves (#169)
+                @test [DataVault.running_owner(v, k) for k in ks] == owners
             finally
                 SweepRunner._KILL_WORKER[] = nothing
                 SweepRunner._CUT_RETRY[] = 5.0
@@ -897,11 +906,7 @@ end
     end
 end
 
-@testset "a worker that goes between two tries of a cut was removed on purpose, and a cut that throws is bounded (#152)" begin
-    # The order as it stands between two tries: `cut` is false again, `tries` is not zero.
-    o = SweepRunner.StopOrder(time() - 1, false, "r", false)
-    o.tries = 1
-    @test o.cut == false && (o.cut || o.tries > 0)             # what the dispatch task asks
+@testset "a cut that throws is bounded, and its lock is kept out of the exit hook (#152, #169)" begin
     _ct_vault() do v, outdir
         ks = DataVault.keys(v)
         m = SweepRunner.Master()
@@ -925,6 +930,9 @@ end
         end
         @test order.failed                                      # not retried for ever
         @test occursin("threw", order.why)
+        @test "tok" in SweepRunner._out_tokens()                # listed...
+        @test !haskey(SweepRunner._OUT, "tok")                  # ...and not released at exit
+        SweepRunner._out_unkeep!("tok")
         @test count(e -> e.kind == "key_cut_failed", _ct_events(outdir)) ==
             SweepRunner._CUT_TRIES
     end
@@ -1255,5 +1263,48 @@ end
         t0 = time()
         acks = wait_acks(v, id; timeout=5.0, poll=0.1, masters=["a", "b"])
         @test time() - t0 < 2.0 && length(acks) == 2
+    end
+end
+
+@testset "workers: a worker that goes between two tries of a cut is stopped, not a death of its key (#152)" begin
+    _ct_workers(2) do
+        _ct_vault() do v, outdir
+            ks = DataVault.keys(v)[1:2]
+            target = ks[1]
+            long = ParamIO.canonical(target)
+            sel = Dict(String(n) => val for (n, val) in target.params)
+            work = k -> begin
+                sleep(ParamIO.canonical(k) == long ? 600.0 : 0.1)
+                return Dict{String,Any}("x" => 1)
+            end
+            # The first try at removing the worker does nothing; the worker then goes by
+            # itself before the second try (an `rmprocs` that completes late).
+            tries = Ref(0)
+            SweepRunner._KILL_WORKER[] =
+                pid -> begin
+                    tries[] += 1
+                    tries[] == 1 && @async (sleep(0.3); rmprocs(pid; waitfor=0))
+                    return nothing
+                end
+            SweepRunner._CUT_RETRY[] = 5.0                      # the exit comes inside the wait
+            try
+                t = @async run!(work, v, ks; opts=RunOpts(; control_interval=0.2))
+                t0 = time()
+                while !DataVault.is_running(v, target) && time() - t0 < 60
+                    sleep(0.05)
+                end
+                control!(v, :stop; select=sel, grace=0.2)
+                @test timedwait(() -> istaskdone(t), 120.0) === :ok
+                r = fetch(t)
+                # Stopped on purpose: counted as a stop, not handed out again as a death.
+                @test (r.stop, r.done, r.err, r.gave_up) == (1, 1, 0, 0)
+                ev = _ct_events(outdir)
+                @test count(e -> e.kind == "key_acquired" && e.key == long, ev) == 1
+            finally
+                SweepRunner._KILL_WORKER[] = nothing
+                SweepRunner._CUT_RETRY[] = 5.0
+                SweepRunner._release_all_at_exit()
+            end
+        end
     end
 end

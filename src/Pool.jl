@@ -378,8 +378,29 @@ end
 # Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
 # cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
 # a job step dies with its srun client.
-function _kill_worker!(id::Integer; waitfor::Real=5)
+function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
     p = _launcher(id)
+    if hard
+        # For a worker known to be busy (a cut, a master on its way out): asking first is
+        # seconds of waiting behind Distributed's worker lock, one worker at a time, during
+        # which the unit goes on — and, in a cut, can return and take its next key. What
+        # launched it is killed at once, and Distributed is told without waiting.
+        try
+            if p isa Base.Process && process_running(p)
+                kill(p)                      # SIGTERM: an `srun` client takes its step with it
+                timedwait(() -> !process_running(p), 1.0; pollint=0.02) === :ok ||
+                    kill(p, Base.SIGKILL)
+            end
+        catch
+        end
+        try
+            id in procs() && rmprocs(id; waitfor=0)
+        catch
+        end
+        # Gone from `procs()` once Distributed has seen the connection drop.
+        timedwait(() -> !(id in procs()), Float64(waitfor); pollint=0.02)
+        return nothing
+    end
     try
         id in procs() && rmprocs(id; waitfor=waitfor)
     catch

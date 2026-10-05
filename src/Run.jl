@@ -416,6 +416,16 @@ function _stop_outcome(reason::Symbol)::Symbol
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
+# A step of a `finally`: what it throws is not allowed to hide what is already on its way out.
+function _guarded(f)
+    try
+        f()
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return nothing
+end
+
 # How many times a worker that joined late is readied before it is given up on.
 const _PREPARE_TRIES = 3
 
@@ -425,6 +435,9 @@ const _TICK_SAY_EVERY = 100
 # The steps whose lasting failure ends the round, and after how long.
 const _TICK_FATAL_STEPS = (:pool, :adopt, :stop_grace, :enforce_stops)
 const _TICK_FATAL_AFTER = Ref(300.0)
+# How long the units still running get once a round is ending on a failed step, when the
+# options give no `stop_grace`: time for a `stop_point` to save and leave.
+const _ABORT_GRACE = Ref(120.0)
 
 # How many times a key whose worker DIED is handed to another one.
 const _WORKER_DEATH_REDISPATCHES = 2
@@ -865,19 +878,25 @@ function run!(
         # failed worker bootstrap) there can be keys still out: the locks this master named for
         # them are released now, and each key that was cut is logged, rather than left on disk
         # for whoever trips over them.
-        _release_running!(table, vault, stage, log)
+        # Each by itself: one that throws (the event directory full at the end of a job) must
+        # not skip the ones after it, nor take the place of the exception that is propagating.
+        _guarded(() -> _release_running!(table, vault, stage, log))
         # A status that still says `running` after the master has left is the one thing it must
         # not say.
         master.state = after
-        master.interval > 0 && status_tick!(master, log)
+        _guarded(() -> master.interval > 0 && status_tick!(master, log))
         # A master of its own ends here; one handed in (`run_loop!`) reports when the loop ends.
-        own && log_event(log, :job_account; stage=stage, account=account_snapshot(master))
+        _guarded() do
+            return own && log_event(
+                log, :job_account; stage=stage, account=account_snapshot(master)
+            )
+        end
         # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
         # when IT returns).
-        (own && pool !== nothing && !pool.keep) && shutdown!(pool)
+        _guarded(() -> (own && pool !== nothing && !pool.keep) && shutdown!(pool))
         # The round's warnings in one line, however it ended: an exception, a pool that gave
         # up, a cut that failed are the rounds whose warnings matter most.
-        _say_warnings(stage, _warnings_since(warned0))
+        _guarded(() -> _say_warnings(stage, _warnings_since(warned0)))
     end
 
     # Aggregate outcomes into counters + manifest updates.
@@ -1431,7 +1450,7 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
     # leaving their locks to `stale_after`.
     pids = unique(r.worker for (_, r) in cut if r.owner !== nothing && r.worker != 0)
     filter!(p -> p != myid() && p in procs(), pids)
-    remove = something(_KILL_WORKER[], _kill_worker!)
+    remove = something(_KILL_WORKER[], _kill_hard!)
     @sync for pid in pids
         @async try
             remove(pid)
@@ -1458,6 +1477,10 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
                     worker=pid,
                     why="master_exit: the worker could not be removed and is still computing",
                 )
+                # Out of what the exit hook releases: with the token left there, the lock
+                # this line "keeps" was cleared — with the worker's own token — as the master
+                # exited, and the key ran twice.
+                _out_keep!(tok)
                 settle!(table, i, :lock_busy)
                 continue
             end
@@ -1706,7 +1729,11 @@ function _drive_workers!(
             finally
                 out[] -= 1
                 _out_remove!(tok)
+                _out_unkeep!(tok)
             end
+            # A task the round stopped waiting for (its worker could not be removed): the round
+            # has reported without it. What comes back now changes nothing it reported.
+            current_task() in abandoned && return nothing
             order = get(c.stopping, row.kstr, nothing)
             if order !== nothing
                 delete!(c.stopping, row.kstr)
@@ -1863,6 +1890,15 @@ function _drive_workers!(
                     "$(round(Int, time() - since)) s, $n times in a row " *
                     "(last: $(_short_err(e))); see kind=\"tick_failed\" in the event log",
                 )
+                # The round is ending: the units still running are given a bound, so that it
+                # does end. (Hand-outs stopped, and `run!` then waited for every unit, with
+                # no bound by default.)
+                try
+                    grace = isfinite(opts.stop_grace) ? opts.stop_grace : _ABORT_GRACE[]
+                    _order_stops_all!(master, table, grace, "abort")
+                catch e3
+                    e3 isa InterruptException && rethrow()
+                end
             end
         end
         return nothing
