@@ -20,15 +20,18 @@ Depth = 2
 - **Multi-master safe** — several `julia` processes can hit the same vault
   root without double-executing any key (DataVault `.running` advisory lock).
 - **Crash recovery** — `kill -9` a master mid-run and the next `run!` picks
-  up where it left off via heartbeat-based stale lock reclaim.
+  up where it left off: locks whose holder is gone are removed; one nobody answers for is reclaimed after
+  `stale_after`; one a reporting master lists as held is left alone.
 - **Early skip** — full-done re-runs take O(1) filesystem operations
   (a single `manifest.jld2` read), not O(N) per-key `.done` stats.
-  3600-key warm re-run ≈ **3.5 ms**.
+  The test suite bounds the manifest read plus `todo_keys` for 3600 keys at 500 ms, and a
+  3600-key warm `run!` at 1 s.
 - **Structured events** — JSONL event log atomic across concurrent writers;
   per-item `println` is a non-goal, by design.
 - **One entry point for all parallel modes** —
   [`init_workers!(mode=:auto)`](@ref SweepRunner.init_workers!)
-  dispatches to `:sequential` / `:threads` / `:distributed` / `:slurm`
+  sets up `:sequential` / `:threads` / `:distributed` / `:slurm` (keys are dispatched over
+  processes: under `:threads` they run on the master one at a time, with threads inside a key)
   depending on environment.
 - **Pure work functions** — your physics is a plain
   `(DataKey) -> Dict`, IO/locking/logging live in the runtime.
@@ -48,13 +51,13 @@ SweepRunner.run!(work_fn, vault, keys)
 ```
 
 Re-running the same script after completion emits `:skip_complete` and
-exits in milliseconds regardless of `length(keys)`.
+returns after one manifest read, whatever `length(keys)` is.
 
 ## Pain points it answers
 
 | Pain | Answer |
 | :--- | :--- |
-| `.done` files rescanned every job (3600 files, ~10 min) | [`Manifest`](@ref SweepRunner.Manifest) rollup, one JLD2 read |
+| `.done` files rescanned every job (one stat per key, on a network file system) | [`Manifest`](@ref SweepRunner.Manifest) rollup, one JLD2 read |
 | 300 MB of per-item `println` logs | [`EventLog`](@ref SweepRunner.EventLog) (JSONL); per-item `println` is not part of the API |
 | Killed samples silently wedge the queue | Heartbeat + stale-lock reclaim (DataVault `.running`) auto-recover |
 | Multiple masters double-execute the same key | Per-key `.running` advisory lock (`acquire_running!`) + post-lock `is_done` re-check |

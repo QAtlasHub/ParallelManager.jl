@@ -1,0 +1,1501 @@
+# Pool — workers sized to the keys they run.
+#
+# `init_workers!` starts `n` identical workers and `run!` hands any key to any of them, so a sweep
+# whose keys differ in size has to size every worker for its largest key. The figures that
+# prompted this are FiniteTemperature.jl's (128 cores, 226 GB per node; keys from 1 core / 2 GB to
+# 7 cores / 12 GB: ~55 small workers on a node sized per key, 18 sized for the largest). They are
+# that campaign's, reported in #70; nothing in this repository reproduces them.
+#
+# Here a key says what it needs (`key_req(key) -> KeyReq(cores, mem_gb)`), and the pool starts a
+# worker of that size where a node has the room, reuses it for the next key it fits, and retires
+# it when its size has nothing left to do and another size is waiting. A worker that dies under a
+# key (out of memory) has the key retried with more memory.
+#
+# Correctness does not rest on the pool. A key still goes through the per-key pipeline (the lock,
+# the heartbeat, the commit), so a pool's wrong view of the room costs a wasted start and nothing
+# else.
+#
+# The pool, its planner (`plan_spawns`, a pure function) and the local spawner are exercised by
+# the tests. `SlurmStepSpawner` and `StepManager` are the downstream implementation moved here;
+# they need an allocation to run and have not been run from this package. Where a default or a
+# check below exists because of a failure on a cluster, the comment says which.
+
+using Distributed
+using LinearAlgebra: BLAS
+
+"""
+    KeyReq(cores, mem_gb)
+
+What one key needs from the worker that runs it, and the size a worker was started with. `cores`
+is at least 1 and `mem_gb` positive and finite: a zero or negative request would fit any worker
+and give room back to a node when it is placed.
+"""
+struct KeyReq
+    cores::Int
+    mem_gb::Float64
+    function KeyReq(cores::Integer, mem_gb::Real)
+        cores >= 1 || throw(ArgumentError("KeyReq: cores must be >= 1, got $cores"))
+        (isfinite(mem_gb) && mem_gb > 0) ||
+            throw(ArgumentError("KeyReq: mem_gb must be positive and finite, got $mem_gb"))
+        return new(Int(cores), Float64(mem_gb))
+    end
+end
+
+# Can a worker of size `have` run a key that needs `need`?
+_fits(have::KeyReq, need::KeyReq) = need.cores <= have.cores && need.mem_gb <= have.mem_gb
+
+"""
+    PoolNode(name, cores, mem_gb)
+
+A node workers can be started on, and what it offers. A node with no cores or no memory left for
+workers (`0`) is allowed — it simply takes none.
+"""
+struct PoolNode
+    name::String
+    cores::Int
+    mem_gb::Float64
+    function PoolNode(name::AbstractString, cores::Integer, mem_gb::Real)
+        cores >= 0 || throw(ArgumentError("PoolNode $name: cores must be >= 0, got $cores"))
+        (isfinite(mem_gb) && mem_gb >= 0) || throw(
+            ArgumentError("PoolNode $name: mem_gb must be >= 0 and finite, got $mem_gb")
+        )
+        return new(String(name), Int(cores), Float64(mem_gb))
+    end
+end
+
+"""
+    Spawner
+
+Where a [`SizedPool`](@ref)'s workers come from. A backend implements `pool_nodes(s)` (the
+[`PoolNode`](@ref)s it offers) and `start_workers(s, node, size, n; exeflags)` (start `n` workers
+of [`KeyReq`](@ref) `size` on `node`, return the Distributed ids of the ones that are ready).
+[`LocalSpawner`](@ref) and [`SlurmStepSpawner`](@ref) are provided.
+"""
+abstract type Spawner end
+
+"""
+    LocalSpawner(; cores=Sys.CPU_THREADS - 1, mem_gb=0.8 * total memory)
+
+Workers are local `julia --worker` processes on this machine, treated as one node. For tests and
+a workstation; nothing enforces a worker's memory limit.
+"""
+struct LocalSpawner <: Spawner
+    node::PoolNode
+end
+
+function LocalSpawner(;
+    cores::Integer=max(Sys.CPU_THREADS - 1, 1), mem_gb::Real=0.8 * Sys.total_memory() / 2^30
+)
+    return LocalSpawner(PoolNode(gethostname(), Int(cores), Float64(mem_gb)))
+end
+
+"""
+    SlurmStepSpawner(; nodes=<env or the allocation>, mem_per_node_mb=<env or the allocation>,
+                     master_gb=3.0, srun_gb=0.008, headroom_gb=4.0)
+
+Workers are job steps of the current allocation: `srun --exact -N1 -n1 --nodelist=<node>
+--cpus-per-task=<cores> --mem=<mem>`, so each worker is its own step with its own memory cgroup.
+Every node offers its CPUs and memory, less `headroom_gb`. The master's node also keeps one core
+and `master_gb + srun_gb × (cores of this master's nodes)`: every worker is an `srun` client
+process on the master's node, a few MB each, and a large job has thousands.
+
+`nodes` limits it to part of the allocation — a master of a node group
+([`split_nodes`](@ref)); it defaults to `ENV["SWEEPRUNNER_NODELIST"]`. A master that is itself a
+job step sees the STEP's `--mem` in `SLURM_MEM_PER_NODE`, not the node's: pass
+`mem_per_node_mb`, or set `SWEEPRUNNER_MEM_PER_NODE_MB`, to the allocation's figure.
+
+The defaults (4 GB of headroom, the `srun` reservation, 3 GB for the master) are the values the
+downstream pool this was moved from uses; nothing in this repository measures them, and the
+spawner has not been run on a cluster from here.
+"""
+struct SlurmStepSpawner <: Spawner
+    nodes::Vector{PoolNode}
+end
+
+# `128(x2),64` -> [128, 128, 64]
+function _expand_slurm_counts(s::AbstractString, n::Int)
+    out = _slurm_cpus_per_node(s)
+    out === nothing && error("SLURM_JOB_CPUS_PER_NODE: cannot read $(repr(s))")
+    length(out) == n || error("SLURM_JOB_CPUS_PER_NODE $(repr(s)) does not cover $n nodes")
+    return out
+end
+
+# The allocation's nodes with what each offers, from the environment a Slurm job has.
+function _slurm_pool_nodes(
+    env::AbstractDict,
+    me::AbstractString;
+    only=nothing,
+    master_gb::Real,
+    headroom_gb::Real,
+    srun_gb::Real=0.0,
+    mem_per_node_mb=nothing,
+)
+    names = expand_nodelist(env["SLURM_JOB_NODELIST"])
+    isempty(names) &&
+        error("SLURM_JOB_NODELIST $(repr(env["SLURM_JOB_NODELIST"])) not read")
+    cpus = _expand_slurm_counts(get(env, "SLURM_JOB_CPUS_PER_NODE", ""), length(names))
+    mem_mb = if mem_per_node_mb !== nothing
+        fill(Float64(mem_per_node_mb), length(names))
+    elseif haskey(env, "SLURM_MEM_PER_NODE")
+        fill(parse(Float64, env["SLURM_MEM_PER_NODE"]), length(names))
+    elseif haskey(env, "SLURM_MEM_PER_CPU")
+        parse(Float64, env["SLURM_MEM_PER_CPU"]) .* cpus
+    else
+        error("neither SLURM_MEM_PER_NODE nor SLURM_MEM_PER_CPU is set: node memory unknown")
+    end
+    keep = [only === nothing || n in only for n in names]
+    any(keep) || error("none of the nodes asked for is in the allocation")
+    # The srun clients of every worker this master can have live on the master's node.
+    reserve = master_gb + srun_gb * sum(cpus[keep])
+    nodes = PoolNode[]
+    for (n, c, m) in zip(names[keep], cpus[keep], mem_mb[keep])
+        master = n == me || startswith(me, n * ".")
+        push!(
+            nodes,
+            PoolNode(
+                n,
+                max(c - (master ? 1 : 0), 0),
+                max(0.0, m / 1024 - headroom_gb - (master ? reserve : 0.0)),
+            ),
+        )
+    end
+    return nodes
+end
+
+function SlurmStepSpawner(;
+    nodes=get(ENV, "SWEEPRUNNER_NODELIST", nothing),
+    mem_per_node_mb=tryparse(Float64, get(ENV, "SWEEPRUNNER_MEM_PER_NODE_MB", "")),
+    master_gb::Real=3.0,
+    srun_gb::Real=0.008,
+    headroom_gb::Real=4.0,
+)
+    only = if nodes === nothing
+        nothing
+    elseif nodes isa AbstractString
+        Set(expand_nodelist(nodes))
+    else
+        Set(String.(nodes))
+    end
+    return SlurmStepSpawner(
+        _slurm_pool_nodes(
+            ENV, gethostname(); only, master_gb, headroom_gb, srun_gb, mem_per_node_mb
+        ),
+    )
+end
+
+pool_nodes(s::LocalSpawner) = [s.node]
+pool_nodes(s::SlurmStepSpawner) = s.nodes
+
+"""
+    StepManager(node, cores, mem_gb, srun, n)
+
+A `ClusterManager` that starts `n` workers of one size on `node`, each inside its own `srun`
+step when `srun` is true, as plain local processes otherwise.
+
+`n > 1` matters: `addprocs` holds Distributed's worker lock for the whole call, so one call per
+worker starts them strictly one after another; within ONE call the launched workers are connected
+and set up concurrently.
+"""
+struct StepManager <: ClusterManager
+    node::String
+    cores::Int
+    mem_gb::Float64
+    srun::Bool
+    n::Int
+end
+
+# On an allocation that spans racks a node's default address can be one the master cannot reach;
+# its host name resolves to the one every node can.
+function _bind_flag(node::AbstractString)
+    ip = try
+        Distributed.Sockets.getaddrinfo(node, Distributed.Sockets.IPv4)
+    catch e
+        # Said, because the failure this guards against (workers on another rack that never
+        # connect) would otherwise come back without a word.
+        @warn "SweepRunner: node name does not resolve; its workers bind to their default address, which a master on another rack may not reach" node exception =
+            e maxlog = 5
+        return ``
+    end
+    return `--bind-to $ip`
+end
+
+# The command that starts one worker of `m`'s size.
+function _step_command(m::StepManager, worker::Cmd)
+    m.srun || return worker
+    mb = ceil(Int, m.mem_gb * 1024)
+    return `srun --exact --nodes=1 --ntasks=1 --nodelist=$(m.node) --cpus-per-task=$(m.cores) --mem=$(mb)M --cpu-bind=cores --kill-on-bad-exit=1 $worker`
+end
+
+function Distributed.launch(m::StepManager, params::Dict, launched::Array, c::Condition)
+    exename = params[:exename]
+    exeflags = params[:exeflags]
+    bind = m.srun ? _bind_flag(m.node) : ``
+    cmd = _step_command(m, `$(Base.julia_cmd(exename)) $exeflags $bind --worker`)
+    env = Dict{String,String}(ENV)
+    # The allocation's own per-cpu memory would contradict --mem on the step.
+    for v in ("SLURM_MEM_PER_CPU", "SLURM_MEM_PER_NODE", "SLURM_MEM_PER_GPU")
+        delete!(env, v)
+    end
+    env["OPENBLAS_NUM_THREADS"] = string(m.cores)
+    env["MKL_NUM_THREADS"] = string(m.cores)
+    env["JULIA_NUM_THREADS"] = "1"
+    # What the worker reports as its cores (status, account, cost records).
+    env["SLURM_CPUS_PER_TASK"] = string(m.cores)
+    project = Base.ACTIVE_PROJECT[]
+    project === nothing || (env["JULIA_PROJECT"] = project)
+    env["JULIA_LOAD_PATH"] = join(LOAD_PATH, ":")
+    env["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, ":")
+    for _ in 1:(m.n)
+        io = open(detach(setenv(cmd, env; dir=params[:dir])), "r+")
+        Distributed.write_cookie(io)
+        wc = WorkerConfig()
+        wc.process = io
+        wc.io = io.out
+        wc.enable_threaded_blas = true
+        push!(launched, wc)
+    end
+    return notify(c)
+end
+
+function Distributed.manage(::StepManager, ::Integer, config::WorkerConfig, op::Symbol)
+    op === :interrupt && config.process !== nothing && kill(something(config.process), 2)
+    return nothing
+end
+
+"""
+    start_workers(spawner, node, size, n; exeflags) -> Vector{Int}
+
+Start `n` workers of `size` on `node` and return the Distributed ids of the ones that are ready,
+each with its BLAS threads set to `size.cores`. Fewer ids than `n` means the rest did not start;
+a worker that started but could not be readied is removed again, so every id returned is usable
+and nothing else is left running.
+"""
+function start_workers(
+    s::Union{LocalSpawner,SlurmStepSpawner},
+    node::AbstractString,
+    size::KeyReq,
+    n::Integer;
+    exeflags,
+)
+    ids = _addprocs_clean() do
+        return addprocs(
+            StepManager(
+                String(node), size.cores, size.mem_gb, s isa SlurmStepSpawner, Int(n)
+            );
+            exeflags=exeflags,
+        )
+    end
+    return _ready_workers!(ids, size)
+end
+
+# One `addprocs` at a time, and nothing left behind by one that throws. `addprocs` can fail after
+# part of its batch has connected (one worker's handshake throws inside its `@sync`): those
+# workers are in `procs()`, known to nobody, and would hold their cores while the room of the
+# whole batch is given back. Distributed serialises `addprocs` itself, so holding a lock around it
+# costs nothing and makes "what appeared during this call" this call's.
+const _ADDPROCS_LOCK = ReentrantLock()
+
+function _addprocs_clean(f)
+    return lock(_ADDPROCS_LOCK) do
+        before = Set(procs())
+        try
+            f()
+        catch
+            for p in setdiff(procs(), before)
+                _kill_worker!(p)
+            end
+            rethrow()
+        end
+    end
+end
+
+_set_blas_threads(n::Integer) = (BLAS.set_num_threads(n); nothing)
+
+# How long a started worker may take to load the package and answer. One that hangs in `using`
+# used to hold its whole batch unregistered.
+const _READY_TIMEOUT = Ref(600.0)
+# Why workers could not be readied, for whoever started them to say (`_pool_start!` drains it).
+const _READY_FAILS = String[]
+
+# Ready each started worker by itself: one that fails, or does not answer in time, is removed and
+# fails alone, not its batch — and why is kept, not dropped.
+function _ready_workers!(ids::AbstractVector{<:Integer}, size::KeyReq; ready=_ready_one)
+    good = Int[]
+    # The reasons go to the start that asked (its task says where), not to one list every
+    # start drains: a short start used to carry another node's reason, or none.
+    reasons = get(task_local_storage(), :sweeprunner_ready_fails, _READY_FAILS)
+    @sync for w in ids
+        @async begin
+            # A plain task, not `@async`: inside `@sync` that would hand its failure to the
+            # block, and one worker that cannot be readied would fail its whole batch.
+            t = Task(() -> ready(w, size))
+            schedule(t)
+            ok = timedwait(() -> istaskdone(t), _READY_TIMEOUT[]; pollint=0.05) === :ok
+            if ok && !istaskfailed(t)
+                push!(good, w)
+            else
+                why = if !ok
+                    "worker $w did not become ready within $(_READY_TIMEOUT[]) s"
+                else
+                    "worker $w: " * _short_err(t.exception)
+                end
+                push!(reasons, why)
+                _kill_worker!(w)
+            end
+        end
+    end
+    return sort!(good)
+end
+
+function _ready_one(w::Integer, size::KeyReq)
+    # The package first: a fresh worker has loaded nothing, and cannot even be told what to run.
+    Distributed.remotecall_eval(Main, [w], :(using SweepRunner))
+    remotecall_fetch(_set_blas_threads, w, size.cores)
+    return nothing
+end
+
+# Worker `id`'s launching process: its `srun` client, or the local `julia --worker`. `nothing`
+# for a worker started some other way.
+function _launcher(id::Integer)
+    p = try
+        Distributed.worker_from_id(id).config.process
+    catch
+        return nothing
+    end
+    return p === nothing ? nothing : something(p)
+end
+
+# Whether worker `id` is gone: out of `procs()`, or its launching process has exited. The latter
+# is seen even when Distributed has not noticed the connection drop — downstream, a step killed
+# for memory under a running key left the master's remote call waiting for minutes, the worker
+# still counted busy.
+function _worker_gone(id::Integer, live)::Bool
+    # Its process, not its place in `procs()` (`live`): a worker that was asked to leave is out
+    # of that list at once, and its room is not free until it has gone (see `_worker_dead`).
+    return _worker_dead(id, something(_LAUNCHER_OF[], _launcher)(id))
+end
+
+# Remove worker `id` for certain. Asked to leave first, which an idle worker does at once and
+# cleanly; one that does not (it is inside a key, or it is hung) has what launched it killed —
+# a job step dies with its srun client.
+function _kill_worker!(id::Integer; waitfor::Real=5, hard::Bool=false)
+    p = something(_LAUNCHER_OF[], _launcher)(id)
+    if hard
+        # For a worker known to be busy (a cut, a master on its way out): asking first is
+        # seconds of waiting behind Distributed's worker lock, one worker at a time, during
+        # which the unit goes on — and, in a cut, can return and take its next key.
+        if p isa Base.Process
+            # What launched it is killed. Distributed notices the dropped connection by itself:
+            # `rmprocs` is NOT called. (`rmprocs(waitfor=0)` is not "do not wait": it holds
+            # Distributed's worker lock until the worker has terminated, and with it every
+            # later `addprocs` and `rmprocs` in this process.)
+            try
+                if process_running(p)
+                    kill(p)                  # SIGTERM: an `srun` client takes its step with it
+                    timedwait(() -> !process_running(p), 5.0; pollint=0.02) === :ok ||
+                        kill(p, Base.SIGKILL)
+                end
+            catch e
+                e isa InterruptException && rethrow()
+            end
+            timedwait(() -> process_exited(p), Float64(waitfor); pollint=0.02)
+        else
+            # No handle on what launched it: it can only be asked. In a task of its own, with a
+            # bound, so that a worker that does not answer does not hold the worker lock.
+            @async try
+                rmprocs(id; waitfor=waitfor)
+            catch
+            end
+            timedwait(() -> _worker_dead(id, nothing), Float64(waitfor); pollint=0.02)
+        end
+        return nothing
+    end
+    try
+        id in procs() && rmprocs(id; waitfor=waitfor)
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    try
+        if p isa Base.Process && process_running(p)
+            kill(p)
+            timedwait(() -> !process_running(p), 5.0) === :ok || kill(p, Base.SIGKILL)
+        end
+    catch e
+        e isa InterruptException && rethrow()
+    end
+    return nothing
+end
+
+"""
+    _worker_dead(id, launcher) -> Bool
+
+Is worker `id`'s PROCESS known to have ended? `launcher` is what started it (taken BEFORE any
+attempt to remove it), or `nothing`.
+
+Positive evidence only: the launcher has exited, or Distributed has the worker as terminated (or
+has forgotten it). `!(id in procs())` is NOT evidence — `procs()` lists connected workers, and
+`rmprocs` marks a worker as terminating, which takes it out of `procs()`, the moment it is ASKED
+to leave, whether or not it ever does. A worker inside a unit that does not yield, on a manager
+that gives no process handle, was "removed" by that reading, and its key's lock was released
+under it.
+"""
+function _worker_dead(id::Integer, launcher)::Bool
+    launcher isa Base.Process && return process_exited(launcher)
+    w = lock(Distributed.worker_lock) do
+        return get(Distributed.map_pid_wrkr, Int(id), nothing)
+    end
+    w === nothing && return true                       # deregistered: it terminated
+    return w isa Distributed.Worker && w.state === Distributed.W_TERMINATED
+end
+
+# ── the planner ─────────────────────────────────────────────────────────────────────────────────
+
+"""
+    worker_size(need, node, free_cores, free_mem; threads=:throughput, max_threads=8) -> KeyReq
+
+The size a worker is started with for a key that needs `need`, on a node with that much room.
+
+- `:throughput` — the cores its memory stands for on this node
+  (`need.mem_gb × free cores / free memory`), at least what the key declares and at most
+  `max_threads`. Where memory binds before cores, a key sized by its cores alone strands the
+  rest of the node; this hands those cores to the keys whose memory holds them.
+- `:fastest` — a key that declares more than one core gets up to `max_threads`, and the memory
+  that comes with them on this node; a one-core key is sized as under `:throughput`. For
+  allocations where cores are not the scarce thing, or a key that has to finish. (A key that
+  says it is serial is left serial: threads would go where the key cannot use them.)
+"""
+function worker_size(
+    need::KeyReq,
+    node::PoolNode,
+    free_c::Integer,
+    free_m::Real;
+    threads::Symbol=:throughput,
+    max_threads::Integer=8,
+)
+    if threads === :fastest && need.cores > 1
+        c = max(need.cores, min(max_threads, free_c))
+        return KeyReq(c, max(need.mem_gb, c * node.mem_gb / max(node.cores, 1)))
+    end
+    free_m > 0 || return need
+    c = round(Int, need.mem_gb * free_c / free_m)
+    return KeyReq(
+        clamp(c, need.cores, max(need.cores, min(free_c, max_threads))), need.mem_gb
+    )
+end
+
+"""
+    plan_spawns(needs, waited, nodes, free_cores, free_mem, covering; threads, max_threads,
+                starve_after, room) -> (; starts, blocked, capped)
+
+Which workers to start. `needs` are the queued keys' requirements in queue order and `waited`
+how long each has found no room; `covering` are the sizes of the workers that are idle or already
+starting, each of which will take one key it fits. `nodes` are the nodes that may be used: leave
+a drained node out.
+
+In order: a need that a covering worker fits takes it; otherwise the worker is started on the
+node that keeps the most memory free after it; a need that fits nowhere is `blocked`. Smaller
+needs behind a blocked one still start (backfill) until it has waited `starve_after` seconds:
+from then on nothing is started ahead of it, so the room it needs is freed by keys finishing.
+At most `room` workers are planned; `capped` says a start was wanted past that.
+
+Pure: `free_cores` / `free_mem` are not modified. `starts` is a vector of `(node, size)`,
+`blocked` the indices into `needs`.
+"""
+function plan_spawns(
+    needs::AbstractVector{KeyReq},
+    waited::AbstractVector{<:Real},
+    nodes::AbstractVector{PoolNode},
+    free_c::AbstractDict,
+    free_m::AbstractDict,
+    covering::AbstractVector{KeyReq};
+    threads::Symbol=:throughput,
+    max_threads::Integer=8,
+    starve_after::Real=600.0,
+    room::Integer=typemax(Int),
+)
+    fc, fm = copy(free_c), copy(free_m)
+    cover = collect(covering)
+    starts = Tuple{String,KeyReq}[]
+    blocked = Int[]
+    capped = false
+    for (i, need) in enumerate(needs)
+        j = findfirst(c -> _fits(c, need), cover)
+        if j !== nothing
+            deleteat!(cover, j)
+            continue
+        end
+        best, bestroom, size = nothing, -Inf, need
+        for n in nodes
+            s = worker_size(need, n, fc[n.name], fm[n.name]; threads, max_threads)
+            (fc[n.name] >= s.cores && fm[n.name] >= s.mem_gb) || continue
+            left = fm[n.name] - s.mem_gb
+            left > bestroom && ((best, bestroom, size) = (n.name, left, s))
+        end
+        if best === nothing
+            push!(blocked, i)
+            waited[i] >= starve_after && break
+            continue
+        end
+        if length(starts) >= room
+            capped = true
+            break
+        end
+        push!(starts, (best, size))
+        fc[best] -= size.cores
+        fm[best] -= size.mem_gb
+    end
+    return (; starts, blocked, capped)
+end
+
+# ── the pool ────────────────────────────────────────────────────────────────────────────────────
+
+mutable struct PoolWorker
+    const node::String
+    const size::KeyReq
+    last_busy::Float64
+    retiring::Bool
+    # When it was registered: what it does says something about its node since then.
+    const started::Float64
+end
+function PoolWorker(node, size, last_busy, retiring)
+    return PoolWorker(node, size, last_busy, retiring, time())
+end
+
+# How many starts may fail in a row before the pool stops trying and says so.
+const _POOL_MAX_FAILS = 10
+
+# The most workers one master holds under Slurm when the cluster's limit cannot be read: each
+# worker is an srun client on the master's node. Downstream ran at 1500 after a master that
+# planned 3735 stalled, without a message, at 1782.
+const _POOL_SLURM_CAP = 1500
+
+"""
+    SizedPool(spawner=default_spawner(); key_req, threads=:throughput, max_threads=8,
+              speedup=(key, cores) -> 1.0, retire_after=120.0, starve_after=600.0,
+              stall_after=600.0, mem_growth=1.5, max_workers=<limit>, poll=1.0, keep=false,
+              exeflags=<project, -t1>)
+
+A pool of workers sized to the keys they run. Give it to [`run!`](@ref) / [`run_loop!`](@ref) as
+`pool=`; it starts workers as the queue needs them (no `init_workers!`). Its workers are removed
+when the `run!` / `run_loop!` it was given to returns, unless `keep=true` (then call
+[`shutdown!`](@ref) yourself).
+
+- `key_req` — `key -> KeyReq(cores, mem_gb)`: what a key needs.
+- `threads` — how many cores a worker is given beyond what its key declares
+  ([`worker_size`](@ref)): `:throughput` (the cores its memory stands for; most work per
+  node-hour), `:fastest` (up to `max_threads` for keys that declare more than one core;
+  time-to-solution), or `:finish_by` (as `:throughput`, but a key that would not reach its next
+  checkpoint before the job's `deadline` is given the cores that get it there, by `speedup`).
+- `speedup` — `(key, cores) -> factor` relative to one core, for `:finish_by`
+  ([`measured_speedup`](@ref) builds one from the cost records).
+- `retire_after` — an idle worker whose size no queued key fits is retired after this long, when
+  another size is waiting for room.
+- `starve_after` — how long a key that fits nowhere lets smaller keys start ahead of it.
+- `stall_after` — starts that neither join nor fail for this long are said out loud
+  (`pool_stalled`), naming the usual cause under Slurm.
+- `mem_growth` — a key whose worker died is retried with this much more memory (up to what a
+  node has), at most the dispatcher's death bound times. Must be > 1.
+- `max_workers` — the most workers this pool holds at once. Under Slurm it defaults to the
+  per-master limit ([`srun_worker_limit`](@ref), else 1500): past it workers neither join nor
+  fail. Reaching it is logged once (`pool_at_limit`).
+
+A node whose starts bring no worker, or whose workers cannot be readied, five times in a row
+over at least a minute is taken out (`pool_node_out`) and tried once more five minutes later
+(`pool_node_retry`); a worker of it started since then taking a key clears it. The pool gives
+up, and `run!` throws, when every node has been taken out twice, or when ten starts (or ten
+readied workers) in a row have failed over at least two minutes — the node rule's minute first,
+then its own: a pool that cannot start workers is not a round that ended.
+"""
+mutable struct SizedPool
+    const spawner::Spawner
+    const key_req::Any
+    const threads::Symbol
+    const max_threads::Int
+    const speedup::Any
+    const retire_after::Float64
+    const starve_after::Float64
+    const stall_after::Float64
+    const mem_growth::Float64
+    const max_workers::Int
+    const limit_source::String
+    const poll::Float64
+    const keep::Bool
+    const exeflags::Cmd
+    const nodes::Vector{PoolNode}
+    const free_c::Dict{String,Int}
+    const free_m::Dict{String,Float64}
+    const workers::Dict{Int,PoolWorker}
+    const starting::Dict{Int,Tuple{String,KeyReq,Int}}     # token => (node, size, how many)
+    const memreq::Dict{String,Float64}                     # raised after a worker died on it
+    const waiting::Dict{String,Float64}                    # since when a key has found no room
+    const too_big::Set{String}
+    # Workers that existed before the pool started any: not its own, and take any key.
+    const foreign::Set{Int}
+    # Every worker the pool has registered, ever: what tells its own from a caller's.
+    const seen::Set{Int}
+    # Starts that failed in a row, per node, and the nodes taken out for it.
+    const node_fails::Dict{String,Int}
+    const bad_nodes::Set{String}
+    # node => since when its starts have been failing, and when it was taken out.
+    const node_fail_since::Dict{String,Float64}
+    const node_out_at::Dict{String,Float64}
+    # start token => when that start began.
+    const start_at::Dict{Int,Float64}
+    seq::Int
+    fails::Int
+    stuck::Bool
+    snapshot::Bool          # `foreign` has been taken
+    last_join::Float64      # the last time a start succeeded or failed
+    last_stall::Float64
+    said_limit::Bool
+    closing::Bool           # `shutdown!` is under way: a start that lands now is removed
+    rejects::Int            # workers in a row that started and could not be used
+    fail_since::Float64     # since when starts have been failing in a row (0: they are not)
+    reject_since::Float64   # the same for rejected workers
+    # node => how many times it has been taken out: a node is given up on the second time.
+    const node_outs::Dict{String,Int}
+    # node => when it last counted a failure: a count is "in a row" only over failures that are
+    # not hours apart.
+    const node_last_fail::Dict{String,Float64}
+    # node => when it was last readmitted after being out: only workers started since then say
+    # that the node works.
+    const node_back_at::Dict{String,Float64}
+end
+
+"""
+    default_spawner() -> Spawner
+
+[`SlurmStepSpawner`](@ref) inside a Slurm job, [`LocalSpawner`](@ref) otherwise.
+"""
+default_spawner() = haskey(ENV, "SLURM_JOB_ID") ? SlurmStepSpawner() : LocalSpawner()
+
+function _default_exeflags()
+    project = dirname(something(Base.active_project(), "."))
+    img = _worker_exeflags(get(ENV, "SWEEPRUNNER_SYSIMAGE", nothing))
+    return `--project=$project -t1 $img`
+end
+
+# The cap on workers and where it came from. Under Slurm an unreadable limit is a default cap,
+# not no cap: the failure it prevents is silent.
+function _pool_limit(spawner::Spawner, max_workers; limit=srun_worker_limit)
+    max_workers === nothing || return (Int(max_workers), "max_workers")
+    spawner isa SlurmStepSpawner || return (typemax(Int), "none")
+    n = tryparse(Int, get(ENV, "SWEEPRUNNER_MAX_WORKERS", ""))
+    n === nothing || return (n, "SWEEPRUNNER_MAX_WORKERS")
+    lim = limit()
+    lim === nothing || return (lim, "SrunPortRange")
+    return (_POOL_SLURM_CAP, "default (SrunPortRange could not be read)")
+end
+
+function SizedPool(
+    spawner::Spawner=default_spawner();
+    key_req,
+    threads::Symbol=:throughput,
+    max_threads::Integer=8,
+    speedup=(key, cores) -> 1.0,
+    retire_after::Real=120.0,
+    starve_after::Real=600.0,
+    stall_after::Real=600.0,
+    mem_growth::Real=1.5,
+    max_workers::Union{Integer,Nothing}=nothing,
+    poll::Real=1.0,
+    keep::Bool=false,
+    exeflags::Cmd=_default_exeflags(),
+)
+    threads in (:throughput, :fastest, :finish_by) || throw(
+        ArgumentError(
+            "SizedPool: threads must be :throughput, :fastest or :finish_by, got " *
+            repr(threads),
+        ),
+    )
+    max_threads >= 1 || throw(ArgumentError("SizedPool: max_threads must be >= 1"))
+    mem_growth > 1 || throw(
+        ArgumentError(
+            "SizedPool: mem_growth must be > 1 (a key whose worker died would be retried " *
+            "with the same memory), got $mem_growth",
+        ),
+    )
+    poll > 0 || throw(ArgumentError("SizedPool: poll must be > 0, got $poll"))
+    (retire_after >= 0 && starve_after >= 0 && stall_after >= 0) || throw(
+        ArgumentError("SizedPool: retire_after, starve_after and stall_after must be >= 0"),
+    )
+    limit, source = _pool_limit(spawner, max_workers)
+    limit >= 1 || throw(ArgumentError("SizedPool: max_workers must be >= 1, got $limit"))
+    nodes = pool_nodes(spawner)
+    isempty(nodes) && throw(ArgumentError("SizedPool: the spawner offers no node"))
+    return SizedPool(
+        spawner,
+        key_req,
+        threads,
+        Int(max_threads),
+        speedup,
+        Float64(retire_after),
+        Float64(starve_after),
+        Float64(stall_after),
+        Float64(mem_growth),
+        limit,
+        source,
+        Float64(poll),
+        keep,
+        exeflags,
+        nodes,
+        Dict(n.name => n.cores for n in nodes),
+        Dict(n.name => n.mem_gb for n in nodes),
+        Dict{Int,PoolWorker}(),
+        Dict{Int,Tuple{String,KeyReq,Int}}(),
+        Dict{String,Float64}(),
+        Dict{String,Float64}(),
+        Set{String}(),
+        Set{Int}(),
+        Set{Int}(),
+        Dict{String,Int}(),
+        Set{String}(),
+        Dict{String,Float64}(),
+        Dict{String,Float64}(),
+        Dict{Int,Float64}(),
+        0,
+        0,
+        false,
+        false,
+        time(),
+        0.0,
+        false,
+        false,
+        0,
+        0.0,
+        0.0,
+        Dict{String,Int}(),
+        Dict{String,Float64}(),
+        Dict{String,Float64}(),
+    )
+end
+
+# What `key` needs now: its declared size, the memory raised after a death, and under
+# `:finish_by` the cores that get it to its next checkpoint before the deadline.
+function _pool_need(pool::SizedPool, key::DataKey, kstr::AbstractString, deadline, min_time)
+    base = pool.key_req(key)::KeyReq
+    base = KeyReq(base.cores, max(base.mem_gb, get(pool.memreq, kstr, 0.0)))
+    (pool.threads === :finish_by && deadline !== nothing && min_time !== nothing) ||
+        return base
+    left = deadline - time()
+    need = key_seconds(min_time, key)
+    # Not known how long it takes: the most cores, not the fewest — as zero seconds it was
+    # given one core, the size least likely to get it there.
+    # ...of what a node has: asking for more than any node holds made the key `key_too_big`.
+    if need === nothing
+        most = maximum(n.cores for n in pool.nodes)
+        return KeyReq(max(min(pool.max_threads, most), base.cores), base.mem_gb)
+    end
+    s0 = max(Float64(pool.speedup(key, base.cores)), 1e-9)
+    for c in base.cores:max(pool.max_threads, base.cores)
+        need * s0 / max(Float64(pool.speedup(key, c)), 1e-9) <= left &&
+            return KeyReq(c, base.mem_gb)
+    end
+    return KeyReq(max(pool.max_threads, base.cores), base.mem_gb)
+end
+
+function _pool_need(pool::SizedPool, row::TaskRow, deadline, min_time)
+    return _pool_need(pool, row.key, row.kstr, deadline, min_time)
+end
+
+# How long `key` needs to get somewhere AT THE SIZE THE POOL WILL RUN IT WITH. The deadline
+# hold-back asks this, so a key that `:finish_by` gave more cores to is not then refused for the
+# time it would have taken on fewer.
+function _pool_min_time(pool::SizedPool, key::DataKey, deadline, min_time)::Float64
+    need = key_seconds(min_time, key)
+    # Unknown stays unknown (NaN): `_fits` decides what that means, not this function.
+    need === nothing && return NaN
+    pool.threads === :finish_by || return need
+    base = pool.key_req(key)::KeyReq
+    size = _pool_need(pool, key, canonical(key), deadline, min_time)
+    s0 = max(Float64(pool.speedup(key, base.cores)), 1e-9)
+    return need * s0 / max(Float64(pool.speedup(key, size.cores)), 1e-9)
+end
+
+# May worker `pid` take `row`? A worker the pool started takes what its size holds; one that was
+# there before the pool takes anything, as it did without one.
+function _pool_accepts(pool::SizedPool, pid::Int, row::TaskRow, deadline, min_time)::Bool
+    w = get(pool.workers, pid, nothing)
+    w === nothing && return pid in pool.foreign
+    w.retiring && return false
+    return _fits(w.size, _pool_need(pool, row, deadline, min_time))
+end
+
+# May the dispatcher give worker `pid` a dispatch task yet? Not between the moment `addprocs`
+# makes it visible and the moment the pool knows its size: in that window it would be taken for
+# a worker that holds anything.
+function _pool_adoptable(pool::SizedPool, pid::Int)
+    return haskey(pool.workers, pid) || pid in pool.foreign
+end
+
+# Workers that joined and are not the pool's: the caller's own `addprocs`, or a `spawn` hook's.
+# Told apart only while no start is in flight — in that window a worker that is visible and not
+# registered cannot be one of the pool's. They used to be taken once, at the first tick, so one
+# added later idled for the whole job.
+function _pool_note_foreign!(pool::SizedPool)
+    intersect!(pool.foreign, workers())               # one that left is no longer counted
+    isempty(pool.starting) || return nothing
+    for p in workers()
+        (p == myid() || p in pool.seen || p in pool.foreign) && continue
+        push!(pool.foreign, p)
+    end
+    return nothing
+end
+
+function _pool_retiring(pool::SizedPool, pid::Int)
+    w = get(pool.workers, pid, nothing)
+    return w !== nothing && w.retiring
+end
+
+_pool_threads(pool::SizedPool) = pool.threads === :fastest ? :fastest : :throughput
+
+# A worker died under `row`: most often its memory. The key comes back asking for more than the
+# most it has had, whichever of the worker's size, an earlier raise, or its declaration that is.
+function _pool_death!(pool::SizedPool, row::TaskRow, pid::Int, log::EventLog, stage::Symbol)
+    w = get(pool.workers, pid, nothing)
+    had = max(
+        pool.key_req(row.key).mem_gb,
+        get(pool.memreq, row.kstr, 0.0),
+        w === nothing ? 0.0 : w.size.mem_gb,
+    )
+    cap = maximum(n.mem_gb for n in pool.nodes)
+    pool.memreq[row.kstr] = min(pool.mem_growth * had, cap)
+    log_event(
+        log,
+        :pool_retry_mem;
+        level=:warn,
+        stage=stage,
+        key=row.kstr,
+        had_gb=round(had; digits=2),
+        next_gb=round(pool.memreq[row.kstr]; digits=2),
+    )
+    return nothing
+end
+
+# Give a worker's room back and forget it. Room comes back in two places: here, for a worker
+# that was registered, and in `_pool_start!`, for the part of a batch that did not come.
+function _pool_free!(pool::SizedPool, pid::Int)
+    w = pop!(pool.workers, pid, nothing)
+    w === nothing && return nothing
+    pool.free_c[w.node] += w.size.cores
+    pool.free_m[w.node] += w.size.mem_gb
+    return nothing
+end
+
+# Take a worker out: no more keys, the process removed, its room back once it is gone. The pool
+# is the one owner of this; the dispatch task only sees `retiring` and leaves.
+function _pool_retire!(pool::SizedPool, pid::Int, log=nothing, stage::Symbol=:pool)
+    w = get(pool.workers, pid, nothing)
+    (w === nothing || w.retiring) && return nothing
+    w.retiring = true
+    @async try
+        _kill_worker!(pid)
+        if _worker_gone(pid, Set(procs()))
+            _pool_free!(pool, pid)
+        else
+            # Its room is NOT given back: the process is still there, on its cores and with
+            # its memory, and a worker placed on top of it is how a node runs out. The tick
+            # frees it when it is seen gone.
+            log === nothing || log_event(
+                log,
+                :pool_kill_failed;
+                level=:warn,
+                stage=stage,
+                worker=pid,
+                node=w.node,
+                cores=w.size.cores,
+                mem_gb=round(w.size.mem_gb; digits=2),
+            )
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        log === nothing || log_event(
+            log,
+            :pool_kill_failed;
+            level=:warn,
+            stage=stage,
+            worker=pid,
+            err=_short_err(e),
+        )
+    end
+    return nothing
+end
+
+"""
+    _pool_tick!(pool, table, master, log, stage, opts, min_time; fits)
+
+One pass of the pool: forget workers that are gone, report keys no node can hold, start the
+workers the queue needs ([`plan_spawns`](@ref)), and retire idle workers whose size is no longer
+wanted while another size waits for room.
+
+It follows what the master was told: nothing is started while the master is paused or stopping,
+a drained node offers no room and its workers no cover, a `:resize` target caps the pool, and a
+key the deadline will hold back (`fits`) is not planned for.
+"""
+function _pool_tick!(
+    pool::SizedPool,
+    table::TaskTable,
+    master::Master,
+    log::EventLog,
+    stage::Symbol,
+    opts::RunOpts,
+    min_time;
+    fits=Returns(true),
+)
+    now = time()
+    c = master.ctl
+    if !pool.snapshot
+        # What was here before the pool started anything is not the pool's.
+        pool.snapshot = true
+        # A pool built long before its first round has not been stalled all that time.
+        pool.last_join = now
+        log_event(
+            log,
+            :pool_limit;
+            stage=stage,
+            max_workers=pool.max_workers == typemax(Int) ? nothing : pool.max_workers,
+            source=pool.limit_source,
+        )
+    end
+    _pool_note_foreign!(pool)
+    live = Set(procs())
+    for pid in collect(keys(pool.workers))
+        _worker_gone(pid, live) || continue
+        # Its launcher exited: make Distributed notice, so the call waiting on it returns.
+        pid in live && @async _kill_worker!(pid)
+        _pool_free!(pool, pid)
+    end
+
+    # What is on each worker, and the queued rows in queue order (a bounded look ahead: more
+    # than the nodes could ever hold at once is not worth sizing).
+    busy = Set{Int}()
+    queued = TaskRow[]
+    idx = Int[]
+    limit = 4 * sum(n.cores for n in pool.nodes) + 64
+    lock(table.lock) do
+        for (i, r) in enumerate(table.rows)
+            if r.state === :running
+                push!(busy, r.worker)
+            elseif r.state === :todo && length(queued) < limit
+                push!(queued, r)
+                push!(idx, i)
+            end
+        end
+    end
+    for (pid, w) in pool.workers
+        pid in busy && (w.last_busy = now)
+    end
+    _pool_report!(pool)
+
+    # Paused or stopping: the queue is not to be drawn, so nothing is started for it.
+    if c.paused || _stop_reason(opts, master) !== nothing
+        pool.stuck = false
+        return nothing
+    end
+
+    cap_c = maximum(n.cores for n in pool.nodes)
+    cap_m = maximum(n.mem_gb for n in pool.nodes)
+    needs = KeyReq[]
+    rows = TaskRow[]
+    for (i, r) in zip(idx, queued)
+        # No worker is started for a key the deadline holds back. It is settled here: with a
+        # pool no worker of its size may ever exist to draw it and pass it over, and left
+        # queued it kept the round waiting until the deadline itself. The time left only
+        # shrinks, so a key that does not fit now will not fit later in this round.
+        if !fits(r.key)
+            settle!(table, i, :no_fit)
+            continue
+        end
+        need = _pool_need(pool, r, opts.deadline, min_time)
+        if need.cores > cap_c || need.mem_gb > cap_m
+            # Reported now, not retried forever.
+            if !(r.kstr in pool.too_big)
+                push!(pool.too_big, r.kstr)
+                log_event(
+                    log,
+                    :key_too_big;
+                    level=:warn,
+                    stage=stage,
+                    key=r.kstr,
+                    cores=need.cores,
+                    mem_gb=round(need.mem_gb; digits=2),
+                    node_cores=cap_c,
+                    node_mem_gb=round(cap_m; digits=2),
+                )
+            end
+            settle!(table, i, :error)
+            continue
+        end
+        push!(needs, need)
+        push!(rows, r)
+    end
+
+    _pool_nodes_back!(pool, now, log, stage)
+    # Where a worker may be STARTED, and whose workers may take keys. A node taken out starts
+    # none, but the workers it has are still workers: left out of the cover, the pool started
+    # more elsewhere for keys they were about to take.
+    usable(node) = !(node in c.drained) && !(node in pool.bad_nodes)
+    serving(node) = !(node in c.drained)
+    idle = [
+        w.size for
+        (pid, w) in pool.workers if !(pid in busy) && !w.retiring && serving(w.node)
+    ]
+    starting = KeyReq[]
+    for (node, size, n) in values(pool.starting)
+        usable(node) && append!(starting, fill(size, n))
+    end
+    waited = [now - get!(pool.waiting, r.kstr, now) for r in rows]
+    have = length(pool.workers) + sum(x -> x[3], values(pool.starting); init=0)
+    cap = c.target === nothing ? pool.max_workers : min(pool.max_workers, c.target)
+    plan = plan_spawns(
+        needs,
+        waited,
+        [n for n in pool.nodes if usable(n.name)],
+        pool.free_c,
+        pool.free_m,
+        vcat(idle, starting);
+        threads=_pool_threads(pool),
+        max_threads=pool.max_threads,
+        starve_after=pool.starve_after,
+        room=max(cap - have, 0),
+    )
+    blocked = Set(rows[i].kstr for i in plan.blocked)
+    filter!(kv -> kv[1] in blocked, pool.waiting)
+    # Said when the cap first applies and again whenever it applies at another value (after a
+    # `resize`, in a later stage): once for the life of the pool, a later cap went unsaid.
+    plan.capped || delete!(_SAID_CAP, pool)
+    if plan.capped && get(_SAID_CAP, pool, -1) != cap
+        _SAID_CAP[pool] = cap
+        pool.said_limit = true
+        log_event(
+            log,
+            :pool_at_limit;
+            level=:warn,
+            stage=stage,
+            held=have,
+            max_workers=cap,
+            queued=length(needs),
+            source=c.target === nothing ? pool.limit_source : "resize",
+        )
+    end
+
+    # One start per (node, size), so the workers of a batch connect concurrently.
+    batches = Dict{Tuple{String,KeyReq},Int}()
+    for (node, size) in plan.starts
+        batches[(node, size)] = get(batches, (node, size), 0) + 1
+        pool.free_c[node] -= size.cores
+        pool.free_m[node] -= size.mem_gb
+    end
+    for ((node, size), n) in batches
+        tok = (pool.seq += 1)
+        pool.starting[tok] = (node, size, n)
+        pool.start_at[tok] = now
+        @async _pool_start!(pool, tok, log, stage)
+    end
+    isempty(batches) || _pool_report!(pool)
+
+    # A size with nothing to do gives its room back when another is waiting for it: for the
+    # node's cores and memory, or for a place under the worker limit.
+    waiting_for_room = !isempty(plan.blocked) || plan.capped
+    # Idle workers no queued key fits: what retiring can still free.
+    unwanted = Int[
+        pid for (pid, w) in pool.workers if
+        !(pid in busy) && !w.retiring && !any(n -> _fits(w.size, n), needs)
+    ]
+    # Idle workers on a node that was drained take no more keys (their dispatch tasks left):
+    # they go, whatever is waiting.
+    drained_idle = Int[
+        pid for
+        (pid, w) in pool.workers if !(pid in busy) && !w.retiring && w.node in c.drained
+    ]
+    for pid in drained_idle
+        w = pool.workers[pid]
+        log_event(
+            log,
+            :pool_retire;
+            stage=stage,
+            worker=pid,
+            node=w.node,
+            cores=w.size.cores,
+            mem_gb=round(w.size.mem_gb; digits=2),
+            why="node drained",
+        )
+        _pool_retire!(pool, pid, log, stage)
+    end
+    filter!(p -> !(p in drained_idle), unwanted)
+    if waiting_for_room
+        for pid in unwanted
+            w = pool.workers[pid]
+            now - w.last_busy >= pool.retire_after || continue
+            log_event(
+                log,
+                :pool_retire;
+                stage=stage,
+                worker=pid,
+                node=w.node,
+                cores=w.size.cores,
+                mem_gb=round(w.size.mem_gb; digits=2),
+            )
+            _pool_retire!(pool, pid, log, stage)
+        end
+    end
+
+    # Starts that neither join nor fail. Under Slurm the usual cause is the srun port range of
+    # the master's node, and it comes without an error.
+    # Measured from when the OLDEST start in flight began — not from the last time any start
+    # finished, which after two quiet hours made the first new start a "stall" at once.
+    oldest = _pool_oldest_start(pool, now)
+    if !isempty(pool.starting) &&
+        now - oldest >= pool.stall_after &&
+        now - pool.last_stall >= pool.stall_after
+        pool.last_stall = now
+        log_event(
+            log,
+            :pool_stalled;
+            level=:warn,
+            stage=stage,
+            starting=sum(x -> x[3], values(pool.starting); init=0),
+            joined=length(pool.workers),
+            secs=round(Int, now - oldest),
+            hint="under Slurm: the master node's srun port range " *
+                 "(scontrol show config | grep SrunPortRange)",
+        )
+    end
+
+    # Queued keys, nothing running or starting that could take them, and nothing to start:
+    # waiting would not change that. It WOULD while a worker is on its way out or is about to
+    # be retired for the room: the keys behind it start when it is gone. Without that the round
+    # ended the moment the small keys were done, with the large ones reported `worker_lost`.
+    freeing =
+        any(w -> w.retiring, values(pool.workers)) ||
+        (waiting_for_room && !isempty(unwanted)) ||
+        # A node that was taken out comes back for a retry: waiting does change that.
+        any(n -> get(pool.node_outs, n, 0) < 2, pool.bad_nodes)
+    pool.stuck =
+        !isempty(needs) &&
+        isempty(plan.starts) &&
+        isempty(pool.starting) &&
+        isempty(busy) &&
+        !freeing &&
+        # Over the nodes that can be used: a worker on a drained node takes no key, and counted
+        # as able to, it kept the round waiting until the deadline.
+        !any(
+            w -> !w.retiring && serving(w.node) && any(n -> _fits(w.size, n), needs),
+            values(pool.workers),
+        )
+    return nothing
+end
+
+# What the status compares the workers that joined against: the pool's current plan, and the
+# processes it has asked for (a start that is under way has been launched and has not joined).
+function _pool_report!(pool::SizedPool)
+    # Planned: the workers the pool has and the ones it has asked for. Launched: the ones whose
+    # process is there. The difference is what is still on its way — or not coming.
+    have = length(pool.workers) + length(pool.foreign)
+    asked = sum(x -> x[3], values(pool.starting); init=0)
+    note_workers!(; planned=have + asked, launched=have)
+    return nothing
+end
+
+function _pool_start!(pool::SizedPool, tok::Int, log::EventLog, stage::Symbol)
+    node, size, n = pool.starting[tok]
+    ids = Int[]
+    threw = false
+    why = String[]
+    task_local_storage(:sweeprunner_ready_fails, why)
+    try
+        ids = start_workers(pool.spawner, node, size, n; exeflags=pool.exeflags)
+    catch e
+        e isa InterruptException && rethrow()
+        threw = true
+        log_event(
+            log,
+            :pool_spawn_failed;
+            level=:warn,
+            stage=stage,
+            node=node,
+            cores=size.cores,
+            mem_gb=round(size.mem_gb; digits=2),
+            n=n,
+            err=_short_err(e),
+        )
+    finally
+        # Whatever happened, the start is over: its workers are registered or its room is back.
+        # Left set, the pool would wait on it for ever.
+        union!(pool.seen, ids)
+        if pool.closing
+            # The pool was shut down while this start was in flight: nobody will tick it again,
+            # so its workers are removed rather than registered.
+            for pid in ids
+                _kill_worker!(pid)
+            end
+            empty!(ids)
+        end
+        for pid in ids
+            pool.workers[pid] = PoolWorker(node, size, time(), false)
+        end
+        delete!(pool.starting, tok)
+        delete!(pool.start_at, tok)
+        short = n - length(ids)
+        pool.free_c[node] += short * size.cores
+        pool.free_m[node] += short * size.mem_gb
+        pool.last_join = time()
+        if short > 0 && !pool.closing
+            # A start that brought MOST of its workers is not a failure of the pool: batches of
+            # 64 that each missed one used to add up to "ten starts failed in a row". One that
+            # brought none is; one that brought a few of many is neither counted nor forgiven.
+            if isempty(ids)
+                pool.fails += 1
+                pool.fail_since == 0.0 && (pool.fail_since = time())
+            elseif 2 * length(ids) >= n
+                pool.fails = 0
+                pool.fail_since = 0.0
+            end
+            # Said also when NO worker came and nothing was thrown: the count rose in silence,
+            # and the error after ten failures pointed at events that did not exist.
+            threw || log_event(
+                log,
+                :pool_spawn_short;
+                level=:warn,
+                stage=stage,
+                node=node,
+                cores=size.cores,
+                asked=n,
+                started=length(ids),
+                why=isempty(why) ? nothing : join(why, "; "),
+            )
+            # A node that brought up SOME of what was asked can start workers: it is the start
+            # that brought none that counts against the node.
+            # A start that brought nothing counts against the node. One that brought workers
+            # does not clear the node: whether they can be USED is known when one takes a key
+            # (`_pool_served!`) — a node whose workers start and cannot be readied used to be
+            # cleared by each start and started on for the whole job.
+            isempty(ids) &&
+                _pool_node_failed!(pool, node, log, stage; why="a start brought no worker")
+        elseif short == 0
+            pool.fails = 0
+            pool.fail_since = 0.0
+        end
+        isempty(pool.starting) && (pool.closing = false)
+        _pool_report!(pool)
+    end
+    isempty(ids) || log_event(
+        log,
+        :pool_spawn;
+        stage=stage,
+        node=node,
+        cores=size.cores,
+        mem_gb=round(size.mem_gb; digits=2),
+        n=length(ids),
+    )
+    return nothing
+end
+
+# pool => the cap `pool_at_limit` was last said for.
+const _SAID_CAP = IdDict{Any,Int}()
+
+# How many starts in a row may fail on one node before it is taken out, over at least how
+# long, and after how long a node that was taken out is tried again. A minute, because the tick
+# is a second and `srun` refuses for several while the last step's resources are released; five
+# minutes, because that is about how long a node or a controller that hiccuped needs.
+const _NODE_MAX_FAILS = 5
+const _NODE_FAIL_SPAN = Ref(60.0)
+const _NODE_RETRY_AFTER = Ref(300.0)
+
+# The dispatcher could not ready or identify one of the pool's workers: it will get no key. Left
+# in the pool it was still counted as cover — nothing was started in its place, and the queue
+# waited for ever. It is retired; its room comes back when it is gone.
+function _pool_rejected!(pool::SizedPool, pid::Int, log, stage::Symbol)
+    w = get(pool.workers, pid, nothing)
+    (w === nothing || w.retiring) && return nothing
+    log_event(
+        log,
+        :pool_retire;
+        stage=stage,
+        worker=pid,
+        node=w.node,
+        why="rejected by the dispatcher",
+    )
+    # A worker that started and cannot be used is a start that failed — counted apart from the
+    # starts themselves (each of which succeeded, and reset that count), so that a pool none
+    # of whose workers can be readied gives up instead of starting them for ever.
+    # Not on a node that is already out: the first rejection of a batch takes the node out and
+    # starts the pool's counts again, and the rest of that batch — sixty, a hundred — put them
+    # straight back, so that one bad node was a give-up as soon as it was readmitted.
+    if !(w.node in pool.bad_nodes)
+        pool.rejects += 1
+        pool.reject_since == 0.0 && (pool.reject_since = time())
+        # ...and against its node: one node where nothing can be readied is taken out like one
+        # where nothing starts, instead of being planned first again each time it is emptied.
+        _pool_node_failed!(pool, w.node, log, stage; why="its workers cannot be readied")
+    end
+    _pool_retire!(pool, pid, log, stage)
+    return nothing
+end
+
+# A node taken out is tried again after a pause: one start, and out again if that fails.
+function _pool_nodes_back!(pool::SizedPool, now::Float64, log, stage::Symbol)
+    for node in collect(pool.bad_nodes)
+        # Each time a node has gone out again its next try waits twice as long (up to an hour):
+        # a node that stays bad is not given a batch of start-ups every five minutes all job.
+        outs = max(get(pool.node_outs, node, 1), 1)
+        pause = min(_NODE_RETRY_AFTER[] * 2.0^(outs - 1), max(_NODE_RETRY_AFTER[], 3600.0))
+        now - get(pool.node_out_at, node, now) >= pause || continue
+        delete!(pool.bad_nodes, node)
+        pool.node_fails[node] = _NODE_MAX_FAILS - 1
+        pool.node_fail_since[node] = now - _NODE_FAIL_SPAN[]
+        # ...and its count is as of now: from the second retry on the pause is longer than
+        # `_NODE_FAIL_GAP`, and a failure "long after the last one" started a new count — the
+        # retry's one failure was forgiven, and the node got a minute of failed starts instead.
+        pool.node_last_fail[node] = now
+        pool.node_back_at[node] = now
+        log_event(log, :pool_node_retry; stage=stage, node=node)
+    end
+    return nothing
+end
+
+# When the oldest start still in flight began (`now` when there is none).
+function _pool_oldest_start(pool::SizedPool, now::Float64)
+    return minimum((get(pool.start_at, t, now) for t in keys(pool.starting)); init=now)
+end
+
+# A start on `node` failed or came up short. One node that cannot start workers used to be chosen
+# again each tick (a failed start gives its room back, and the node with the most room is
+# preferred), while a success anywhere else reset the one counter there was.
+function _pool_node_failed!(
+    pool::SizedPool, node::AbstractString, log, stage::Symbol; why::AbstractString=""
+)
+    # In a row in TIME too: a failure long after the last one starts a new count. (On a node
+    # whose workers hold twelve-hour keys nothing clears the count, and five unrelated
+    # rejections over hours took out a node with a hundred healthy workers.)
+    if time() - get(pool.node_last_fail, node, time()) > _NODE_FAIL_GAP[]
+        pool.node_fails[node] = 0
+        delete!(pool.node_fail_since, node)
+    end
+    pool.node_last_fail[String(node)] = time()
+    n = pool.node_fails[node] = get(pool.node_fails, node, 0) + 1
+    since = get!(pool.node_fail_since, node, time())
+    # Five in a row AND over some time: with a tick a second, five seconds of `srun` refusing
+    # (the last step's resources not yet released) took a node out for the rest of the job.
+    (n >= _NODE_MAX_FAILS && time() - since >= _NODE_FAIL_SPAN[]) || return nothing
+    node in pool.bad_nodes && return nothing
+    push!(pool.bad_nodes, String(node))
+    pool.node_out_at[String(node)] = time()
+    pool.node_outs[String(node)] = get(pool.node_outs, String(node), 0) + 1
+    # The node rule has taken over: the pool's own counts of failed starts and rejected workers
+    # start again. Left running, they reached ten at the same minute the nodes went out, and
+    # the pool gave up before the retry it was waiting for.
+    pool.fails = 0
+    pool.fail_since = 0.0
+    pool.rejects = 0
+    pool.reject_since = 0.0
+    log_event(
+        log,
+        :pool_node_out;
+        level=:warn,
+        stage=stage,
+        node=node,
+        fails=n,
+        why=why,
+        times_out=pool.node_outs[String(node)],
+        nodes_left=count(x -> !(x.name in pool.bad_nodes), pool.nodes),
+    )
+    return nothing
+end
+
+# Has the pool stopped trying? Too many starts failed in a row.
+# Ten in a row AND over some time, like the rule for a node: at the start of a job there are more
+# than ten batches in one tick, and a few seconds of `srun` refusing failed them together.
+_pool_gave_up(pool::SizedPool) = _pool_gave_up_why(pool) !== nothing
+
+# Why the pool has given up — `:nodes`, `:starts`, `:rejects` — or `nothing`.
+function _pool_gave_up_why(pool::SizedPool)
+    # Every node out — and each of them for the second time: the first time a node is taken
+    # out it gets a retry after `_NODE_RETRY_AFTER`, and the pool waits for that.
+    all(n -> n.name in pool.bad_nodes && get(pool.node_outs, n.name, 0) >= 2, pool.nodes) &&
+        return :nodes
+    # The counts below are for failures the node rule does not explain. They wait while a node
+    # is out for its retry, and while starts are still on their way (a burst of rejections
+    # during a mass start is followed by replacements that need their minute to come up).
+    waiting = any(n -> get(pool.node_outs, n, 0) < 2, pool.bad_nodes)
+    (waiting || !isempty(pool.starting)) && return nothing
+    # Over a span LONGER than the node's. Both counts are stamped by the same failed start, and a
+    # node goes out only on its next failure after its span — up to a tick later — while this
+    # is true the instant its span has passed, and is looked at five times a second: with
+    # starts that fail at once the pool gave up at one minute, before any node was out and so
+    # before any retry. Past the node's span plus its own, the node rule has had its turn.
+    now = time()
+    spanned(since) = since > 0 && now - since >= _POOL_FAIL_SPAN[] + _NODE_FAIL_SPAN[]
+    (pool.fails >= _POOL_MAX_FAILS && spanned(pool.fail_since)) && return :starts
+    (pool.rejects >= _POOL_MAX_FAILS && spanned(pool.reject_since)) && return :rejects
+    return nothing
+end
+
+const _POOL_FAIL_SPAN = Ref(60.0)
+# Failures of a node further apart than this are not "in a row".
+const _NODE_FAIL_GAP = Ref(600.0)
+
+# A worker of the pool took a key: the pool's workers can be used, and so can that node's.
+function _pool_served!(pool::SizedPool, pid::Int=0)
+    pool.rejects = 0
+    pool.reject_since = 0.0
+    w = get(pool.workers, pid, nothing)
+    w === nothing && return nothing
+    # Only a worker started since the node last came back says anything about the node NOW. On
+    # a node that broke during the job the workers from before keep taking keys: they used to
+    # clear its count while it was out (so its back-off never grew, and the pool waited for a
+    # retry every five minutes for ever) and after (so the retry's one failure was forgiven).
+    w.node in pool.bad_nodes && return nothing
+    w.started >= get(pool.node_back_at, w.node, 0.0) || return nothing
+    pool.node_fails[w.node] = 0
+    delete!(pool.node_fail_since, w.node)
+    # A node that works again is not "out once already": two short outages hours apart
+    # used to leave it given up on for the rest of the job.
+    delete!(pool.node_outs, w.node)
+    return nothing
+end
+
+# Is there still something the pool is working towards?
+function _pool_wants(pool::SizedPool, table::TaskTable)
+    _pool_gave_up(pool) && return false
+    isempty(pool.starting) || return true
+    return _has_queued(table) && !pool.stuck
+end
+
+"""
+    pool_summary(pool) -> Vector{NamedTuple}
+
+The pool's workers by size: `(; cores, mem_gb, workers)`, largest first.
+"""
+function pool_summary(pool::SizedPool)
+    counts = Dict{KeyReq,Int}()
+    for w in values(pool.workers)
+        counts[w.size] = get(counts, w.size, 0) + 1
+    end
+    rows = [(; cores=s.cores, mem_gb=s.mem_gb, workers=n) for (s, n) in counts]
+    return sort!(rows; by=r -> (-r.cores, -r.mem_gb))
+end
+
+"""
+    shutdown!(pool; wait=60.0)
+
+Remove every worker the pool started and give their room back. Starts still in flight are waited
+for, up to `wait` seconds, and remove their own workers when they land. `run!` / `run_loop!` call
+it when they return, unless the pool was made with `keep=true`.
+"""
+function shutdown!(pool::SizedPool; wait::Real=60.0)
+    # Starts still in flight land in a pool nobody ticks any more: each removes its own workers
+    # when it sees `closing`. They are waited for, within a bound, so that when this returns
+    # what the pool started is gone.
+    pool.closing = !isempty(pool.starting)
+    timedwait(() -> isempty(pool.starting), Float64(wait); pollint=0.05)
+    for pid in collect(keys(pool.workers))
+        _kill_worker!(pid)
+        _pool_free!(pool, pid)
+    end
+    note_workers!(; planned=0, launched=0)
+    return nothing
+end
+
+export KeyReq, PoolNode, Spawner, LocalSpawner, SlurmStepSpawner, SizedPool
+export worker_size, plan_spawns, pool_summary, default_spawner

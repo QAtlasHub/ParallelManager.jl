@@ -64,12 +64,15 @@ result = SweepRunner.run!(work_fn, vault, keys)
 ```
 
 First run processes all 6 keys and writes a JSONL event log. The second
-run does nothing — it emits `:skip_complete` and exits in milliseconds:
+run does nothing — it emits `:skip_complete` and returns without touching the keys:
 
 ```
 ┌ Info: stage complete
-└   result = (stage = :phase1, done = 0, err = 0, skipped = 6, total = 6)
+└   result = (stage = :phase1, done = 0, err = 0, …, skipped = 6, total = 6, remaining = 0, stopped_by = nothing)
 ```
+
+The result has more fields than shown (`busy`, `gave_up`, `stop`, `cancelled`,
+`held_back`, `collisions`); [`run!`](@ref SweepRunner.run!) lists them.
 
 ## Phase chaining without Stage/DAG
 
@@ -95,7 +98,7 @@ path builders that leak phase1's storage layout into phase2's code.
 
 ## Parallel execution
 
-Want multi-threading inside one master?
+Want threads for the library calls inside a key (keys still run one at a time)?
 
 ```bash
 julia --project --threads=8 run.jl
@@ -103,7 +106,7 @@ julia --project --threads=8 run.jl
 
 `init_workers!(mode=:auto)` detects `Threads.nthreads() > 1` and returns
 `:threads`. For process-level parallelism, `run!` automatically fans out over
-Distributed workers via `pmap` when `nprocs() > 1` (use
+Distributed workers when `nprocs() > 1` (use
 `init_workers!(mode=:distributed|:slurm)`); with only the master it runs
 sequentially. Several independent masters can also share one vault:
 
@@ -119,7 +122,8 @@ wait
 
 Both masters will hit the same vault, the per-key `.running` lock (DataVault's
 `acquire_running!`) prevents double execution, and events from both processes
-interleave safely in `out/events.jsonl`.
+go to one log per master, `out/events_<host>_<pid>.jsonl`
+([`merge_event_logs`](@ref SweepRunner.merge_event_logs) puts them in one file).
 
 ## SLURM
 

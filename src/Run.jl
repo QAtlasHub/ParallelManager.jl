@@ -5,32 +5,41 @@
 #   10: + Manifest (early skip)
 #   11: + KeyLock (multi-master)
 #   12: + retry
-#   13: + automatic `pmap(WorkerPool(workers()), ...)` dispatch when
+#   13: + automatic fan-out over the Distributed workers when
 #       `nprocs() > 1`, so a single master can fan out over local
 #       `addprocs(n)` or a SLURM cluster allocated via
 #       `SlurmClusterManager`.  No per-file change needed in user
 #       compute scripts — they still call `run!(work_fn, vault, keys)`.
+#   0.6.9: the master holds the task table (TaskTable.jl) and hands keys out itself, with the lock
+#       token and the resume point; `pmap` is gone.
 
 using Distributed
 using DataVault
 using ParamIO: DataKey, canonical
 
 """
-    RunOpts(; workers=:auto, max_attempts=3, stale_after=600.0,
-             heartbeat_interval=60.0, stop_flag=nothing, deadline=nothing)
+    RunOpts(; workers=:auto, max_attempts=3, stale_after=600.0, heartbeat_interval=60.0,
+             stop_flag=ENV["SWEEPRUNNER_STOP_FLAG"], log_level=:info, deadline=nothing,
+             deadline_in=nothing, defer_poll=30.0, status_interval=60.0, control_interval=10.0,
+             min_busy_fraction=0.0, idle_grace=600.0, checkpoint_every=600.0,
+             stop_grace=Inf, shard=<env>, order=:given, manifest_interval=300.0,
+             stuck_after=0.0, min_utilisation=0.5)
 
 Execution options for [`run!`](@ref).
 
 # Fields
 
 - `workers::Symbol = :auto` — dispatch mode. `:auto` fans out over the
-  Distributed `WorkerPool(workers())` via `pmap` when `nprocs() > 1`, and runs
+  Distributed `workers()` when `nprocs() > 1`, and runs
   sequentially otherwise. `:sequential` forces the sequential path even when
   worker processes are present (useful for debugging a serialization issue).
 - `max_attempts::Int = 3` — per-key retry budget. Set to `1` to disable
   retry (a failed `work_fn` is logged as `:error` instead of `:gave_up`).
-- `stale_after::Float64 = 600.0` — seconds before another master can reclaim a
-  held lock as stale. Passed through to `DataVault.acquire_running!`.
+- `stale_after::Float64 = 600.0` — the heartbeat age past which a lock NOBODY ANSWERS FOR is
+  reclaimed. It is the last resort, not the usual wait: a lock a reporting master lists as held
+  is left alone whatever its age, and a lock whose holder is known to be gone (its master no
+  longer lists it, its job ended, its pid is not there) is removed when a job starts, without
+  waiting. Passed through to `DataVault.acquire_running!`.
 - `heartbeat_interval::Float64 = 60.0` — how often the per-lock heartbeat
   (a child process, `DataVault.start_heartbeat`) refreshes DataVault's
   `.running` file. It keeps beating while `work_fn` computes without yielding.
@@ -56,10 +65,10 @@ Execution options for [`run!`](@ref).
   that misspells it gets no error and no graceful stop, only a killed job.
   Pass `stop_flag=nothing` explicitly to opt out.
 
-  **Granularity: the flag is read between keys, not inside one.** A key already
-  in `work_fn` runs to completion, so the time between raising the flag and
-  `run!` returning is bounded by the longest key, which the caller usually
-  cannot predict.
+  **Granularity: between keys, unless the unit or the options say otherwise.** By itself a
+  key already in `work_fn` runs to completion, so the time between raising the flag and `run!`
+  returning is the longest key's. A `work_fn` that calls [`stop_point`](@ref) leaves at its
+  next safe point, and `stop_grace` (below) bounds the rest by removing the worker.
 - `deadline::Union{Float64,Nothing} = nothing` — an absolute `time()` past which
   no new key is handed out. The same mechanism as `stop_flag` with the same
   in-key granularity, and the reason to have both is that a deadline is set in
@@ -69,11 +78,68 @@ Execution options for [`run!`](@ref).
 
   ```julia
   RunOpts(deadline = time() + 25 * 60)   # stop dispatching 5 min before a 30 min job ends
+  RunOpts(deadline_in = 25 * 60)         # the same, said as seconds from now
   ```
+
+  `deadline_in` is the relative form (seconds from when the options are built); give one or the
+  other. A `deadline` too small to be a `time()` is warned about: it is already past.
+
+The numbers are checked when the options are built: `max_attempts >= 1`; `stale_after`,
+`heartbeat_interval` and `defer_poll` positive; the intervals and graces non-negative (`0` is
+"off" where the field says so); `min_busy_fraction` in `[0, 1]`.
 
 - `defer_poll::Float64 = 30.0` — seconds [`run!`](@ref) waits before re-dispatching keys whose
   `work_fn` threw `DataVault.ArtifactBusy` (an artifact being built by another worker or job),
   when the previous pass made no progress. A deferred key costs no attempt.
+- `status_interval::Float64 = 60.0` — how often the master rewrites its status file (see
+  [`read_status`](@ref)): task counts, the worker pool against what was planned, and per worker
+  the key it is on, CPU utilisation and RSS. `0` writes none.
+- `control_interval::Float64 = 10.0` — how often the master looks for [`control!`](@ref)
+  requests (add work, cancel, stop, prioritise, resize, drain, pause) and for workers that joined
+  since the round began. `0` takes no requests.
+- `min_busy_fraction::Float64 = 0.0`, `idle_grace::Float64 = 600.0` — leave on purpose. When
+  the queue is empty and less than this fraction of the workers' cores has had a unit for
+  `idle_grace` seconds, the master stops: the job is holding its nodes for a few long units.
+  The units still running are told to stop (they leave at their next [`stop_point`](@ref), with
+  their progress recorded), and `run!` returns `stopped_by = :underused`, so the allocation is
+  given back instead of being held to the wall clock. `0` (the default) never does.
+- `checkpoint_every::Float64 = 600.0` — how often [`checkpoint_due`](@ref) says it is time to
+  save, inside a `work_fn` that keeps a checkpoint ([`save_checkpoint!`](@ref)). It is also due
+  at once on a stop and when the `deadline` is close. `0`: only then.
+- `stop_grace::Float64 = Inf` — a bound on the job's own stop. Once `stop_flag` is raised or
+  `deadline` has passed, a unit still running after this many seconds is cut: its worker is
+  removed and its lock released, so `run!` returns. Units that call [`stop_point`](@ref) leave
+  before that with their checkpoint. `Inf` (the default) waits for running units, as before;
+  set it below the lead your scheduler gives before it kills the job.
+- `shard::Union{Tuple{Int,Int},Nothing}` — `(i, m)`: this is master `i` of `m` cooperating on one
+  sweep (`0 <= i < m`). It starts on the keys whose hash falls in its share and reaches the
+  others' only when its own run out, so masters that start together do not spend their first
+  passes on each other's locks. Every master still covers every key: a share is where it
+  STARTS, not all it does. **Defaults to `ENV["SWEEPRUNNER_SHARD"]`** written `i/m`, and to the
+  Slurm array task (`SLURM_ARRAY_TASK_ID` of `SLURM_ARRAY_TASK_COUNT`) when the job is one.
+- `order::Symbol = :given` — `:longest_first` hands out the keys with the largest `cost` first
+  (see `cost` in [`run!`](@ref)), so the long keys start while there is time for them and the
+  short ones fill what is left of the job. `:given` keeps the caller's order.
+- `manifest_interval::Float64 = 300.0` — how often the keys finished so far are merged into the
+  manifest WHILE the round runs. The manifest used to be written only when a round ended, so a
+  job killed at its wall clock left none of its completions there and the next job found them
+  again one marker at a time. `0` writes it at the end only.
+- `stuck_after::Float64 = 0.0` — a running key that has reported no progress for this many
+  seconds (since it started, or since its last [`report_progress`](@ref) /
+  [`save_checkpoint!`](@ref)) is said to be stuck: a `key_stuck` warning in the event log, once
+  per stall (a key that advances and stalls again is said again), and `stuck` on its worker's row in the status, with a line in the warnings. Nothing
+  is cut — a heartbeat only shows the process is alive, and this is the missing half, "alive
+  and not advancing", left for a person or a [`control!`](@ref) request to act on. Set it above
+  the longest step your `work_fn` takes between two reports. `0` (the default) never says it.
+- `min_utilisation::Float64 = 0.5` — the alarm for a job that uses a fraction of what it is
+  charged for. When fewer than this fraction of the cores that are THIS MASTER'S to fill (its
+  pool's nodes; its node group, `SWEEPRUNNER_NODELIST`; else the job's cores less what the other
+  masters of the job report) have a key, with keys queued, for ten minutes, the master says so: a `low_utilisation` warning
+  in the event log and on its stderr, and a line at the top of the status, with the reason it
+  can see (workers cover only part of the allocation; or workers idle with keys nobody fits).
+  Nothing is stopped. `0` turns it off. It runs in the status tick, so `status_interval = 0`
+  turns it off too (the round says `status_off`); outside a Slurm job, without a pool, the
+  allocation is not known and nothing is compared.
 
 # Example
 
@@ -92,7 +158,91 @@ struct RunOpts
     log_level::Symbol
     deadline::Union{Float64,Nothing}
     defer_poll::Float64
+    status_interval::Float64
+    control_interval::Float64
+    min_busy_fraction::Float64
+    idle_grace::Float64
+    checkpoint_every::Float64
+    stop_grace::Float64
+    shard::Union{Tuple{Int,Int},Nothing}
+    order::Symbol
+    manifest_interval::Float64
+    stuck_after::Float64
+    min_utilisation::Float64
+    # The checks that keep a run from spinning or deciding on NaN are here too, in the only way
+    # to make one: built positionally, the options used to skip them. (The keyword constructor
+    # below says the same things first, in more words.)
+    function RunOpts(
+        workers,
+        max_attempts,
+        stale_after,
+        heartbeat_interval,
+        stop_flag,
+        log_level,
+        deadline,
+        defer_poll,
+        status_interval,
+        control_interval,
+        min_busy_fraction,
+        idle_grace,
+        checkpoint_every,
+        stop_grace,
+        shard,
+        order,
+        manifest_interval,
+        stuck_after,
+        min_utilisation,
+    )
+        bad(msg) = throw(ArgumentError("RunOpts: $msg"))
+        workers in (:auto, :sequential) || bad("workers must be :auto or :sequential")
+        order in (:given, :longest_first) || bad("order must be :given or :longest_first")
+        max_attempts >= 1 || bad("max_attempts must be >= 1, got $max_attempts")
+        (stale_after > 0 && heartbeat_interval > 0 && defer_poll > 0) ||
+            bad("stale_after, heartbeat_interval and defer_poll must be > 0")
+        heartbeat_interval < stale_after || bad("heartbeat_interval must be < stale_after")
+        all(
+            x -> x >= 0,
+            (
+                status_interval,
+                control_interval,
+                idle_grace,
+                checkpoint_every,
+                stop_grace,
+                manifest_interval,
+                stuck_after,
+            ),
+        ) || bad("intervals and graces must be >= 0 and not NaN")
+        (0 <= min_busy_fraction <= 1 && 0 <= min_utilisation <= 1) ||
+            bad("min_busy_fraction and min_utilisation must be in [0, 1]")
+        (deadline === nothing || !isnan(deadline)) || bad("deadline is NaN")
+        (shard === nothing || (shard[2] >= 1 && 0 <= shard[1] < shard[2])) ||
+            bad("shard must be (i, m) with 0 <= i < m")
+        return new(
+            workers,
+            max_attempts,
+            stale_after,
+            heartbeat_interval,
+            stop_flag,
+            log_level,
+            deadline,
+            defer_poll,
+            status_interval,
+            control_interval,
+            min_busy_fraction,
+            idle_grace,
+            checkpoint_every,
+            stop_grace,
+            shard,
+            order,
+            manifest_interval,
+            stuck_after,
+            min_utilisation,
+        )
+    end
 end
+
+# `time()` was past this in 2001: an absolute deadline below it was meant as a duration.
+const _DEADLINE_LOOKS_RELATIVE = 1.0e9
 
 function RunOpts(;
     workers::Symbol=:auto,
@@ -102,7 +252,19 @@ function RunOpts(;
     stop_flag::Union{String,Nothing}=get(ENV, "SWEEPRUNNER_STOP_FLAG", nothing),
     log_level::Symbol=:info,
     deadline::Union{Real,Nothing}=nothing,
+    deadline_in::Union{Real,Nothing}=nothing,
     defer_poll::Real=30.0,
+    status_interval::Real=60.0,
+    control_interval::Real=10.0,
+    min_busy_fraction::Real=0.0,
+    idle_grace::Real=600.0,
+    checkpoint_every::Real=600.0,
+    stop_grace::Real=Inf,
+    shard::Union{Tuple{<:Integer,<:Integer},Nothing}=_shard_from_env(),
+    order::Symbol=:given,
+    manifest_interval::Real=300.0,
+    stuck_after::Real=0.0,
+    min_utilisation::Real=0.5,
 )
     workers in (:auto, :sequential) || throw(
         ArgumentError(
@@ -114,6 +276,72 @@ function RunOpts(;
             "RunOpts: log_level must be :debug/:info/:warn/:error, got $(repr(log_level))",
         ),
     )
+    order in (:given, :longest_first) || throw(
+        ArgumentError(
+            "RunOpts: order must be :given or :longest_first, got $(repr(order))"
+        ),
+    )
+    (shard === nothing || (shard[2] >= 1 && 0 <= shard[1] < shard[2])) || throw(
+        ArgumentError("RunOpts: shard must be (i, m) with 0 <= i < m, got $(repr(shard))"),
+    )
+    max_attempts >= 1 || throw(
+        ArgumentError(
+            "RunOpts: max_attempts must be >= 1, got $max_attempts (with 0 a key is given " *
+            "up on without one attempt)",
+        ),
+    )
+    # `x > 0` and `x >= 0` are false for NaN too, so a NaN is refused with the rest.
+    for (name, x) in (
+        ("stale_after", stale_after),
+        ("heartbeat_interval", heartbeat_interval),
+        ("defer_poll", defer_poll),
+    )
+        x > 0 || throw(ArgumentError("RunOpts: $name must be > 0 seconds, got $x"))
+    end
+    for (name, x) in (
+        ("status_interval", status_interval),
+        ("control_interval", control_interval),
+        ("manifest_interval", manifest_interval),
+        ("checkpoint_every", checkpoint_every),
+        ("idle_grace", idle_grace),
+        ("stop_grace", stop_grace),
+        ("stuck_after", stuck_after),
+    )
+        x >= 0 ||
+            throw(ArgumentError("RunOpts: $name must be >= 0 seconds (0: off), got $x"))
+    end
+    0 <= min_utilisation <= 1 || throw(
+        ArgumentError(
+            "RunOpts: min_utilisation is a fraction of the allocated cores, in [0, 1]; got " *
+            "$min_utilisation",
+        ),
+    )
+    0 <= min_busy_fraction <= 1 || throw(
+        ArgumentError(
+            "RunOpts: min_busy_fraction is a fraction of the workers' cores, in [0, 1]; got " *
+            "$min_busy_fraction",
+        ),
+    )
+    if deadline_in !== nothing
+        deadline === nothing || throw(
+            ArgumentError(
+                "RunOpts: give `deadline` (an absolute time()) or `deadline_in` (seconds " *
+                "from now), not both",
+            ),
+        )
+        deadline_in >= 0 ||
+            throw(ArgumentError("RunOpts: deadline_in must be >= 0, got $deadline_in"))
+        deadline = time() + deadline_in
+    elseif deadline !== nothing
+        isnan(deadline) && throw(ArgumentError("RunOpts: deadline is NaN"))
+        # Every other option is seconds FROM NOW; this one is a point in time. A value that
+        # small is a duration written in its place, and the run it gives stops at once.
+        deadline < _DEADLINE_LOOKS_RELATIVE && @warn(
+            "RunOpts: deadline = $deadline is an absolute time() and is long past, so the " *
+                "run stops at once. For \"$deadline seconds from now\" write " *
+                "`deadline_in = $deadline`.",
+        )
+    end
     heartbeat_interval < stale_after || throw(
         ArgumentError(
             "RunOpts: heartbeat_interval ($heartbeat_interval) must be < " *
@@ -130,7 +358,37 @@ function RunOpts(;
         log_level,
         deadline === nothing ? nothing : Float64(deadline),
         Float64(defer_poll),
+        Float64(status_interval),
+        Float64(control_interval),
+        Float64(min_busy_fraction),
+        Float64(idle_grace),
+        Float64(checkpoint_every),
+        Float64(stop_grace),
+        shard === nothing ? nothing : (Int(shard[1]), Int(shard[2])),
+        order,
+        Float64(manifest_interval),
+        Float64(stuck_after),
+        Float64(min_utilisation),
     )
+end
+
+# `i/m` from `SWEEPRUNNER_SHARD`, else the Slurm array task; `nothing` when neither says.
+function _shard_from_env()
+    s = get(ENV, "SWEEPRUNNER_SHARD", "")
+    if !isempty(s)
+        parts = split(s, '/')
+        if length(parts) == 2
+            i, m = tryparse(Int, parts[1]), tryparse(Int, parts[2])
+            (i !== nothing && m !== nothing && m >= 1 && 0 <= i < m) && return (i, m)
+        end
+        return nothing
+    end
+    id = tryparse(Int, get(ENV, "SLURM_ARRAY_TASK_ID", ""))
+    n = tryparse(Int, get(ENV, "SLURM_ARRAY_TASK_COUNT", ""))
+    lo = something(tryparse(Int, get(ENV, "SLURM_ARRAY_TASK_MIN", "")), 0)
+    (id === nothing || n === nothing || n < 2) && return nothing
+    i = id - lo
+    return 0 <= i < n ? (i, n) : nothing
 end
 
 # Why the loop is stopping, so `:stage_done` can say which of the two fired rather than leaving
@@ -141,18 +399,65 @@ function _stop_reason(opts::RunOpts)::Union{Symbol,Nothing}
     return nothing
 end
 
-# The per-key outcome vocabulary names the same two reasons `_stop_reason` does, for a
+# The same, for a master: a `control!(…, :stop)` with no scope stops it too. The job's own bounds
+# outrank a request, so a stage cut by the wall clock is not attributed to whoever asked last.
+function _stop_reason(opts::RunOpts, master::Master)::Union{Symbol,Nothing}
+    r = _stop_reason(opts)
+    r === nothing || return r
+    return master.ctl.stop_all ? master.ctl.stop_why : nothing
+end
+
+# The per-key outcome vocabulary names the same reasons `_stop_reason` does, for a
 # `(key, outcome)` tuple that sits alongside `:ok` / `:error`. Written once, and loudly: a third
 # reason added above must fail here rather than be silently relabelled as a deadline.
 function _stop_outcome(reason::Symbol)::Symbol
     reason === :flag && return :stop_flag
     reason === :deadline && return :stop_deadline
+    reason === :request && return :stop_request
+    reason === :underused && return :stop_request      # the master asked, of itself
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
-# How many times a key whose worker DIED is handed to another one. Both dispatchers bound this,
-# `_run_pmap!` through `pmap`'s `retry_delays` and `_run_affinity!` by counting, and they have to
-# agree: the same bound expressed twice through unrelated mechanisms is how they drift apart.
+# A step of a `finally`: what it throws is not allowed to hide what is already on its way out —
+# and is said, where it can be (`what` names the step).
+function _guarded(f, log=nothing, what::AbstractString="")
+    try
+        f()
+    catch e
+        e isa InterruptException && rethrow()
+        try
+            log === nothing ||
+                log_event(log, :cleanup_failed; level=:warn, step=what, err=_short_err(e))
+        catch
+            # The log is what failed.
+        end
+    end
+    return nothing
+end
+
+# How long a worker Distributed reports as exited is given to be seen to have ended, before
+# its lock is kept as that of a process that may still be computing.
+const _EXIT_CONFIRM = Ref(10.0)
+
+# Workers left inside a unit they could not be stopped in (their lock was kept).
+const _KEPT_WORKERS = Set{Int}()
+
+# How many times a worker that joined late is readied before it is given up on. Three: once is
+# what a file system that was slow for a moment fails, and each try costs a tick.
+const _PREPARE_TRIES = 3
+
+# The ticker's steps: how often a failing one is said again, and how many failures in a row end
+# the round.
+const _TICK_SAY_EVERY = 100
+# The steps whose lasting failure ends the round, and after how long. Five minutes: longer than
+# a file system or a controller usually stays away, shorter than a job can afford to idle.
+const _TICK_FATAL_STEPS = (:pool, :adopt, :stop_grace, :enforce_stops)
+const _TICK_FATAL_AFTER = Ref(300.0)
+# How long the units still running get once a round is ending on a failed step, when the
+# options give no `stop_grace`: time for a `stop_point` to save and leave.
+const _ABORT_GRACE = Ref(120.0)
+
+# How many times a key whose worker DIED is handed to another one.
 const _WORKER_DEATH_REDISPATCHES = 2
 
 # As of v0.3 the per-key lock lives ENTIRELY in DataVault's `.running`
@@ -187,7 +492,9 @@ derives `(root, stage)` from a `DataVault.Vault`:
 load_manifest(vault::Vault) = load_manifest(manifest_root(vault), Symbol(vault.run))
 
 """
-    run!(work_fn, vault, keys; opts=RunOpts(), load=nothing, observe=true) -> NamedTuple
+    run!(work_fn, vault, keys; opts=RunOpts(), load=nothing, affinity=nothing, observe=true,
+         master=nothing, spawn=nothing, key_class=nothing, cost=nothing, min_time=nothing,
+         pool=nothing) -> NamedTuple
 
 Run `work_fn(key) -> Dict` for every `key` in `keys`, persisting through
 `vault`. Writes a structured JSONL event log at
@@ -224,14 +531,88 @@ once instead of once per key.
 
     run!(work_fn, vault, keys; affinity = k -> param(k, "system.L"))
 
-A preference, not a partition: a worker is never idle while a key is pending, so a 200-key group
+A preference, not a partition: a worker is never idle while a key it may take is pending (with a
+`pool`, a worker takes only keys of its size), so a 200-key group
 does not serialise onto the worker that opened it. When a worker has nothing from its own groups
 left it takes from the group with the most work outstanding, which spreads workers over groups.
 
-Only affects the `pmap` path; the sequential path already visits keys in order.
+Only affects the fan-out; the sequential path visits keys in order. Keys are drawn by group, so
+`order=:longest_first` and a shard's order hold inside a group, not across groups.
 
-Returns `(; stage, done, err, busy, gave_up, stop, skipped, total, stopped_by)`. `stopped_by` is
-`:flag`, `:deadline`, or `nothing`: a stage that finished every key reports `nothing` even if the
+# The task table
+
+The master reads the markers once, before it dispatches: keys finished by a sibling since the
+manifest was written are settled, a lock whose holder is provably gone is removed, and a key held
+by a live sibling is not handed out at all (it is counted in `busy`). What is left is the queue.
+Each key goes to a worker together with its lock token and the last progress recorded for it, so
+`work_fn` can ask [`resume_point`](@ref) instead of probing its own outputs; see
+[`report_progress`](@ref).
+
+When the queue drains, the keys that came back busy are asked about once more, since their holder
+may have finished or died while the pass ran.
+
+`key_class` is `key -> label`: the class a key's cost is recorded under (a size, a model). Every
+finished key leaves a `key_done` record with its wall time, CPU time, cores, peak memory and node;
+[`key_costs`](@ref) reads them back and [`cost_summary`](@ref) groups them by this label, so the
+next job can be sized from what keys of each class actually took. Inside `work_fn`,
+[`note_key!`](@ref) adds fields to the record.
+
+# Cost and the wall clock
+
+`cost` is `key -> seconds`, the key's expected run time ([`measured_cost`](@ref) builds one from
+what earlier keys took). With `RunOpts(order=:longest_first)` the queue is drawn longest first.
+
+`min_time` is `key -> seconds`, how long the key needs to get somewhere: to its next checkpoint,
+or to its end if it keeps none (it defaults to `cost`). With a `deadline`, a key that needs more
+than the time left is NOT started: a key that is run, cut at the wall clock and started again
+from the same point by the next job occupies a worker for nothing. Such keys are counted in
+`held_back`, logged once (`held_back`), and left for a job with more time. The check is made each
+time a key is handed out, so as the job runs down the long keys are passed over and the short ones
+still fill it.
+
+Without a `min_time` it is `cost`, the whole key — except for a key with a progress record
+(an earlier attempt called `save_checkpoint!` or `report_progress`): that one needs only
+`opts.checkpoint_every` to get somewhere, so a checkpointing key longer than the job is still
+advanced by it. A key with no record yet is held to its whole time.
+
+# Workers sized to their keys
+
+`pool` is a [`SizedPool`](@ref): instead of `n` identical workers started by `init_workers!`, the
+pool starts a worker of the size a key needs (`key_req`), where a node has the room, as the queue
+is drawn, and a worker only takes the keys it can hold. A worker that dies under a key has the
+key retried with more memory.
+
+`spawn` is `n -> start n more workers`: what a `:resize` request calls to grow the pool. Without
+it the pool can only shrink.
+
+`master` is the [`Master`](@ref) this call runs as (a fresh one by default). A caller that makes
+several `run!` calls as one job (as [`run_loop!`](@ref) does) passes the same one to each, so they
+share an event log, a status file and the worker identities already collected.
+
+# Control
+
+While it runs, the master takes requests ([`control!`](@ref)): add keys, cancel or stop part of
+the work, move keys to the front, resize the pool, drain a node, pause. They are applied every
+`opts.control_interval` seconds, and each one is logged with who asked. Workers that join after
+the round began are adopted at the same cadence. Inside `work_fn`, [`should_stop`](@ref) /
+[`stop_point`](@ref) are where a unit that was told to stop leaves.
+
+# Status
+
+While it runs, the master rewrites `<state_root>/masters/<id>/status.json` every
+`opts.status_interval` seconds; [`read_status`](@ref) / [`print_status`](@ref) read it from any
+process, during the job or after it.
+
+Returns `(; stage, done, err, busy, gave_up, stop, cancelled, held_back, cost_unknown,
+explore_again, collisions, skipped, total, remaining, stopped_by)`. `cancelled` counts the keys a
+request took out of this job; `held_back` the keys not started because they could not get
+anywhere before the deadline, `cost_unknown` how many of those were held back because nobody
+could say how long they take, and `explore_again` the classes whose explored key did not finish
+(the next round tries another);
+`collisions` the keys that were handed to a worker and came back because another master took
+them first; `total` includes the
+keys a request added; `remaining` is how many keys are not done after the round (`0`: the sweep
+is complete). `stopped_by` is `:flag`, `:deadline`, `:request`, `:underused`, or `nothing` (`run_loop!` adds `:cost_unknown`: the keys left were all held back because nobody could say how long they take): a stage that finished every key reports `nothing` even if the
 deadline passed while its last key ran, since no key was ever held back by it.
 The full-done early exit returns the same field set rather than a shorter one.
 
@@ -241,15 +622,16 @@ Contract:
 - Exceptions in `work_fn` are caught and logged; the corresponding key's
   `.done` file is not written, so re-runs will pick it up.
 - The stage label used for logging is `Symbol(vault.run)`.
-- Manifest is monotonic: saved at end-of-stage with every newly completed key.
+- Manifest is monotonic: newly completed keys are merged in every `opts.manifest_interval`
+  seconds while the round runs, and once more when it ends.
 
 # Parallel dispatch
 
 If `nprocs() > 1` (i.e. `init_workers!(mode=:distributed|:slurm)` has added
 worker processes), `run!` automatically fans out over the Distributed
-`WorkerPool(workers())` via `pmap`.  Each worker runs the per-key
+`workers()`.  Each worker runs the per-key
 lock-acquire → `work_fn` → `DataVault.save!` → `mark_done!` pipeline
-independently.  All filesystem operations (the `.running` lock, atomic JLD2 write,
+for the key it was handed.  All filesystem operations (the `.running` lock, atomic JLD2 write,
 JSONL event log) are already NFS-safe, so concurrent workers inside one
 master are structurally consistent with multi-master operation.
 
@@ -258,7 +640,7 @@ sequential loop from todo 11.  This means the same compute.jl script is
 valid in three modes:
 
 1. No `init_workers!` call at all → sequential on the master.
-2. `init_workers!(mode=:distributed)` with `addprocs(n)` → local pmap fan-out.
+2. `init_workers!(mode=:distributed)` with `addprocs(n)` → local fan-out.
 3. `init_workers!(mode=:slurm)` inside a SLURM job → cluster fan-out.
 
 Multi-master locking (several separate julia processes writing to the
@@ -273,17 +655,48 @@ function run!(
     load=nothing,
     affinity=nothing,
     observe::Bool=true,
+    master::Union{Master,Nothing}=nothing,
+    spawn=nothing,
+    key_class=nothing,
+    cost=nothing,
+    min_time=nothing,
+    pool=nothing,
 )
     stage = Symbol(vault.run)
-    log_name = "events_$(gethostname())_$(getpid()).jsonl"
+    # A master handed in outlives this call (`run_loop!` between rounds); one made here does not.
+    own = master === nothing
+    master = own ? Master() : master
+    log_name = "events_$(master.id).jsonl"
     log = EventLog(joinpath(vault.outdir, log_name); min_level=opts.log_level)
+    # A pool starts its own workers as the queue needs them, so there may be none yet.
+    multi = opts.workers !== :sequential && (nprocs() > 1 || pool !== nothing)
+    master.vault = vault
+    master.stage = String(stage)
+    master.multi = multi
+    master.interval = opts.status_interval
+    master.stuck_after = opts.stuck_after
+    master.min_utilisation = opts.min_utilisation
+    # What this master has to fill: its pool's nodes, or its node group; else not told.
+    master.own_cores =
+        pool === nothing ? _slurm_group_cores() : sum(n.cores for n in pool.nodes)
+    warned0 = warning_counts()
+    spawn === nothing || (master.ctl.spawn = spawn)
+    after = own ? :ended : :waiting
+    # Requests made while no round was running (between rounds, or just before this call), and
+    # the keys earlier requests added: they are part of the sweep from here on.
+    poll_control!(master, nothing, log, opts; force=true)
+    keys = _with_extra(keys, master.ctl.extra)
 
+    t_run = time()
     # Early skip: load manifest, subtract completed keys
     m = load_manifest(vault)
     todo = todo_keys(m, collect(keys))
 
     if isempty(todo)
         log_event(log, :skip_complete; stage=stage, total=length(keys))
+        master.table = nothing
+        master.state = after
+        master.interval > 0 && write_status(master)
         return (
             stage=stage,
             done=0,
@@ -291,38 +704,231 @@ function run!(
             busy=0,
             gave_up=0,
             stop=0,
+            cancelled=0,
+            held_back=0,
+            cost_unknown=0,
+            explore_again=0,
+            collisions=0,
             skipped=length(keys),
             total=length(keys),
+            remaining=0,
             stopped_by=nothing,
         )
     end
 
     log_event(log, :stage_start; stage=stage, total=length(keys), todo=length(todo))
+    collisions0 = master.collisions
 
-    # Dispatch strategy: pmap when Distributed workers are present (unless the
-    # caller forced `workers=:sequential`), otherwise the sequential loop.
-    multi = opts.workers !== :sequential && nprocs() > 1
+    # Dispatch strategy: fan out when Distributed workers are present (unless the
+    # caller forced `workers=:sequential`), otherwise draw the queue on this process.
+    t_prepare = time()
+    mods = vcat([:ParamIO, :DataVault, :SweepRunner], _worker_module_names(load))
     if multi
         # Ensure the seam packages (+ the user's work module(s) via `load=`) are loaded in `Main`
         # on every worker before fan-out. `init_workers!` spawns workers with `--project` but loads
-        # no packages, so the first pmap task would otherwise die with a cryptic
+        # no packages, so the first dispatched key would otherwise die with a cryptic
         # `KeyError: <Module> not found` (DataKey deserialization / the save! pipeline / work_fn).
         # Idempotent, so it composes with a project that still broadcasts modules by hand.
-        _ensure_worker_modules(
-            vcat([:ParamIO, :DataVault, :SweepRunner], _worker_module_names(load))
-        )
+        _ensure_worker_modules(mods)
     end
+    # The same two steps for workers that join after the round began. One that cannot be readied
+    # is not handed work, and the round goes on without it.
+    prepare =
+        pids -> try
+            _ensure_worker_modules(mods; pids=pids)
+            _observe_late!(vault, pids, observe, log, stage)
+            _redirect_late!(pids)
+            pids
+        catch e
+            e isa InterruptException && rethrow()
+            log_event(
+                log,
+                :workers_rejected;
+                level=:warn,
+                stage=stage,
+                n=length(pids),
+                err=_short_err(e),
+            )
+            Int[]
+        end
     # Every process that will write markers observes its sources now, so each `.done` names the
     # observation of the process that computed it (see Observe.jl).
     _observe_processes!(vault, multi, observe, log, stage)
-    dispatch = ks -> if !multi
-        _run_sequential!(work_fn, vault, ks, stage, log, opts)
-    elseif affinity === nothing
-        _run_pmap!(work_fn, vault, ks, stage, log, opts)
+    # The master's view of the round: one pass over the markers, then the queue the dispatcher
+    # draws from. The sequential path visits keys in the caller's order, so it takes no affinity.
+    prepare_secs = time() - t_prepare
+    # Whoever the cost comes from — the caller's hook or the table this package measured — a key
+    # it has no answer for is treated one way: see `_fits`.
+    cost = _default_cost(vault, cost, key_class, todo, log, stage)
+    _say_ignored(
+        log, stage, opts, cost; pool=pool, affinity=affinity, spawn=spawn, multi=multi
+    )
+    # A hook that throws is said — here, whatever the options: the ordering, the pool's sizing
+    # and the campaign's filter ask it too, and there its error only read as "unknown".
+    hook_said = Ref(false)
+    _say_hook_error(log, stage, something(min_time, cost, Some(nothing)), todo, hook_said)
+    todo = _ordered(todo, opts, cost)
+    t_scan = time()
+    # Whether a key can still get somewhere before the deadline; asked at each hand-out.
+    # Without a `min_time`, the whole key (`cost`) — except for a key that has shown it keeps
+    # progress: that one needs only the time to its next checkpoint to get somewhere.
+    table_ref = Ref{Union{TaskTable,Nothing}}(nothing)
+    need_time = if min_time !== nothing
+        min_time
     else
-        _run_affinity!(work_fn, vault, ks, stage, log, opts, affinity)
+        _checkpoint_aware(something(cost, Returns(0.0)), opts, table_ref)
     end
-    outcomes = _redispatch_deferred(dispatch(todo), dispatch, log, stage, opts)
+    if pool !== nothing
+        # At the size the pool will run the key with: a key `:finish_by` gave more cores to is
+        # not then refused for the time it would have taken on fewer.
+        base_time = need_time
+        need_time = key -> _pool_min_time(pool, key, opts.deadline, base_time)
+    end
+    # Keys whose time nobody could say, and what the hook threw the first time it did.
+    unknown_keys = Set{String}()
+    unknown_classes = Set{String}()
+    fits = _fits(
+        opts,
+        need_time;
+        class=k -> _class_of(key_class, k),
+        explored=master.explored,
+        avoid=master.explore_failed,
+        unknown=unknown_keys,
+        classes=unknown_classes,
+        on_explore=(class, kstr) -> log_event(
+            log,
+            :cost_explore;
+            level=:warn,
+            stage=stage,
+            class=class,
+            key=kstr,
+            why="its time is not known; one key of the class is started to measure it",
+        ),
+        # A hook that throws for the first queued key was said before the queue was ordered;
+        # one that throws only for others is said here, the first time it does.
+        on_error=err -> if !hook_said[]
+            hook_said[] = true
+            log_event(log, :cost_hook_failed; level=:warn, stage=stage, err=err)
+        end,
+        on_cap=n -> log_event(
+            log,
+            :cost_explore_capped;
+            level=:warn,
+            stage=stage,
+            max=n,
+            why="more classes of unknown cost than are explored in one round; the rest wait",
+        ),
+    )
+    table = TaskTable(todo; affinity=multi ? affinity : nothing)
+    table_ref[] = table
+    scan = _scan!(table, vault, stage, log, opts)
+    scan_secs = time() - t_scan
+    master.locks = Dict{String,Any}(String(k) => v for (k, v) in pairs(scan))
+    _apply_standing!(master, table)
+    # Merge what has finished so far into the manifest, at most every `manifest_interval`.
+    flushed = Ref(time())
+    manifest_secs = Ref(0.0)
+    flush_manifest =
+        () -> begin
+            (opts.manifest_interval > 0 && time() - flushed[] >= opts.manifest_interval) || return nothing
+            t_flush = time()
+            flushed[] = t_flush
+            try
+                done_now = lock(table.lock) do
+                    return DataKey[
+                        r.key for r in table.rows if
+                        r.outcome === :ok || r.outcome === :already_done
+                    ]
+                end
+                foreach(k -> add_complete!(m, k), done_now)
+                merge_and_save_manifest!(m)
+                # The cost table with it: a job killed at its wall clock leaves what it measured.
+                write_cost_table(vault)
+            catch e
+                e isa InterruptException && rethrow()
+                log_event(
+                    log, :manifest_failed; level=:warn, stage=stage, err=_short_err(e)
+                )
+            end
+            manifest_secs[] += time() - t_flush
+            return nothing
+        end
+    master.table = table
+    master.state = :running
+    _identify_workers!(master, multi ? workers() : [myid()])
+    drive = if multi
+        () -> _drive_workers!(
+            work_fn,
+            vault,
+            table,
+            stage,
+            log,
+            opts,
+            master;
+            affinity=affinity,
+            prepare=prepare,
+            key_class=key_class,
+            fits=fits,
+            tick=flush_manifest,
+            pool=pool,
+            min_time=something(min_time, cost, Some(nothing)),
+        )
+    else
+        () -> _drive_sequential!(
+            work_fn,
+            vault,
+            table,
+            stage,
+            log,
+            opts,
+            master;
+            key_class=key_class,
+            fits=fits,
+            tick=flush_manifest,
+        )
+    end
+    t_dispatch = time()
+    try
+        _with_status(master, log) do
+            return _dispatch!(
+                drive,
+                table,
+                vault,
+                stage,
+                log,
+                opts;
+                standing=() -> _apply_standing!(master, table),
+            )
+        end
+    finally
+        # A master that is leaving says so. On the way out through an exception (an interrupt, a
+        # failed worker bootstrap) there can be keys still out: the locks this master named for
+        # them are released now, and each key that was cut is logged, rather than left on disk
+        # for whoever trips over them.
+        # Each by itself: one that throws (the event directory full at the end of a job) must
+        # not skip the ones after it, nor take the place of the exception that is propagating.
+        _guarded(() -> _release_running!(table, vault, stage, log), log, "release_running")
+        # A status that still says `running` after the master has left is the one thing it must
+        # not say.
+        master.state = after
+        _guarded(() -> master.interval > 0 && status_tick!(master, log), log, "status")
+        # A master of its own ends here; one handed in (`run_loop!`) reports when the loop ends.
+        _guarded() do
+            return own && log_event(
+                log, :job_account; stage=stage, account=account_snapshot(master)
+            )
+        end
+        # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
+        # when IT returns).
+        _guarded(
+            () -> (own && pool !== nothing && !pool.keep) && shutdown!(pool),
+            log,
+            "shutdown_pool",
+        )
+        # The round's warnings in one line, however it ended: an exception, a pool that gave
+        # up, a cut that failed are the rounds whose warnings matter most.
+        _guarded(() -> _say_warnings(stage, _warnings_since(warned0)))
+    end
 
     # Aggregate outcomes into counters + manifest updates.
     n_done = 0
@@ -330,33 +936,62 @@ function run!(
     n_busy = 0
     n_gave_up = 0
     n_stop = 0
+    n_cancelled = 0
+    n_held_back = 0
+    n_complete = 0
     stop_seen = nothing
-    for (key, outcome) in outcomes
-        if outcome === :lock_busy || outcome === :deferred
-            n_busy += 1
-        elseif outcome === :already_done
+    for row in table.rows
+        key, outcome = row.key, row.outcome
+        if outcome === :already_done
             add_complete!(m, key)
+            n_complete += 1
         elseif outcome === :ok
             add_complete!(m, key)
             n_done += 1
+            n_complete += 1
         elseif outcome === :stop_flag
             n_stop += 1
             stop_seen = :flag                 # outranks :deadline, as `_stop_reason` does
         elseif outcome === :stop_deadline
             n_stop += 1
-            stop_seen === nothing && (stop_seen = :deadline)
+            stop_seen === :flag || (stop_seen = :deadline)
+        elseif outcome === :stop_request || outcome === :stopped
+            # A unit that left at a safe point, or was cut: stopped, whoever asked. The job's own
+            # bounds outrank a request when both hold.
+            n_stop += 1
+            stop_seen === nothing &&
+                (stop_seen = something(_stop_reason(opts), master.ctl.stop_why))
+        elseif outcome === :cancelled
+            n_cancelled += 1
+        elseif outcome === :no_fit
+            n_held_back += 1
         elseif outcome === :gave_up
             n_gave_up += 1
             n_err += 1
-        else  # :error
+        elseif outcome === :error
             n_err += 1
+        else
+            # `:lock_busy`, `:deferred`, `:worker_lost`: never attempted to completion here, and
+            # retriable.
+            n_busy += 1
         end
     end
 
     # Persist the updated manifest, merging with on-disk state so that
     # concurrent masters don't overwrite each other's completed keys.
+    t_manifest = time()
     merge_and_save_manifest!(m)
 
+    explore_again = _unexplore!(master.explored, table, master.explore_failed)
+    # The cost table at the end of EVERY round, not only on the manifest's timer: the next
+    # round reads it, and a class explored in this one has to be known to that one — else the
+    # siblings were held back again and the loop took it for the deadline.
+    try
+        write_cost_table(vault)
+    catch e
+        e isa InterruptException && rethrow()
+        log_event(log, :cost_table_failed; level=:warn, stage=stage, err=_short_err(e))
+    end
     # From what the round actually did, so a stage that finished every key is not attributed to a
     # deadline that passed while the last one ran.
     stopped_by = stop_seen
@@ -370,8 +1005,37 @@ function run!(
         busy=n_busy,
         gave_up=n_gave_up,
         stop=n_stop,
+        cancelled=n_cancelled,
+        held_back=n_held_back,
+        collisions=master.collisions - collisions0,
         skipped=length(keys) - length(todo),
         stopped_by=stopped_by === nothing ? nothing : String(stopped_by),
+        # Where the round's wall time went, outside the keys themselves.
+        prepare_secs=round(prepare_secs; digits=3),
+        scan_secs=round(scan_secs; digits=3),
+        manifest_secs=round(manifest_secs[] + (time() - t_manifest); digits=3),
+        dispatch_secs=round(t_manifest - t_dispatch; digits=3),
+        total_secs=round(time() - t_run; digits=3),
+        # The warn-level events of this round on this process, by kind.
+        warnings=_warnings_since(warned0),
+    )
+    # Said once, with the count: the keys this job did not start because they could not get
+    # anywhere before its deadline.
+    n_held_back > 0 && log_event(
+        log,
+        :held_back;
+        # Held for the deadline is the plan working; held because nobody knows how long the
+        # key takes is something to act on.
+        level=isempty(unknown_keys) ? :info : :warn,
+        stage=stage,
+        keys=n_held_back,
+        cost_unknown=length(unknown_keys),
+        classes_unknown=sort!(collect(unknown_classes)),
+        secs_left=if opts.deadline === nothing
+            nothing
+        else
+            round(Int, opts.deadline - time())
+        end,
     )
     return (
         stage=stage,
@@ -380,8 +1044,18 @@ function run!(
         busy=n_busy,
         gave_up=n_gave_up,
         stop=n_stop,
+        cancelled=n_cancelled,
+        held_back=n_held_back,
+        cost_unknown=length(unknown_keys),
+        # Classes whose explored key did not finish: the next round explores them again.
+        explore_again=explore_again,
+        collisions=master.collisions - collisions0,
         skipped=length(keys) - length(todo),
-        total=length(keys),
+        # What the manifest already had, plus every row of the table: the keys a request added
+        # while the round ran are rows too.
+        total=(length(keys) - length(todo)) + length(table),
+        # Keys of this sweep that are not done after the round, whoever would do them.
+        remaining=length(table) - n_complete,
         stopped_by=stopped_by,
     )
 end
@@ -436,12 +1110,17 @@ function _run_one_with_lock!(
     key::DataKey,
     stage::Symbol,
     log::EventLog,
-    opts::RunOpts,
+    opts::RunOpts;
+    tok::AbstractString=owner_token(),
+    resume::Union{Progress,Nothing}=nothing,
+    reap::Bool=true,
+    watch::StopWatch=StopWatch(time(), "", ""),
+    class::AbstractString="",
 )
     kstr = canonical(key)
 
-    # Early exit if stop flag has been raised (checked by both sequential
-    # and pmap paths, so each worker can bail independently).
+    # Early exit if stop flag has been raised (checked here as well as by the dispatcher, so a
+    # key already on its way to a worker is not started).
     # The reason travels back WITH the outcome: a flag file can be removed and a deadline can pass
     # before the outcome is read, so re-deriving it later can name something that did not stop this.
     stop = _stop_reason(opts)
@@ -449,12 +1128,14 @@ function _run_one_with_lock!(
 
     # A lock whose holder can be SHOWN to be gone does not have to wait out `stale_after`. The
     # clear is owner-checked, so it is a no-op if the holder changed since the question was asked.
-    _reap_if_dead!(vault, key, stage, log)
+    # Under `run!` the master asked this for every key before dispatching (`_scan!`), and `reap`
+    # is false.
+    reap && _reap_if_dead!(vault, key, stage, log)
 
     # DataVault owns the lock file.  `acquire_running!` is atomic on
     # NFS via POSIX `link()`: concurrent masters see at most one
-    # `:ok` / `:reclaimed`; the losers see `:busy`.
-    tok = owner_token()
+    # `:ok` / `:reclaimed`; the losers see `:busy`. `tok` names this acquisition; under `run!` the
+    # master made it, so its table says who holds what.
     acq = DataVault.acquire_running!(vault, key, tok; stale_after=opts.stale_after)
     if acq === :busy
         log_event(log, :lock_busy; level=:debug, stage=stage, key=kstr)
@@ -486,7 +1167,19 @@ function _run_one_with_lock!(
     hb = DataVault.start_heartbeat(vault, key, tok; interval=opts.heartbeat_interval)
 
     outcome = try
-        _run_one_with_retry!(work_fn, vault, key, kstr, stage, log, opts, tok)
+        _run_one_with_retry!(
+            work_fn,
+            vault,
+            key,
+            kstr,
+            stage,
+            log,
+            opts,
+            tok;
+            resume=resume,
+            watch=watch,
+            class=class,
+        )
     finally
         DataVault.stop_heartbeat(hb)
         # Release so a sibling can retry the key at once instead of after `stale_after`. On `:ok`
@@ -498,245 +1191,1196 @@ function _run_one_with_lock!(
     return (key, outcome)
 end
 
-"""
-    _run_sequential!(work_fn, vault, todo, stage, log, opts) -> Vector{Tuple{DataKey,Symbol}}
-"""
-function _run_sequential!(
-    work_fn::Function,
+# What `_scan_row!` found for one key.
+#   :done   — finished already (by a sibling, since the manifest was written)
+#   :free   — no lock; queue it
+#   :reaped — a lock whose holder is positively gone was removed; queue it
+#   :stale  — nobody answered for it and it is past `stale_after`; queue it, `acquire_running!`
+#             reclaims
+#   :held   — held, or not decidable yet; do not queue it this pass
+#
+# `masters` is a thunk: the masters' status files are read only if a lock turns up, and once.
+function _scan_row!(
+    table::TaskTable,
+    i::Int,
     vault::Vault,
-    todo::AbstractVector{DataKey},
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
-)
-    results = Vector{Tuple{DataKey,Symbol}}()
-    for (i, key) in enumerate(todo)
-        # The keys a stop drops are ATTRIBUTED, not silently absent, matching `_run_pmap!`, which
-        # hands every key to `_run_one_with_lock!` regardless. The result vector has one entry per
-        # `todo` key on either path.
-        stop = _stop_reason(opts)
-        if stop !== nothing
-            sym = _stop_outcome(stop)
-            append!(results, ((k, sym) for k in @view todo[i:end]))
-            break
-        end
-        push!(results, _run_one_with_lock!(work_fn, vault, key, stage, log, opts))
+    progress::Dict{String,Progress},
+    masters,
+    infos::Vector{LockInfo},
+)::Symbol
+    r = table.rows[i]
+    if DataVault.is_done(vault, r.key)
+        settle!(table, i, :already_done)
+        return :done
     end
-    return results
+    r.progress = get(progress, r.kstr, nothing)
+    lk = _lock_now(vault, r.key)
+    lk === nothing && return :free
+    owner = lk.owner
+    info = _lock_info(r.kstr, owner, lk.age, masters(), _NO_PAGES, opts.stale_after)
+    push!(infos, info)
+    if info.verdict === :dead
+        # Owner-checked: `false` means the lock changed hands since it was judged, and whoever
+        # has it now is asked about on the next pass.
+        _reap!(vault, r.key, info, stage, log) && return :reaped
+    elseif info.verdict === :stale
+        return :stale
+    end
+    hold!(table, i, owner)
+    log_event(log, :lock_busy; level=:debug, stage=stage, key=r.kstr)
+    return :held
+end
+
+const _NO_PAGES = Dict{String,Float64}()
+
+# The masters' statuses, read at most once per scan and only if a lock is found.
+function _lazy_masters(vault::Vault)
+    cache = Ref{Any}(nothing)
+    return () -> begin
+        cache[] === nothing && (cache[] = read_status(vault))
+        return cache[]
+    end
 end
 
 """
-    _run_pmap!(work_fn, vault, todo, stage, log, opts) -> Vector{Tuple{DataKey,Symbol}}
+    _scan!(table, vault, stage, log, opts) -> NamedTuple
 
-Fan `todo` out across `WorkerPool(workers())` via `pmap`.  Each worker
-invokes `_run_one_with_lock!`, which serialises the per-key lock +
-`work_fn` + save pipeline on that worker.  Returns the list of
-`(key, outcome)` pairs for master-side aggregation.
+The master's one pass over the markers, before the queue is drawn: every queued row is checked for
+a `.done` written since the manifest and for a `.running` lock, and the recorded progress is
+attached. Each lock found is judged ([`judge_lock`](@ref)): one that is positively dead is removed
+and its key queued, one that is held is kept out of the queue. Returns
+`(; done, locks, held, held_jobs, reaped, dead_jobs, stale, unknown)`, and logs it as
+`locks_reconciled` when there was any lock.
 
-Failures inside `work_fn` are already caught by `_run_one_with_retry!`
-and turned into `(key, :gave_up)` / `(key, :error)`; we additionally set
-`pmap`'s `on_error = identity` so an unexpected thrown exception bubbles
-up as an `Exception` value in the outcomes vector rather than bringing
-down the whole fan-out, and we log + convert those to `:error`. A worker
-that *dies* mid-key (`ProcessExitedException`, e.g. SLURM preemption) is
-re-dispatched to a live worker via `retry_check`.
+This is the read the workers used to do one key at a time, and the reconciliation a job that
+starts used to skip: it joined a vault without knowing whose locks were in it.
 """
-function _run_pmap!(
-    work_fn::Function,
-    vault::Vault,
-    todo::AbstractVector{DataKey},
-    stage::Symbol,
-    log::EventLog,
-    opts::RunOpts,
-)
-    pool = WorkerPool(workers())
-    # `retry_check` re-dispatches a key whose worker DIED
-    # (`ProcessExitedException`) to a live worker; `work_fn` errors are handled
-    # inside `_run_one_with_lock!` and never escape, so they are not retried.
-    raw = pmap(
-        pool,
-        todo;
-        on_error=identity,
-        retry_delays=ExponentialBackOff(; n=_WORKER_DEATH_REDISPATCHES),
-        retry_check=(s, e) -> (s, e isa ProcessExitedException),
-    ) do key
-        return _run_one_with_lock!(work_fn, vault, key, stage, log, opts)
+function _scan!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts)
+    lost = Ref(0)
+    progress = read_progress(vault; unreadable=lost)
+    # Those keys start without their resume point: said, with how many.
+    lost[] > 0 &&
+        log_event(log, :progress_unreadable; level=:warn, stage=stage, files=lost[])
+    masters = _lazy_masters(vault)
+    infos = LockInfo[]
+    done = reaped = 0
+    for i in eachindex(table.rows)
+        table.rows[i].state === :todo || continue
+        s = _scan_row!(table, i, vault, stage, log, opts, progress, masters, infos)
+        s === :done && (done += 1)
+        s === :reaped && (reaped += 1)
     end
-
-    # Normalise any thrown exceptions back to (key, :error) tuples.
-    out = Vector{Tuple{DataKey,Symbol}}(undef, length(todo))
-    @inbounds for i in eachindex(todo)
-        item = raw[i]
-        if item isa Tuple{DataKey,Symbol}
-            out[i] = item
-        else
-            # `pmap(; on_error = identity)` returns the exception value at
-            # this slot.  Log it and mark the key as :error.
-            kstr = canonical(todo[i])
-            err = _short_err(item)
-            log_event(log, :error; stage=stage, key=kstr, attempt=0, err=err)
-            out[i] = (todo[i], :error)
-        end
-    end
+    sm = lock_summary(infos)
+    out = (;
+        done=done,
+        locks=length(infos),
+        held=sm.held,
+        held_jobs=sm.held_jobs,
+        reaped=reaped,
+        dead_jobs=sm.dead_jobs,
+        stale=sm.stale,
+        unknown=sm.unknown,
+    )
+    isempty(infos) || log_event(log, :locks_reconciled; stage=stage, out...)
     return out
 end
 
-"""
-    _run_affinity!(work_fn, vault, todo, stage, log, opts, affinity) -> Vector{Tuple{DataKey,Symbol}}
+# How many times a drained queue looks again at the keys it could not get. Their holder may have
+# finished, died or released while this pass ran, and a long pass is hours.
+const _BUSY_RESCANS = 2
 
-[`_run_pmap!`](@ref) with a PREFERENCE for keys whose `affinity` value the worker has already
-handled. A free worker takes a pending key from its most recently used group if one is left, and
-otherwise from the group with the most work outstanding, which spreads workers over groups instead
-of piling them onto one.
-
-A preference, never a partition. A worker is never idle while a key is pending, so a 200-key group
-does not serialise onto the worker that opened it.
-
-`pmap` is not used here because it hands out work itself. Its `ProcessExitedException` re-dispatch
-is reproduced: a key whose worker died goes back on the queue and the worker is dropped.
-"""
-function _run_affinity!(
-    work_fn::Function,
-    vault::Vault,
-    todo::AbstractVector{DataKey},
-    stage::Symbol,
-    log::EventLog,
-    opts::RunOpts,
-    affinity::Function,
-)
-    groups = Any[affinity(k) for k in todo]
-    by_group = Dict{Any,Vector{Int}}()
-    for (i, g) in enumerate(groups)
-        push!(get!(Vector{Int}, by_group, g), i)
+# Ask again about every key that came back `:lock_busy`, and requeue the ones that are free now.
+# Returns how many were requeued.
+function _rescan_busy!(
+    table::TaskTable, vault::Vault, stage::Symbol, log::EventLog, opts::RunOpts
+)::Int
+    busy = [i for (i, r) in enumerate(table.rows) if r.outcome === :lock_busy]
+    isempty(busy) && return 0
+    progress = read_progress(vault)
+    masters = _lazy_masters(vault)
+    infos = LockInfo[]
+    n = 0
+    for i in busy
+        s = _scan_row!(table, i, vault, stage, log, opts, progress, masters, infos)
+        (s === :free || s === :reaped || s === :stale) || continue
+        requeue!(table, i)
+        n += 1
     end
-    # `pop!` takes from the end, so reverse to hand keys out in the caller's order. That order is
-    # load-bearing: a leading paramset is how a long acquisition is told which slice to close first.
-    for v in values(by_group)
-        reverse!(v)
-    end
+    return n
+end
 
-    out = Vector{Tuple{DataKey,Symbol}}(undef, length(todo))
-    # `Vector{Bool}`, not `BitVector`: adjacent bits share a word, so two tasks marking neighbouring
-    # indices would read-modify-write the same one.
-    filled = fill(false, length(todo))
-    q = ReentrantLock()
-    seen = Dict{Int,Vector{Any}}()
-
-    function _take!(pid::Int)
-        return lock(q) do
-            mine = get!(Vector{Any}, seen, pid)
-            for (j, g) in enumerate(mine)
-                v = get(by_group, g, nothing)
-                if v !== nothing && !isempty(v)
-                    j == 1 || (deleteat!(mine, j); pushfirst!(mine, g))
-                    return pop!(v)
-                end
-            end
-            best, bestn = nothing, 0
-            for (g, v) in by_group
-                length(v) > bestn && ((best, bestn) = (g, length(v)))
-            end
-            best === nothing && return nothing
-            pushfirst!(mine, best)
-            return pop!(by_group[best])
-        end
-    end
-
-    # `pmap` bounds its own `ProcessExitedException` re-dispatch with
-    # `retry_delays=ExponentialBackOff(; n=2)`; this dispatcher has to bound it too. Unbounded, a
-    # key that reliably kills whoever takes it is handed to worker after worker forever, and the
-    # faster a dead holder's lock is reclaimed the faster that cascade runs.
-    const_giveback_limit = _WORKER_DEATH_REDISPATCHES
-    givebacks = zeros(Int, length(todo))
-    _give_back!(i::Int)::Bool = lock(q) do
-        givebacks[i] += 1
-        givebacks[i] > const_giveback_limit && return false
-        push!(get!(Vector{Int}, by_group, groups[i]), i)
-        return true
-    end
-
-    @sync for pid in workers()
-        @async while true
-            i = _take!(pid)
-            i === nothing && break
-            key = todo[i]
-            res = try
-                remotecall_fetch(
-                    _run_one_with_lock!, pid, work_fn, vault, key, stage, log, opts
-                )
-            catch e
-                if e isa ProcessExitedException
-                    # Requeued, or out of attempts: a key that has taken down `const_giveback_limit`
-                    # workers is reported rather than handed to the next one.
-                    if !_give_back!(i)
-                        log_event(
-                            log,
-                            :gave_up;
-                            stage=stage,
-                            key=canonical(key),
-                            attempts=const_giveback_limit + 1,
-                            err="worker exited on this key every time it was dispatched",
-                        )
-                        out[i] = (key, :error)
-                        filled[i] = true
-                    end
-                    break
-                end
-                log_event(
-                    log,
-                    :error;
-                    stage=stage,
-                    key=canonical(key),
-                    attempt=0,
-                    err=_short_err(e),
-                )
-                (key, :error)
-            end
-            out[i] = res
-            filled[i] = true
-        end
-    end
-
-    # Every worker died while keys were still pending. Those keys were never attempted, so they are
-    # retriable rather than failed: `:lock_busy` is the outcome `run!` already counts that way.
-    for i in eachindex(todo)
-        filled[i] && continue
-        log_event(log, :worker_lost; stage=stage, key=canonical(todo[i]))
-        out[i] = (todo[i], :lock_busy)
-    end
-    return out
+function _n_finished(table::TaskTable)
+    return count(r -> r.outcome === :ok || r.outcome === :already_done, table.rows)
 end
 
 """
-    _redispatch_deferred(outcomes, dispatch, log, stage, opts) -> outcomes
+    _dispatch!(drive, table, vault, stage, log, opts)
 
-Re-run the keys whose `work_fn` threw `DataVault.ArtifactBusy` until none is left or the run is
-stopped. The first re-dispatch follows a pass that finished something, so the artifact it was
-waiting on has usually been built by then and it goes at once; after a pass that finished
-nothing, it waits `opts.defer_poll` seconds first — the builder is then another job. Returns the
-outcomes in the caller's key order. A key still deferred when the run stops is left as
-`:deferred`, which `run!` counts with `busy`: it was never attempted.
+Run `drive()` (one pass: the queue is drawn until it is empty and nothing is running) until the
+table has nothing left that another pass could finish.
+
+Two things put a row back on the queue between passes. A key that came back `:lock_busy` is asked
+about again, since its holder may be gone by now. A key whose `work_fn` threw
+`DataVault.ArtifactBusy` is re-dispatched: at once after a pass that finished something (the
+artifact it waited on has usually been built by then), after `opts.defer_poll` seconds otherwise
+(the builder is then another job). A key still deferred when the run stops stays `:deferred`,
+which `run!` counts with `busy`: it was never attempted.
 """
-function _redispatch_deferred(
-    outcomes, dispatch, log::EventLog, stage::Symbol, opts::RunOpts
+function _dispatch!(
+    drive,
+    table::TaskTable,
+    vault::Vault,
+    stage::Symbol,
+    log::EventLog,
+    opts::RunOpts;
+    standing=Returns(nothing),
 )
-    final = Dict{DataKey,Symbol}(k => o for (k, o) in outcomes)
-    progressed = any(o -> o === :ok || o === :already_done, last.(outcomes))
     round = 0
     while true
-        deferred = DataKey[k for (k, _) in outcomes if final[k] === :deferred]
+        before = _n_finished(table)
+        for _ in 0:_BUSY_RESCANS
+            drive()
+            _stop_reason(opts) === nothing || break
+            _rescan_busy!(table, vault, stage, log, opts) == 0 && break
+            # What was just put back is still subject to what requests cancelled or moved.
+            standing()
+        end
+        deferred = [i for (i, r) in enumerate(table.rows) if r.outcome === :deferred]
         isempty(deferred) && break
         _stop_reason(opts) === nothing || break
-        progressed || sleep(opts.defer_poll)
+        _n_finished(table) > before || sleep(opts.defer_poll)
         round += 1
         log_event(log, :deferred_round; stage=stage, round=round, keys=length(deferred))
-        res = dispatch(deferred)
-        progressed = any(r -> last(r) === :ok || last(r) === :already_done, res)
-        for (k, o) in res
-            final[k] = o
+        foreach(i -> requeue!(table, i), deferred)
+        standing()
+    end
+    return nothing
+end
+
+"""
+    _drive_sequential!(work_fn, vault, table, stage, log, opts, master)
+
+Draw the queue on this process, one key at a time. Between keys the status is refreshed and the
+control requests are applied: no timer fires while this process is inside `work_fn`.
+"""
+function _drive_sequential!(
+    work_fn::Function,
+    vault::Vault,
+    table::TaskTable,
+    stage::Symbol,
+    log::EventLog,
+    opts::RunOpts,
+    master::Master;
+    key_class=nothing,
+    fits=Returns(true),
+    tick=Returns(nothing),
+)
+    c = master.ctl
+    while true
+        _status_due!(master, log)
+        tick()
+        poll_control!(master, table, log, opts)
+        # The keys a stop drops are ATTRIBUTED, not silently absent: every row ends the round
+        # with an outcome.
+        stop = _stop_reason(opts, master)
+        if stop !== nothing
+            settle_queued!(table, _stop_outcome(stop))
+            break
+        end
+        if c.paused
+            # Nothing is handed out while paused, and the queue is kept: a request ends it.
+            sleep(min(max(opts.control_interval, 0.05), 1.0))
+            poll_control!(master, table, log, opts; force=true)
+            continue
+        end
+        i = _next_fitting!(table, myid(), fits)
+        i === nothing && break
+        row = table.rows[i]
+        tok = owner_token()
+        start_task!(table, i, tok, myid()) || continue      # settled since it was drawn
+        _out_add!(tok, vault, row.key)
+        t0 = time()
+        outcome = try
+            last(
+                _run_one_with_lock!(
+                    work_fn,
+                    vault,
+                    row.key,
+                    stage,
+                    log,
+                    opts;
+                    tok=tok,
+                    resume=row.progress,
+                    reap=false,
+                    watch=StopWatch(master.started, master.id, master.job),
+                    class=_class_of(key_class, row.key),
+                ),
+            )
+        finally
+            _out_remove!(tok)
+        end
+        delete!(c.stopping, row.kstr)
+        outcome === :lock_busy && (master.collisions += 1)
+        _account_key!(master, vault, row, myid(), t0, outcome)
+        settle!(table, i, outcome)
+    end
+    return nothing
+end
+
+# Book the time a key was out. A key that did not finish keeps what it had reported as progress
+# during this attempt; the rest of the attempt is lost.
+function _account_key!(
+    master::Master, vault::Vault, row::TaskRow, worker::Int, t0::Float64, outcome
+)
+    t1 = time()
+    finished = outcome === :ok || outcome === :already_done
+    at = nothing
+    if !finished
+        p = _read_progress_one(vault, row.kstr)
+        (p !== nothing && p.at >= t0) && (at = p.at)
+    end
+    # Work was thrown away, as opposed to the key coming straight back because someone held it.
+    cut = outcome === nothing || outcome in (:error, :gave_up, :stopped)
+    _acct_key!(master.acct, worker, t0, t1, finished, at; cut=cut)
+    return nothing
+end
+
+# A worker exited holding `row`'s lock. The master named that lock, so it can take it back now
+# instead of leaving it for `stale_after`: the heartbeat died with the worker, and whoever is
+# handed the key next would otherwise find it busy. Owner-checked, so it removes nothing a sibling
+# has since reclaimed; and if the worker is in fact alive and only unreachable, its commit is
+# owner-checked too and is refused.
+function _release_dead!(
+    vault::Vault, row::TaskRow, tok::AbstractString, stage::Symbol, log::EventLog
+)
+    try
+        DataVault.clear_running!(vault, row.key, tok) && log_event(
+            log,
+            :lock_released;
+            stage=stage,
+            key=row.kstr,
+            owner=tok,
+            why="worker_exited",
+        )
+    catch e
+        e isa InterruptException && rethrow()
+        log_event(log, :reap_failed; stage=stage, key=row.kstr, err=_short_err(e))
+    end
+    return nothing
+end
+
+# Release the lock of every row that is still out, and say which keys were cut. A normal round
+# has none: this is for a master leaving through an exception.
+function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::EventLog)
+    cut = [(i, r) for (i, r) in enumerate(table.rows) if r.state === :running]
+    # The workers first, as in a cut — and all at once: a busy worker takes seconds to remove,
+    # and one after another a hundred of them outlast the scheduler's SIGTERM-to-SIGKILL window,
+    # leaving their locks to `stale_after`.
+    pids = unique(r.worker for (_, r) in cut if r.owner !== nothing && r.worker != 0)
+    remove = something(_KILL_WORKER[], _kill_hard!)
+    # What launched each, taken before anything is done to them — and the ones to remove are
+    # those whose PROCESS is not known to have ended: a worker that was asked to leave is out of
+    # `procs()` and may be computing all the same.
+    launcher_of = something(_LAUNCHER_OF[], _launcher)
+    filter!(p -> p != myid(), pids)
+    launchers = Dict(pid => launcher_of(pid) for pid in pids)
+    filter!(p -> !_worker_dead(p, launchers[p]), pids)
+    @sync for pid in pids
+        @async try
+            remove(pid)
+        catch e
+            e isa InterruptException && rethrow()
         end
     end
-    return [(k, final[k]) for (k, _) in outcomes]
+    for (i, r) in cut
+        tok = r.owner
+        tok === nothing && continue
+        # A lock released under a worker that is still computing is a key that runs twice.
+        # One that would not go keeps its lock (its heartbeat keeps it fresh, and it ends with
+        # the worker).
+        pid = r.worker
+        if pid != 0 && pid != myid()
+            # Still there? Its PROCESS, not its place in `procs()` (see `_worker_dead`).
+            if haskey(launchers, pid) && !_worker_dead(pid, launchers[pid])
+                push!(_KEPT_WORKERS, pid)
+                log_event(
+                    log,
+                    :lock_kept;
+                    level=:warn,
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    worker=pid,
+                    why="master_exit: the worker could not be removed and is still computing",
+                )
+                # Out of what the exit hook releases: with the token left there, the lock
+                # this line "keeps" was cleared — with the worker's own token — as the master
+                # exited, and the key ran twice.
+                _out_keep!(tok)
+                settle!(table, i, :lock_busy)
+                continue
+            end
+        end
+        try
+            # `false`: the lock was not this token's any more (released by a cut, or taken by
+            # a sibling). Said as that, not as a release that did not happen.
+            if DataVault.clear_running!(vault, r.key, tok)
+                log_event(
+                    log,
+                    :lock_released;
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    why="master_exit",
+                )
+            else
+                log_event(
+                    log,
+                    :lock_not_ours;
+                    stage=stage,
+                    key=r.kstr,
+                    owner=tok,
+                    why="master_exit: the lock was already released or is held by another",
+                )
+            end
+        catch e
+            e isa InterruptException && rethrow()
+            # Said as what it is: the lock is still there, until `stale_after`.
+            log_event(
+                log,
+                :release_failed;
+                level=:warn,
+                stage=stage,
+                key=r.kstr,
+                owner=tok,
+                err=_short_err(e),
+            )
+        end
+        _out_remove!(tok)
+        settle!(table, i, :lock_busy)
+    end
+    return length(cut)
+end
+
+# ── a round over the workers ─────────────────────────────────────────────────────────────────────
+#
+# What one call of `_drive_workers!` shares between its dispatch tasks, its ticker and its ending.
+# These were sixteen variables captured by closures inside one function; a fix to one of them had
+# to be read against all the others. Here each part is a function over the one struct, and what a
+# part reads or writes is `r.<field>` at the place it does so.
+#
+# All of a round's tasks are `@async` on the task that runs `_drive_workers!`, so the fields are
+# plain values and `idle` a plain `Condition`: nothing between a check and the `wait` that follows
+# it can yield.
+mutable struct Round
+    # What the round was asked to do.
+    const work_fn::Function
+    const vault::Vault
+    const table::TaskTable
+    const stage::Symbol
+    const log::EventLog
+    const opts::RunOpts
+    const master::Master
+    const affinity::Any
+    const prepare::Any
+    const key_class::Any
+    const fits::Any
+    const tick::Any
+    const pool::Any
+    const min_time::Any
+    # The name the workers know this round's context by.
+    const rid::UInt64
+    # How often the ticker runs.
+    const every::Float64
+    # Units out on a worker, and what the tasks that have nothing to do wait on.
+    out::Int
+    const idle::Condition
+    # A stop was seen and the queue settled with it; the job's own stop was given its grace.
+    stopped::Bool
+    graced::Bool
+    # With a pool: whether anything is queued, kept by the ticker, so a dispatch task whose size
+    # fits nothing right now waits for a key that will come back rather than leaving.
+    queued_now::Bool
+    # Whether keys are being held back by other masters' locks: why an idle worker is idle.
+    held_now::Bool
+    # Workers with a dispatch task, the tasks in the order they were started, and whose is whose.
+    const started::Set{Int}
+    const tasks::Vector{Task}
+    const task_of::Dict{Int,Task}
+    # Workers that could not be readied in this round (left out, not asked again every tick),
+    # ones that did not say who they are (said once), and how often each was tried.
+    const rejected::Set{Int}
+    const unidentified::Set{Int}
+    const prep_tries::Dict{Int,Int}
+    # With a pool: the workers that were there when `run!` began, which it readied itself.
+    const first_foreign::Set{Int}
+    # Set when the round has to end with an error (a unit that could not be cut, a tick step
+    # that keeps failing): no more keys are handed out, the units running finish, and the error
+    # is thrown. `abandoned` are the dispatch tasks not waited for: each is inside a call to a
+    # worker that could not be removed.
+    abort::Any
+    const abandoned::Set{Task}
+    # The round is over: the ticker leaves.
+    done::Bool
+    # Since when the allocation has been under-used (`_leave_if_underused!`).
+    const idle_since::Base.RefValue{Float64}
+    # Per ticker step: failures in a row, and since when.
+    const fails::Dict{Symbol,Int}
+    const failing_since::Dict{Symbol,Float64}
+end
+
+function Round(
+    work_fn,
+    vault,
+    table,
+    stage,
+    log,
+    opts,
+    master;
+    affinity,
+    prepare,
+    key_class,
+    fits,
+    tick,
+    pool,
+    min_time,
+)
+    # `every`: a pool is looked at more often than requests are — a start it does not make is
+    # idle room.
+    every = opts.control_interval > 0 ? Float64(opts.control_interval) : 10.0
+    pool === nothing || (every = min(every, Float64(pool.poll)))
+    return Round(
+        work_fn,
+        vault,
+        table,
+        stage,
+        log,
+        opts,
+        master,
+        affinity,
+        prepare,
+        key_class,
+        fits,
+        tick,
+        pool,
+        min_time,
+        rand(UInt64),
+        every,
+        0,
+        Condition(),
+        false,
+        false,
+        pool !== nothing,
+        any(row -> row.state === :held, table.rows),
+        Set{Int}(),
+        Task[],
+        Dict{Int,Task}(),
+        Set{Int}(),
+        Set{Int}(),
+        Dict{Int,Int}(),
+        pool === nothing ? Set{Int}() : Set{Int}(p for p in workers() if p != myid()),
+        nothing,
+        Set{Task}(),
+        false,
+        Ref(0.0),
+        Dict{Symbol,Int}(),
+        Dict{Symbol,Float64}(),
+    )
+end
+
+# The dispatch task of one worker: draw a row, hand it over, settle it; until nothing is out and
+# nothing can arrive, or the worker is gone.
+function _round_loop!(r::Round, pid::Int, host::String, ospid::Int)
+    (; vault, table, stage, log, opts, master, pool) = r
+    c = master.ctl
+    # What launched this worker, while Distributed can still say.
+    launcher = something(_LAUNCHER_OF[], _launcher)(pid)
+    # The round's context goes to the worker once. Sent with every key, the work function,
+    # the vault (its whole spec), the log and the options were serialised again per
+    # dispatch, through the master's one core.
+    try
+        remotecall_fetch(_install_round, pid, r.rid, r.work_fn, vault, stage, log, opts)
+    catch e
+        e isa ProcessExitedException && return nothing
+        log_event(log, :workers_rejected; level=:warn, stage=stage, n=1, err=_short_err(e))
+        pool === nothing || _pool_rejected!(pool, pid, log, stage)
+        return nothing
+    end
+    while true
+        if !r.stopped
+            stop = _stop_reason(opts, master)
+            if stop !== nothing
+                settle_queued!(table, _stop_outcome(stop))
+                r.stopped = true
+            end
+        end
+        r.abort === nothing || break
+        # A worker that went away while this loop was waiting must not be handed a key: the
+        # call would fail at once and be counted against the key as a death.
+        pid in workers() || break
+        if pid in c.retired
+            # A `:resize` took this worker out. It leaves the pool, which is what frees its
+            # cores; it was between units, so nothing is cut.
+            log_event(log, :worker_retired; stage=stage, worker=pid, host=host)
+            @async try
+                rmprocs(pid; waitfor=30)
+            catch
+            end
+            break
+        end
+        host in c.drained && break
+        # The pool retires its own workers; the task only has to leave.
+        (pool !== nothing && _pool_retiring(pool, pid)) && break
+        accept = if pool === nothing
+            nothing
+        else
+            row -> _pool_accepts(pool, pid, row, opts.deadline, r.min_time)
+        end
+        i = if c.paused || r.stopped
+            nothing
+        else
+            _next_fitting!(table, pid, r.fits; accept=accept)
+        end
+        if i === nothing
+            # Leave when nothing is out and nothing can arrive. A paused master keeps its
+            # queue, and its dispatch tasks with it; so does a pool with keys still queued
+            # that this worker's size does not fit yet.
+            r.out == 0 &&
+                !(c.paused && !r.stopped && _has_queued(table)) &&
+                !(r.queued_now && !r.stopped) &&
+                break
+            w0 = time()
+            why = if c.paused
+                :paused
+            elseif r.stopped
+                :stopping
+            elseif r.held_now
+                :lock_busy
+            else
+                :queue_empty
+            end
+            wait(r.idle)
+            _acct_idle!(master.acct, pid, why, w0, time())
+            continue
+        end
+        row = table.rows[i]
+        tok = owner_token(host, ospid)
+        # Settled since it was drawn (a stop's `settle_queued!`): not started after all.
+        start_task!(table, i, tok, pid) || continue
+        pool === nothing || _pool_served!(pool, pid)
+        _out_add!(tok, vault, row.key)
+        r.out += 1
+        t0 = time()
+        died = false
+        # A `Ref`, set by the handler BEFORE anything in it can throw: the `finally` below must
+        # not let go of a token whose worker may still be computing because the event log
+        # failed while that was being said.
+        kept = Ref(false)
+        outcome = try
+            last(
+                remotecall_fetch(
+                    _run_installed,
+                    pid,
+                    r.rid,
+                    row.key;
+                    tok=tok,
+                    resume=row.progress,
+                    reap=false,
+                    watch=StopWatch(master.started, master.id, master.job),
+                    class=_class_of(r.key_class, row.key),
+                ),
+            )
+        catch e
+            # The round stopped waiting for this task; what its worker does now is not the
+            # round's (no death counted, no memory raised for a key it gave up on).
+            current_task() in r.abandoned && return nothing
+            failed = _round_call_failed!(r, e, row, tok, pid, host, launcher, t0, kept)
+            died = failed.died
+            failed.outcome
+        finally
+            r.out -= 1
+            if !kept[]
+                _out_remove!(tok)
+                _out_unkeep!(tok)
+            end
+        end
+        # A task the round stopped waiting for (its worker could not be removed): the round
+        # has reported without it. What comes back now changes nothing it reported.
+        current_task() in r.abandoned && return nothing
+        _round_settle!(r, i, row, pid, t0, outcome)
+        notify(r.idle)
+        died && break
+    end
+    return nothing
+end
+
+# The call to the worker threw. What the unit's outcome is (`nothing`: hand the key out again)
+# and whether this dispatch task is over (`died`). `kept` is set when the key's lock is kept —
+# first, so that it holds whatever throws after it.
+function _round_call_failed!(r::Round, e, row, tok, pid::Int, host, launcher, t0, kept::Ref)
+    (; vault, table, stage, log, master, pool) = r
+    if !(e isa ProcessExitedException)
+        log_event(log, :error; stage=stage, key=row.kstr, attempt=0, err=_short_err(e))
+        return (; outcome=:error, died=false)
+    end
+    # Distributed reports the exit when its side closes, which can be a moment before the
+    # process is seen to have ended: that moment is waited for.
+    gone =
+        timedwait(() -> _worker_dead(pid, launcher), _EXIT_CONFIRM[]; pollint=0.05) === :ok
+    if !gone
+        # Distributed has closed its side (the worker was asked to leave, or the connection
+        # dropped) and the PROCESS is not known to have ended: it may be computing. Its lock is
+        # not released under it; the key is held, by it.
+        kept[] = true
+        _out_keep!(tok)
+        push!(_KEPT_WORKERS, pid)
+        log_event(
+            log,
+            :lock_kept;
+            level=:warn,
+            stage=stage,
+            key=row.kstr,
+            owner=tok,
+            worker=pid,
+            why="the connection to the worker is closed and its process is not " *
+                "known to have ended",
+        )
+        return (; outcome=:lock_busy, died=true)
+    end
+    _release_dead!(vault, row, tok, stage, log)
+    # The worker cannot say what the attempt cost; the master knows how long.
+    log_event(
+        log,
+        :key_spent;
+        stage=stage,
+        key=row.kstr,
+        outcome="worker_died",
+        secs=time() - t0,
+        cores=get(master.acct.cores, pid, 0),
+        host=host,
+        class=_class_of(r.key_class, row.key),
+    )
+    ord = get(master.ctl.stopping, row.kstr, nothing)
+    if ord !== nothing && (ord.cut || ord.tries > 0)
+        # Removed on purpose — also when the exit comes between two tries of the cut: not a
+        # death of the key, and not its memory.
+        return (; outcome=:stopped, died=true)
+    end
+    lock(() -> row.deaths += 1, table.lock)
+    # More memory for the next hand-out, when there is one: a key that is given up on now is
+    # not "retried with more".
+    (pool === nothing || row.deaths > _WORKER_DEATH_REDISPATCHES) ||
+        _pool_death!(pool, row, pid, log, stage)
+    return (; outcome=_after_death(row, log, stage), died=true)
+end
+
+# A unit came back (or did not): what it counts as, and the row settled or handed out again.
+function _round_settle!(r::Round, i::Int, row, pid::Int, t0, outcome)
+    (; vault, table, master) = r
+    c = master.ctl
+    order = get(c.stopping, row.kstr, nothing)
+    if order !== nothing
+        delete!(c.stopping, row.kstr)
+        # A unit that was cut comes back as a lost lock, an error from the interrupt, or
+        # not at all. Whatever it is, the unit was stopped, not failed.
+        order.cut && outcome !== :ok && (outcome = :stopped)
+        # Told to stop, and its worker died before it left: it stays stopped. Requeued,
+        # it would be the next key handed out.
+        outcome === nothing && (outcome = :stopped)
+    end
+    # The same for a key a request cancelled while it was running.
+    if outcome === nothing && any(f -> matches(f, row.key), c.cancels)
+        outcome = :cancelled
+    end
+    outcome === :lock_busy && (master.collisions += 1)
+    _account_key!(master, vault, row, pid, t0, outcome)
+    if outcome === nothing
+        # What it had reported before it died is where the next worker starts.
+        row.progress = _read_progress_one(vault, row.kstr)
+        requeue!(table, i; front=true)
+    else
+        settle!(table, i, outcome)
+    end
+    return nothing
+end
+
+# Start a dispatch task for every worker that does not have one. Workers present when the
+# round began were prepared by `run!`; later ones are prepared here.
+function _round_adopt!(r::Round)
+    (; stage, log, master, pool, prepare) = r
+    # `workers()` is `[1]` when there are none: the master is not one of its own workers.
+    # (A worker whose lock was kept is still inside the unit it could not be stopped in:
+    # it gets no key from a later round in this process.)
+    fresh = [
+        p for p in workers() if
+        !(p in r.started) && p != myid() && !(p in r.rejected) && !(p in _KEPT_WORKERS)
+    ]
+    # A worker the pool is still starting is visible here before the pool knows its size;
+    # it gets a dispatch task once it is registered, not before.
+    pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)
+    isempty(fresh) && return nothing
+    late = !isempty(r.started)
+    # Workers `run!` found when it began were readied by it; a pool's own, and any that
+    # join later, here.
+    found = if pool === nothing
+        (late ? Int[] : fresh)
+    else
+        [p for p in fresh if p in r.first_foreign]
+    end
+    todo = setdiff(fresh, found)
+    ready = if prepare === nothing || isempty(todo)
+        fresh
+    else
+        ok = prepare(todo)
+        if length(ok) < length(todo)
+            # The batch failed as one. Each by itself, so the one that cannot be readied is
+            # the only one left out — and it is set aside: asked again every tick, it was
+            # re-readying every worker and logging the same line each second.
+            ok = Int[]
+            for p in todo
+                if !isempty(prepare([p]))
+                    push!(ok, p)
+                else
+                    _round_give_up_on!(r, p)             # after a few tries; else next tick
+                end
+            end
+        end
+        vcat(found, ok)
+    end
+    _identify_workers!(master, ready)
+    who = lock(() -> copy(master.who), master.lock)
+    n = 0
+    for pid in ready
+        w = get(who, pid, nothing)
+        if w === nothing
+            # Could not say who it is: asked again on the next ticks, said once, and given
+            # up on after a few — it was asked, and readied again, every tick for ever.
+            _round_give_up_on!(r, pid)
+            if !(pid in r.unidentified)
+                push!(r.unidentified, pid)
+                log_event(
+                    log,
+                    :workers_rejected;
+                    level=:warn,
+                    stage=stage,
+                    n=1,
+                    err="worker $pid did not answer who it is; it gets no work until it does",
+                )
+            end
+            continue
+        end
+        push!(r.started, pid)
+        n += 1
+        t = @async try
+            _round_loop!(r, pid, w.host, w.pid)
+        finally
+            # A loop that leaves on an exception must not strand the ones waiting on it.
+            notify(r.idle)
+        end
+        r.task_of[pid] = t
+        push!(r.tasks, t)
+    end
+    (late && n > 0) && log_event(log, :workers_joined; stage=stage, n=n)
+    return nothing
+end
+
+# One more failed try at readying `pid`. After `_PREPARE_TRIES` it is left out of the round and
+# — if it is the pool's — retired there, so that it is not counted as a worker any more. The one
+# place a worker is given up on: the pool is told wherever the round decides it.
+function _round_give_up_on!(r::Round, pid::Int)
+    n = r.prep_tries[pid] = get(r.prep_tries, pid, 0) + 1
+    n >= _PREPARE_TRIES || return false
+    push!(r.rejected, pid)
+    r.pool === nothing || _pool_rejected!(r.pool, pid, r.log, r.stage)
+    return true
+end
+
+# One step of the ticker, by name. A failure is logged on its first occurrence and then every
+# `_TICK_SAY_EVERY`-th, with the count. One of `_TICK_FATAL_STEPS` that has failed for
+# `_TICK_FATAL_AFTER` seconds ends the round with an error: a master whose pool tick cannot run
+# is not doing its job.
+function _round_step(f, r::Round, name::Symbol)
+    try
+        f()
+        r.fails[name] = 0
+        delete!(r.failing_since, name)
+    catch e
+        e isa InterruptException && rethrow()
+        n = r.fails[name] = get(r.fails, name, 0) + 1
+        since = get!(r.failing_since, name, time())
+        try
+            (n == 1 || n % _TICK_SAY_EVERY == 0) && log_event(
+                r.log,
+                :tick_failed;
+                level=:warn,
+                stage=r.stage,
+                step=String(name),
+                count=n,
+                secs=round(Int, time() - since),
+                err=_short_err(e),
+            )
+        catch e2
+            # The log is what failed. The ticker must outlive that: it is what cuts,
+            # flushes and plans.
+            e2 isa InterruptException && rethrow()
+        end
+        # By time, not by ticks (with a pool a tick is a second), and only for the steps a
+        # round cannot do without: a pool that cannot plan, stops that cannot be enforced.
+        # A flush or a request poll that cannot reach the file system is said and retried.
+        if name in _TICK_FATAL_STEPS &&
+            time() - since >= _TICK_FATAL_AFTER[] &&
+            r.abort === nothing
+            r.abort = ErrorException(
+                "run!: the master's `$name` step has failed for " *
+                "$(round(Int, time() - since)) s, $n times in a row " *
+                "(last: $(_short_err(e))); see kind=\"tick_failed\" in the event log",
+            )
+            # The round is ending: the units still running are given a bound, so that it
+            # does end. (Hand-outs stopped, and `run!` then waited for every unit, with
+            # no bound by default.)
+            try
+                grace = isfinite(r.opts.stop_grace) ? r.opts.stop_grace : _ABORT_GRACE[]
+                _order_stops_all!(r.master, r.table, grace, "abort")
+            catch e3
+                e3 isa InterruptException && rethrow()
+            end
+        end
+    end
+    return nothing
+end
+
+# One pass of the ticker. Each step under its own guard: one that throws used to switch off
+# every step after it, each tick — the cut of units past their grace, the manifest, the pool.
+function _round_tick!(r::Round)
+    (; table, stage, log, opts, master, pool) = r
+    c = master.ctl
+    _round_step(r, :control) do
+        # Without a pool the ticker runs once per `control_interval`, so every tick is a
+        # poll. With one it runs at the pool's pace, and requests are still read only
+        # every `control_interval`.
+        return poll_control!(
+            master, table, log, opts; affinity=r.affinity, force=pool === nothing
+        )
+    end
+    if pool !== nothing
+        # Not for a round that is ending with an error: nothing more is started for it.
+        r.abort === nothing && _round_step(r, :pool) do
+            return _pool_tick!(pool, table, master, log, stage, opts, r.min_time; fits=r.fits)
+        end
+        # Whatever the tick did, the wait loop decides on what is true now.
+        _round_step(r, :pool_wants) do
+            return r.queued_now = _pool_wants(pool, table)
+        end
+    end
+    _round_step(() -> _round_adopt!(r), r, :adopt)
+    _round_step(r, :underused) do
+        return _leave_if_underused!(master, table, r.out, r.idle_since, opts, log)
+    end
+    _round_step(r, :stop_grace) do
+        # The job's own stop — its flag, its deadline, leaving an under-used allocation —
+        # gets its grace once, when it is first seen.
+        own_stop =
+            _stop_reason(opts) !== nothing || (c.stop_all && c.stop_why === :underused)
+        if !r.graced && own_stop
+            r.graced = true
+            _order_stops_all!(master, table, opts.stop_grace, "stop_grace")
+        end
+    end
+    _round_step(r, :enforce_stops) do
+        _enforce_stops!(master, table, log)
+        # A unit that could not be cut: the round ends, saying which worker is still there.
+        # EVERY such unit's dispatch task stops being waited for; only the error is the
+        # first one's. With two workers that could not be removed, the second used to be
+        # waited for, and `run!` still did not return.
+        for (kstr, o) in c.stopping
+            o.failed || continue
+            r.abort === nothing && (r.abort = ErrorException("run!: " * o.why))
+            i = get(table.index, kstr, 0)
+            t = i == 0 ? nothing : get(r.task_of, table.rows[i].worker, nothing)
+            t === nothing || push!(r.abandoned, t)
+        end
+    end
+    _round_step(r.tick, r, :flush)
+    _round_step(r, :held) do
+        return r.held_now = lock(
+            () -> any(row -> row.state === :held, table.rows), table.lock
+        )
+    end
+    # Wakes the idle dispatch tasks: a resume, a new key or a new stop is theirs to act on.
+    notify(r.idle)
+    return nothing
+end
+
+# Wait for the dispatch tasks. Returns the first exception one of them ended with, if any.
+function _round_wait!(r::Round)
+    (; table, opts, master, pool) = r
+    failure = nothing
+    i = 1
+    while true
+        while i <= length(r.tasks)                 # the list grows as workers are adopted
+            t = r.tasks[i]
+            # Woken by every dispatch task that ends and by every tick. A task whose worker
+            # could not be removed is not waited for: its call does not return.
+            while !istaskdone(t) && !(r.abort !== nothing && t in r.abandoned)
+                wait(r.idle)
+            end
+            if istaskdone(t)
+                try
+                    wait(t)
+                catch e
+                    failure === nothing && (failure = e)
+                end
+            end
+            i += 1
+        end
+        r.abort === nothing || break
+        # A pool may have nothing started yet, or be starting the workers the queue still
+        # needs: the round is not over while it is working towards them.
+        (
+            pool !== nothing &&
+            failure === nothing &&
+            _stop_reason(opts, master) === nothing
+        ) || break
+        _pool_wants(pool, table) || break
+        sleep(min(r.every, 0.2))
+    end
+    return failure
+end
+
+# The round's ending: its errors thrown, in the order they outrank each other, and what is
+# still queued settled.
+function _round_finish!(r::Round, failure)
+    (; table, stage, log, opts, master, pool) = r
+    c = master.ctl
+    # A cut removes a worker and then releases its lock; the round is over when that is done,
+    # so what it reports (and what the next round finds on disk) is settled.
+    for t in c.cuts
+        try
+            wait(t)
+        catch
+        end
+    end
+    empty!(c.cuts)
+    failure === nothing || throw(failure)
+    r.abort === nothing || throw(r.abort)
+    # A pool that cannot start workers is not a round that ended: said, and an error.
+    (pool !== nothing && _pool_gave_up(pool) && _has_queued(table)) &&
+        _round_pool_gave_up(r)
+
+    # Keys still queued with nobody left to take them. Under a stop they are attributed to it;
+    # otherwise every worker died (or was drained or retired) while they were pending: they were
+    # never attempted, so they are retriable rather than failed, and `run!` counts them with
+    # `busy`.
+    stop = _stop_reason(opts, master)
+    if stop !== nothing
+        settle_queued!(table, _stop_outcome(stop))
+    else
+        for (i, row) in enumerate(table.rows)
+            row.state === :todo || continue
+            log_event(log, :worker_lost; stage=stage, key=row.kstr)
+            settle!(table, i, :worker_lost)
+        end
+    end
+    return nothing
+end
+
+# Say that the pool gave up, and throw what a person should look for.
+function _round_pool_gave_up(r::Round)
+    (; table, stage, log, pool) = r
+    log_event(
+        log,
+        :pool_gave_up;
+        level=:error,
+        stage=stage,
+        why=String(something(_pool_gave_up_why(pool), :unknown)),
+        fails=pool.fails,
+        rejects=pool.rejects,
+        nodes_out=sort!(collect(pool.bad_nodes)),
+        queued=count(row -> row.state === :todo, table.rows),
+    )
+    nodes_out = if isempty(pool.bad_nodes)
+        ""
+    else
+        " $(length(pool.bad_nodes)) of $(length(pool.nodes)) node(s) taken out (kind=\"pool_node_out\")."
+    end
+    # What to look for depends on what failed: starts that brought nothing, or workers that
+    # started and could not be readied. By the rule that fired, not by which count happens to
+    # be larger.
+    why = _pool_gave_up_why(pool)
+    what, where = if why === :rejects
+        "$(pool.rejects) workers in a row started and could not be readied",
+        "kind=\"workers_rejected\" / \"pool_retire\""
+    elseif why === :starts
+        "$(pool.fails) worker starts failed in a row",
+        "kind=\"pool_spawn_failed\" / \"pool_spawn_short\""
+    else
+        "no node is left to start workers on", "kind=\"pool_node_out\", with why each node went"
+    end
+    return error(
+        "SizedPool: $what with keys still queued." *
+        nodes_out *
+        " The reasons are in the event log ($where).",
+    )
+end
+
+"""
+    _drive_workers!(work_fn, vault, table, stage, log, opts, master; affinity, prepare)
+
+Draw the queue over the Distributed workers: one dispatch task per worker, each taking the next
+row [`next_task!`](@ref) gives it, handing the worker the key WITH its lock token and resume
+point, and settling the row with what comes back.
+
+The master names the lock (`owner_token(host, pid)` of the worker), so the table knows who holds
+what while it runs, and a worker that dies has its lock released at once.
+
+A dispatch task does not leave while a key is still out: a worker that dies gives its key back,
+and somebody has to be there to take it. A key that has taken down
+`_WORKER_DEATH_REDISPATCHES + 1` workers is reported rather than handed to the next one —
+unbounded, a key that reliably kills whoever takes it is handed to worker after worker forever.
+
+A ticker runs beside the dispatch tasks, every `opts.control_interval` seconds. It applies control
+requests ([`poll_control!`](@ref)) and adopts workers that joined since the round began: a pool
+that is still ramping up, or one grown by a `:resize`, is used as it arrives rather than from the
+next round. `prepare(pids)` readies late workers (modules, source observation) and returns the
+ones that can be handed work.
+
+The state these share is one `Round`; the parts are `_round_loop!` (a worker's dispatch
+task), `_round_adopt!`, `_round_tick!` (one pass of the ticker, each step under `_round_step`),
+`_round_wait!` and `_round_finish!`.
+"""
+function _drive_workers!(
+    work_fn::Function,
+    vault::Vault,
+    table::TaskTable,
+    stage::Symbol,
+    log::EventLog,
+    opts::RunOpts,
+    master::Master;
+    affinity=nothing,
+    prepare=nothing,
+    key_class=nothing,
+    fits=Returns(true),
+    tick=Returns(nothing),
+    pool=nothing,
+    min_time=nothing,
+)
+    r = Round(
+        work_fn,
+        vault,
+        table,
+        stage,
+        log,
+        opts,
+        master;
+        affinity,
+        prepare,
+        key_class,
+        fits,
+        tick,
+        pool,
+        min_time,
+    )
+    pool === nothing ||
+        _pool_tick!(pool, table, master, log, stage, opts, min_time; fits=fits)
+    _round_adopt!(r)
+    @async while true
+        sleep(r.every)
+        r.done && break
+        _round_tick!(r)
+    end
+    failure = try
+        _round_wait!(r)
+    finally
+        r.done = true
+        # The workers can forget this round.
+        for pid in r.started
+            pid in workers() && remote_do(_drop_round, pid, r.rid)
+        end
+    end
+    return _round_finish!(r, failure)
+end
+
+# What becomes of a key whose worker died under it: back on the queue (`nothing`), or, once it
+# has taken down `_WORKER_DEATH_REDISPATCHES + 1` workers, given up on.
+function _after_death(row::TaskRow, log::EventLog, stage::Symbol)
+    row.deaths > _WORKER_DEATH_REDISPATCHES || return nothing
+    log_event(
+        log,
+        :gave_up;
+        stage=stage,
+        key=row.kstr,
+        attempts=row.deaths,
+        err="worker exited on this key every time it was dispatched",
+    )
+    # The outcome the event names: counted in `gave_up` (and in `err`).
+    return :gave_up
+end
+
+# The queue is empty and most of the workers have nothing: the job is holding its nodes for a few
+# long units. After `opts.idle_grace` of that, stop on purpose. The request goes through the
+# control channel so the units still running see it at their next `should_stop`.
+function _leave_if_underused!(
+    m::Master,
+    table::TaskTable,
+    busy::Int,
+    since::Base.RefValue{Float64},
+    opts::RunOpts,
+    log::EventLog,
+)
+    (opts.min_busy_fraction > 0 && !m.ctl.stop_all) || return false
+    who = lock(() -> copy(m.who), m.lock)
+    mine = [
+        p for p in workers() if
+        !(p in m.ctl.retired) && !(haskey(who, p) && who[p].host in m.ctl.drained)
+    ]
+    n = length(mine)
+    # In cores, not workers: with workers of different sizes (a pool), one busy 32-core worker
+    # among idle 1-core ones is a job that is mostly in use.
+    cores(p) = haskey(who, p) ? max(who[p].cores, 1) : 1
+    on = lock(table.lock) do
+        return Set(r.worker for r in table.rows if r.state === :running && r.worker != 0)
+    end
+    total = sum(cores, mine; init=0)
+    used = sum(cores, (p for p in mine if p in on); init=0)
+    if n == 0 || _has_queued(table) || used / total >= opts.min_busy_fraction
+        since[] = 0.0
+        return false
+    end
+    since[] == 0.0 && (since[] = time())
+    lasted = time() - since[]
+    lasted >= opts.idle_grace || return false
+    m.ctl.stop_all = true
+    m.ctl.stop_why = :underused
+    log_event(
+        log,
+        :underused;
+        level=:warn,
+        stage=m.stage,
+        busy=busy,
+        workers=n,
+        cores_busy=used,
+        cores=total,
+        secs=round(Int, lasted),
+    )
+    try
+        # Written whatever `control_interval` is: this is how the running units hear of it
+        # (`should_stop` reads the requests itself).
+        control!(m.vault, :stop; master=m.id)
+    catch e
+        e isa InterruptException && rethrow()
+        # Without the request the running units do not hear of it: they run to their end.
+        log_event(
+            log, :underused_request_failed; level=:warn, stage=m.stage, err=_short_err(e)
+        )
+    end
+    return true
+end
+
+function _has_queued(table::TaskTable)
+    return lock(() -> any(r -> r.state === :todo, table.rows), table.lock)
 end
 
 """
@@ -758,22 +2402,80 @@ function _run_one_with_retry!(
     stage::Symbol,
     log::EventLog,
     opts::RunOpts,
-    tok::AbstractString,
+    tok::AbstractString;
+    resume::Union{Progress,Nothing}=nothing,
+    watch::StopWatch=StopWatch(time(), "", ""),
+    class::AbstractString="",
 )
     last_err = nothing
+    reported = Ref(resume !== nothing)
     for attempt in 1:opts.max_attempts
         log_event(log, :key_start; level=:debug, stage=stage, key=kstr, attempt=attempt)
         t0 = time()
+        cpu0 = _cpu_seconds()
+        notes = Dict{String,Any}()
+        # The peak is counted from here, so it is this key's and not the worker's lifetime's —
+        # where that reset works; where it does not, the record says the peak is the process's.
+        scope = _reset_peak_rss() ? "key" : "process"
+        # What this attempt cost, for an attempt that did not finish the key: without it the
+        # classes that fail, are cut, or run long and resume are the ones with no data.
+        spent =
+            outcome -> log_event(
+                log,
+                :key_spent;
+                stage=stage,
+                key=kstr,
+                outcome=String(outcome),
+                secs=time() - t0,
+                attempt=attempt,
+                cpu=_finite(_cpu_seconds() - cpu0),
+                cores=_my_cores(),
+                rss=_peak_rss(),
+                rss_scope=scope,
+                host=gethostname(),
+                class=String(class),
+            )
         try
-            payload = work_fn(key)
+            # What `work_fn` can ask about the key it was handed (`resume_point`,
+            # `report_progress`). A retry starts from what the failed attempt reported.
+            if attempt > 1 && reported[]
+                resume = _read_progress_one(vault, kstr)
+            end
+            ctx = KeyContext(
+                vault,
+                key,
+                kstr,
+                String(tok),
+                resume,
+                opts,
+                reported,
+                watch,
+                notes,
+                CheckpointState(),
+                log,
+                stage,
+            )
+            payload = with(() -> work_fn(key), _KEY => ctx)
             payload isa Dict || error(
                 "work_fn must return a Dict (got $(typeof(payload))). " *
                 "Wrap scalars as e.g. Dict(\"value\" => x).",
             )
-            if DataVault.running_owner(vault, key) != tok
+            held = _lock_state(vault, key, tok)
+            if held.state === :lost
                 # A sibling master reclaimed our lock while work_fn ran; it now
                 # owns this key. Discard our result rather than double-committing.
-                log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                # (A lock that could not be READ is not this case: the commit below is
+                # owner-checked, and writes nothing if the key has changed hands.)
+                log_event(
+                    log,
+                    :lock_lost;
+                    level=:warn,
+                    stage=stage,
+                    key=kstr,
+                    attempt=attempt,
+                    holder=held.holder,
+                )
+                spent(:lock_lost)
                 return :lock_busy
             end
             # The digest save! took before its rename goes into the marker, so `.done` names the
@@ -786,7 +2488,14 @@ function _run_one_with_retry!(
             )
             if !committed
                 log_event(log, :lock_lost; stage=stage, key=kstr, attempt=attempt)
+                spent(:lock_lost)
                 return :lock_busy
+            end
+            # A finished unit has no resume point. Only when one was written, so a unit that
+            # never reports costs no extra filesystem call.
+            if reported[]
+                _clear_progress(vault, kstr)
+                _clear_checkpoint(vault, kstr)
             end
             log_event(
                 log,
@@ -796,6 +2505,15 @@ function _run_one_with_retry!(
                 secs=time() - t0,
                 attempt=attempt,
                 sha256=saved.sha256,
+                # What the key cost (Cost.jl reads these back): CPU seconds over all threads,
+                # the cores this worker has, peak resident bytes, where it ran.
+                cpu=_finite(_cpu_seconds() - cpu0),
+                cores=_my_cores(),
+                rss=_peak_rss(),
+                rss_scope=scope,
+                host=gethostname(),
+                class=String(class),
+                note=notes,
             )
             return :ok
         catch e
@@ -805,8 +2523,48 @@ function _run_one_with_retry!(
                 log_event(log, :artifact_busy; stage=stage, key=kstr, artifact=e.name)
                 return :deferred
             end
+            # Not a failure, and not a stop: the key changed hands under the unit (a sibling
+            # reclaimed it, or the unit was cut), and it left rather than write over the new
+            # owner. A collision, with whose token is on the lock now.
+            if e isa LockLost
+                log_event(
+                    log,
+                    :lock_lost;
+                    level=:warn,
+                    stage=stage,
+                    key=kstr,
+                    attempt=attempt,
+                    holder=e.holder,
+                )
+                spent(:lock_lost)
+                return :lock_busy
+            end
+            # Not a failure either: the unit was told to stop and left at a safe point.
+            if e isa StopRequested
+                log_event(log, :key_stopped; stage=stage, key=kstr, attempt=attempt)
+                spent(:stopped)
+                return :stopped
+            end
+            # A unit whose lock is gone (cut after its grace, or reclaimed) has nothing to retry
+            # for: its result would be refused at the commit.
+            # The error is on record first: a unit that failed AND lost its lock used to leave only
+            # `lock_lost`, and the exception was never seen.
             last_err = _short_err(e)
             log_event(log, :error; stage=stage, key=kstr, attempt=attempt, err=last_err)
+            spent(:error)
+            held = _lock_state(vault, key, tok)
+            if held.state === :lost
+                log_event(
+                    log,
+                    :lock_lost;
+                    level=:warn,
+                    stage=stage,
+                    key=kstr,
+                    attempt=attempt,
+                    holder=held.holder,
+                )
+                return :lock_busy
+            end
             if attempt < opts.max_attempts
                 log_event(log, :retry; stage=stage, key=kstr, next_attempt=attempt + 1)
                 sleep(0.1 * attempt)  # linear backoff
@@ -828,24 +2586,37 @@ function _short_err(e)::String
 end
 
 """
-    run_loop!(work_fn, vault, keys; opts=RunOpts(), max_empty_rounds=3,
-              idle_sleep=30.0, load=nothing, prerequisite=nothing) -> NamedTuple
+    run_loop!(work_fn, vault, keys; opts=RunOpts(), max_empty_rounds=3, idle_sleep=30.0,
+              load=nothing, prerequisite=nothing, affinity=nothing, observe=true,
+              spawn=nothing, key_class=nothing, cost=nothing, min_time=nothing,
+              pool=nothing) -> NamedTuple
 
 Work-stealing loop that repeatedly calls [`run!`](@ref) until there is no
 more work to do. This is the infra equivalent of FiniteTemperature.jl's
 `_work_loop` driver.
 
 The loop exits when:
+- a round leaves no key undone (`remaining == 0`), at once, or
 - `max_empty_rounds` consecutive rounds produce zero new completions AND leave nothing held by a
-  sibling, or
-- `opts.stop_flag` is raised, or `opts.deadline` has passed.
+  sibling (once the busy budget below is spent, rounds with keys still held count as empty
+  too, so the return with `busy > 0` comes `max_empty_rounds` rounds after it, not at once), or
+- `opts.stop_flag` is raised, or `opts.deadline` has passed, or
+- a round held keys back and did nothing else (`held_back > 0`): the loop returns instead of
+  sitting out idle rounds over keys it will not start — `stopped_by = :deadline` when they could
+  not get anywhere before `opts.deadline`, `:cost_unknown` when every one of them was held back
+  because nobody could say how long it takes — or
+- a round ended `:underused` (`opts.min_busy_fraction`) or on a `:stop` request with no scope, or
+- keys are still held by a sibling after the busy budget below: the loop returns with
+  `busy > 0`, `remaining > 0`.
 
 A round that completes nothing but finds keys `:lock_busy` does NOT count toward
-`max_empty_rounds` until `opts.stale_after` has been waited out. Those keys are either being
-worked on by a live sibling, or held by one the wall clock killed, and `stale_after` is what
-separates the two: past it, `acquire_running!` reclaims the lock on the next attempt. Returning
-before then leaves the campaign short and reports nothing, because `max_empty_rounds *
-idle_sleep` (90 s by default) is an order of magnitude under `stale_after` (600 s).
+`max_empty_rounds` until `opts.stale_after + 2 * idle_sleep` seconds of such rounds have passed
+(the busy budget). Those keys are either being worked on by a live sibling, or held by one the
+wall clock killed. A holder that can be shown to be gone is reaped at the start of the next
+round; `stale_after` separates the two only where nobody can be asked, and past it
+`acquire_running!` reclaims the lock. Returning before then leaves the campaign short and
+reports nothing, because `max_empty_rounds * idle_sleep` (90 s by default) is an order of
+magnitude under `stale_after` (600 s).
 
 Default parameters (`max_empty_rounds=3`, `idle_sleep=30.0`) are the
 battle-tested values from FiniteTemperature.jl.
@@ -876,13 +2647,32 @@ known to be missing.
 one level deep and resolved inside `work_fn`, so this is "all of the prerequisite, then all of the
 dependents", not a DAG.
 
-`affinity` is forwarded verbatim to every [`run!`](@ref) call.
+`affinity`, `spawn`, `key_class`, `cost`, `min_time` and `pool` are forwarded verbatim to every [`run!`](@ref) call. The loop is one
+[`Master`](@ref) for all its rounds, so what a [`control!`](@ref) request changed — a cancelled
+filter, enqueued keys, a pause — holds from round to round, and a `:stop` with no scope ends the
+loop (`stopped_by = :request`).
 
-Returns `(; ran, rounds, done, busy, stopped_by, prerequisite)`. `busy` is how many keys the last
-round found held by a sibling, so a caller can tell "everything is done" from "someone else still
-has work out". `ran` is `false` exactly when a prerequisite blocked the stage.
+Returns `(; ran, rounds, done, busy, err, gave_up, remaining, collisions, stopped_by,
+prerequisite)`. `collisions` is the total over the rounds (keys handed out that another master
+had taken: what sharding is there to lower). `busy`
+is how many keys the last round found held by a sibling, so a caller can tell "everything is
+done" from "someone else still has work out". `err`, `gave_up` and `remaining` are the last
+round's: a stage whose remaining keys all fail is `done = 0, busy = 0` like a clean finish, and
+`err > 0`, `remaining > 0` is what tells them apart. `ran` is `false` exactly when a prerequisite
+blocked the stage.
 """
 function run_loop!(
+    work_fn::Function, vault::Vault, keys::AbstractVector{DataKey}; pool=nothing, kwargs...
+)
+    try
+        return _run_loop!(work_fn, vault, keys; pool=pool, kwargs...)
+    finally
+        # Whatever way the loop ended, the pool's workers do not outlive it.
+        (pool !== nothing && !pool.keep) && shutdown!(pool)
+    end
+end
+
+function _run_loop!(
     work_fn::Function,
     vault::Vault,
     keys::AbstractVector{DataKey};
@@ -893,6 +2683,11 @@ function run_loop!(
     prerequisite=nothing,
     affinity=nothing,
     observe::Bool=true,
+    spawn=nothing,
+    key_class=nothing,
+    cost=nothing,
+    min_time=nothing,
+    pool=nothing,
 )
     pre = nothing
     if prerequisite !== nothing
@@ -902,15 +2697,25 @@ function run_loop!(
             rounds=0,
             done=0,
             busy=0,
+            err=0,
+            gave_up=0,
+            remaining=length(keys),
+            collisions=0,
             stopped_by=pre.stopped_by,
             prerequisite=pre,
         )
     end
 
+    # One master for every round: its event log, and what it has learned about its workers.
+    master = Master()
     empty_count = 0
     rounds = 0
     n_done = 0
     n_busy = 0
+    n_err = 0
+    n_gave_up = 0
+    n_remaining = length(keys)
+    n_collisions = 0
     busy_waited = 0.0
     # A lock is reclaimable once its heartbeat is `stale_after` old, so waiting that long is what
     # separates "a sibling is working on it" from "the holder is gone". The margin covers the round
@@ -921,19 +2726,53 @@ function run_loop!(
         # Captured at the exit rather than re-read at return. A loop that exhausts
         # `max_empty_rounds` sleeps `idle_sleep` between rounds and can cross the deadline while
         # doing so, and a flag file removed in the meantime turns a real flag stop into `nothing`.
-        stopped = _stop_reason(opts)
+        stopped = _stop_reason(opts, master)
         stopped === nothing || break
         rounds += 1
         result = run!(
-            work_fn, vault, keys; opts=opts, load=load, affinity=affinity, observe=observe
+            work_fn,
+            vault,
+            keys;
+            opts=opts,
+            load=load,
+            affinity=affinity,
+            observe=observe,
+            master=master,
+            spawn=spawn,
+            key_class=key_class,
+            cost=cost,
+            min_time=min_time,
+            pool=pool,
         )
         n_done += result.done
+        n_collisions += result.collisions
         n_busy = result.busy
+        n_err, n_gave_up, n_remaining = result.err, result.gave_up, result.remaining
+        # Every key is done. No later round can find anything, and sitting out
+        # `max_empty_rounds` idle rounds would hold the allocation for nothing.
+        result.remaining == 0 && break
+        # Nothing was done, nobody else holds anything, and what is left was held back: no key
+        # that remains can get anywhere before the deadline. Idle rounds would not change that.
+        if result.done == 0 &&
+            result.busy == 0 &&
+            result.held_back > 0 &&
+            result.explore_again == 0 &&
+            # ...and the round was not itself stopped: that is then the reason, not this.
+            result.stopped_by === nothing
+            # Held for the deadline, or held because nobody knows how long they take: two
+            # things. The second is not the job running out of time, and a campaign goes on to
+            # its next stage after it.
+            stopped = result.cost_unknown == result.held_back ? :cost_unknown : :deadline
+            break
+        end
         if result.done > 0
             empty_count = 0
             busy_waited = 0.0
             continue
         end
+        # A class is to be explored again with another key: not an empty round. (Bounded: a
+        # key that failed its exploration is not chosen again.)
+        result.explore_again > 0 && continue
         # A round that completed nothing but found keys held by a SIBLING is not an empty round:
         # either that sibling finishes them, or it is dead and `acquire_running!` reclaims them
         # once its heartbeat passes `stale_after`. Counting it as empty is what made a follow-on
@@ -953,14 +2792,371 @@ function run_loop!(
         end
         sleep(idle_sleep)
     end
+    master.state = :ended
+    master.interval > 0 && write_status(master)
+    log_event(
+        EventLog(
+            joinpath(vault.outdir, "events_$(master.id).jsonl"); min_level=opts.log_level
+        ),
+        :job_account;
+        stage=Symbol(vault.run),
+        account=account_snapshot(master),
+    )
+    # What the keys cost, where the next job (and whatever sizes it) can read it.
+    if rounds > 0
+        try
+            write_cost_table(vault)
+        catch e
+            e isa InterruptException && rethrow()
+            log_event(
+                EventLog(joinpath(vault.outdir, "events_$(master.id).jsonl")),
+                :cost_table_failed;
+                level=:warn,
+                stage=Symbol(vault.run),
+                err=_short_err(e),
+            )
+        end
+    end
     return (;
         ran=true,
         rounds=rounds,
         done=n_done,
         busy=n_busy,
+        # Of the LAST round: what is still failing, and what is still not done. A stage whose
+        # remaining keys all fail used to come back looking like a clean finish.
+        err=n_err,
+        gave_up=n_gave_up,
+        remaining=n_remaining,
+        collisions=n_collisions,
         stopped_by=stopped,
         prerequisite=pre,
     )
 end
 
-export RunOpts, run!, run_loop!, manifest_root, load_manifest
+# `todo` in the order it is drawn: the caller's, or longest expected time first; then, for a
+# master that is one of several, its own share of the keys ahead of the others'.
+function _ordered(todo::Vector{DataKey}, opts::RunOpts, cost)
+    out = todo
+    if opts.order === :longest_first && cost !== nothing
+        # Stable, so keys of equal cost keep the caller's order.
+        # A key of unknown cost goes FIRST: it may be the longest, and it has to be started for
+        # its class to be measured at all. Sorted as the shortest it was the first to be cut.
+        out = sort(out; by=k -> -something(key_seconds(cost, k), Inf), alg=MergeSort)
+    end
+    sh = opts.shard
+    if sh !== nothing && sh[2] > 1
+        mine = [_shard_of(canonical(k), sh[2]) == sh[1] for k in out]
+        out = vcat(out[mine], out[.!mine])
+    end
+    return out
+end
+
+# Which of `m` shares a key falls in. From the key's SHA-1, not `hash`: every master, on any
+# node and Julia version, has to agree.
+function _shard_of(kstr::AbstractString, m::Int)::Int
+    d = sha1(String(kstr))
+    v = UInt64(0)
+    for b in @view d[1:8]
+        v = (v << 8) | UInt64(b)
+    end
+    return Int(v % UInt64(m))
+end
+
+"""
+    key_seconds(f, key) -> Union{Float64,Nothing}
+
+Ask a cost hook (`cost`, `min_time`) about one key, guarded: `nothing` when the hook throws or
+answers something that is not a finite, non-negative number. This is the one way the run, the
+campaign and the job controller ask, so "unknown" is the same everywhere — and is never silently
+zero.
+"""
+function key_seconds(f, key::DataKey; failure=nothing)::Union{Float64,Nothing}
+    try
+        x = Float64(f(key))
+        return (isfinite(x) && x >= 0) ? x : nothing
+    catch e
+        e isa InterruptException && rethrow()
+        # Kept for the caller that wants to say it: a hook that throws on every key was never
+        # reported.
+        failure === nothing || (failure[] = e)
+        return nothing
+    end
+end
+
+# The default `min_time`: `whole(key)`, or `checkpoint_every` when that is shorter AND the key has
+# a progress record — written by `save_checkpoint!` / `report_progress` in an earlier attempt, so
+# the key is known to keep what it has done. A key with no record is not assumed to checkpoint:
+# started with less than its whole time left, it would lose all of it.
+function _checkpoint_aware(whole, opts::RunOpts, table_ref::Ref)
+    every = opts.checkpoint_every
+    every > 0 || return whole
+    return key -> begin
+        t = whole(key)
+        table = table_ref[]
+        table === nothing && return t
+        i = get(table.index, canonical(key), 0)
+        (i == 0 || table.rows[i].progress === nothing) && return t
+        return (t isa Real && !isnan(t)) ? min(t, every) : every
+    end
+end
+
+# Options that have no effect on the path this round takes are said, once per round: asked for
+# and silently dropped is how a sweep runs for hours in an order nobody chose.
+function _say_ignored(
+    log::EventLog,
+    stage::Symbol,
+    opts::RunOpts,
+    cost;
+    pool=nothing,
+    affinity=nothing,
+    spawn=nothing,
+    multi::Bool=true,
+)
+    said =
+        (option, why) -> log_event(
+            log, :option_ignored; level=:warn, stage=stage, option=option, why=why
+        )
+    if opts.order === :longest_first && cost === nothing
+        said(
+            "order=:longest_first",
+            "no cost to order by: pass `cost`, or `key_class` once the stage has a cost table",
+        )
+    end
+    if opts.workers === :sequential
+        why = "workers=:sequential runs the keys on the master, in order"
+        pool === nothing || said("pool", why)
+        affinity === nothing || said("affinity", why)
+        spawn === nothing || said("spawn", why)
+    end
+    # With no status tick, the checks that run in it do not run. Said when one of them was
+    # asked for by name; the alarm, on by default, is said at info.
+    if opts.status_interval == 0
+        why = "status_interval = 0: no status is written and nothing that runs in its tick runs"
+        opts.stuck_after > 0 && said("stuck_after", why)
+        log_event(
+            log,
+            :status_off;
+            stage=stage,
+            why=why * " (the low-utilisation alarm, the stuck check, workers_short)",
+        )
+    end
+    # Options only the worker loop acts on. In one process nothing cuts a unit, nothing leaves
+    # an under-used allocation, and keys are visited in order.
+    if !multi
+        why = "the keys run in this process, one at a time: only a round with workers does this"
+        isfinite(opts.stop_grace) && said("stop_grace", why)
+        opts.min_busy_fraction > 0 && said("min_busy_fraction", why)
+        # (`affinity` in one process is not said: a script that passes it always and is run
+        # locally now and then is the ordinary case, and nothing is lost by it.)
+    end
+    return nothing
+end
+
+# How many classes of unknown cost are explored in one round. Eight: enough for the handful of
+# sizes a sweep usually has, few enough that a `key_class` too fine to mean anything does not
+# switch the deadline check off.
+const _EXPLORE_MAX = Ref(8)
+
+# Ask the cost hook about the first queued key, to say an error it throws: once, with what it
+# threw. (Later calls go through `key_seconds`, which turns a throw into "unknown".)
+function _say_hook_error(log::EventLog, stage::Symbol, hook, todo, said=Ref(false))
+    (hook === nothing || isempty(todo)) && return nothing
+    failure = Ref{Any}(nothing)
+    key_seconds(hook, first(todo); failure=failure)
+    failure[] === nothing && return nothing
+    said[] = true
+    log_event(log, :cost_hook_failed; level=:warn, stage=stage, err=_short_err(failure[]))
+    return nothing
+end
+
+# After a round: a class whose explored key did not finish — it was busy elsewhere, cancelled,
+# failed, lost its worker — has not been measured, and is explored again with another key.
+# (Set when the key was ASKED about, the mark stayed for the rest of the job, and every other
+# key of the class was held back in every later round.)
+function _unexplore!(explored::AbstractDict, table::TaskTable, failed::AbstractSet)
+    freed = 0
+    for (class, kstr) in collect(explored)
+        i = get(table.index, kstr, 0)
+        i == 0 && continue                       # not of this round's keys: left as it is
+        o = table.rows[i].outcome
+        (o === :ok || o === :already_done) && continue
+        delete!(explored, class)
+        push!(failed, kstr)                     # another key of the class next time, not this
+        freed += 1
+    end
+    return freed
+end
+
+# `key -> Bool`: can this key still get somewhere before the deadline? Always, without one.
+#
+# One rule for a key whose time is NOT KNOWN (the hook has no answer, answers NaN, or throws):
+# it is neither assumed to fit nor held back for ever. One key per class per job is started
+# regardless, to be measured (`explored`, kept by the master across rounds; `on_explore` says
+# it); the others of that class are held back, counted in `unknown` with their `classes`. Held
+# back without that, a class that had never completed was held back in every job with a deadline
+# — and so never completed.
+function _fits(
+    opts::RunOpts,
+    need;
+    class=key -> "",
+    explored::AbstractDict=Dict{String,String}(),
+    avoid::AbstractSet=Set{String}(),
+    unknown::AbstractSet=Set{String}(),
+    classes::AbstractSet=Set{String}(),
+    on_explore=(class, kstr) -> nothing,
+    on_error=err -> nothing,
+    on_cap=n -> nothing,
+)
+    d = opts.deadline
+    d === nothing && return Returns(true)
+    said_error = Ref(false)
+    explored_now = Ref(0)
+    capped = Ref(false)
+    return key -> begin
+        failure = Ref{Any}(nothing)
+        t = key_seconds(need, key; failure=failure)
+        if failure[] !== nothing && !said_error[]
+            # A hook that throws is not "no answer": said once, with what it threw.
+            said_error[] = true
+            on_error(_short_err(failure[]))
+        end
+        t === nothing || return time() + t <= d
+        c = String(class(key))
+        kstr = canonical(key)
+        chosen = get(explored, c, nothing)
+        if chosen === nothing && !(kstr in avoid)
+            # A bound per round: with a `key_class` so fine that nearly every key is the first
+            # of its class, exploring would be the deadline check switched off.
+            if explored_now[] >= _EXPLORE_MAX[]
+                capped[] || (capped[]=true; on_cap(_EXPLORE_MAX[]))
+            else
+                explored_now[] += 1
+                explored[c] = kstr
+                on_explore(c, kstr)
+                return true
+            end
+        end
+        chosen == kstr && return true            # asked again about the one that was chosen
+        push!(unknown, kstr)
+        push!(classes, c)
+        return false
+    end
+end
+
+# The cost hook `run!` works with: the measured table of this stage where there is one, with the
+# caller's hook for the classes it has not seen. Said in the log, with how many of this round's
+# keys fell back.
+function _default_cost(vault::Vault, cost, key_class, todo, log::EventLog, stage::Symbol)
+    key_class === nothing && return cost
+    table = try
+        load_cost_table(vault; strict=true)
+    catch e
+        e isa InterruptException && rethrow()
+        log_event(log, :cost_table_unreadable; level=:warn, stage=stage, err=_short_err(e))
+        return cost
+    end
+    isempty(table) && return cost
+    fallback = cost === nothing ? (k -> NaN) : cost
+    seen = count(k -> haskey(table, _class_of(key_class, k)), todo)
+    log_event(
+        log,
+        :cost_source;
+        stage=stage,
+        source="measured",
+        classes=length(table),
+        measured_keys=seen,
+        fallback_keys=length(todo) - seen,
+        fallback=cost === nothing ? "none" : "the caller's cost",
+    )
+    return measured_cost(table, k -> _class_of(key_class, k); fallback=fallback)
+end
+
+# The next row whose key fits; the ones passed over on the way are settled `:no_fit`.
+function _next_fitting!(table::TaskTable, worker::Int, fits; accept=nothing)
+    while true
+        i = next_task!(table, worker; accept=accept)
+        i === nothing && return nothing
+        fits(table.rows[i].key) && return i
+        settle!(table, i, :no_fit)
+    end
+end
+
+# ── a round's context, held by the worker ───────────────────────────────────────────────────────
+
+# round id => what every key of that round is run with. On the worker.
+const _ROUNDS = Dict{UInt64,Any}()
+const _ROUNDS_LOCK = ReentrantLock()
+
+function _install_round(
+    rid::UInt64, work_fn, vault::Vault, stage::Symbol, log, opts::RunOpts
+)
+    lock(_ROUNDS_LOCK) do
+        return _ROUNDS[rid] = (; work_fn, vault, stage, log, opts)
+    end
+    return nothing
+end
+
+_drop_round(rid::UInt64) = (lock(() -> delete!(_ROUNDS, rid), _ROUNDS_LOCK); nothing)
+
+# `_run_one_with_lock!` for a key of an installed round: only the key and what is particular to
+# this hand-out travel.
+function _run_installed(rid::UInt64, key::DataKey; kwargs...)
+    r = lock(() -> get(_ROUNDS, rid, nothing), _ROUNDS_LOCK)
+    r === nothing && error("round $(string(rid; base=16)) is not installed on this worker")
+    return _run_one_with_lock!(r.work_fn, r.vault, key, r.stage, r.log, r.opts; kwargs...)
+end
+
+# Workers that joined after `worker_logs!` was called write to the same directory.
+function _redirect_late!(pids)
+    dir = _WORKER_LOG_DIR[]
+    dir === nothing && return nothing
+    for p in pids
+        try
+            remotecall_fetch(_redirect_output, p, dir)
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
+    return nothing
+end
+
+"""
+    todo_count(vault, keys) -> Int
+
+How many of `keys` are not done: the manifest first, then the markers for what it does not have.
+Ask it BEFORE `init_workers!`, so a job that has nothing to do leaves in seconds instead of
+starting hundreds of workers to find that out:
+
+```julia
+SweepRunner.todo_count(vault, keys) == 0 && exit(0)
+SweepRunner.init_workers!()
+```
+"""
+function todo_count(vault::Vault, keys::AbstractVector{DataKey})
+    todo = todo_keys(load_manifest(vault), collect(keys))
+    return count(k -> !DataVault.is_done(vault, k), todo)
+end
+
+# The class label of a key, for its cost record. A `key_class` that throws costs the label, not
+# the key.
+function _class_of(key_class, key::DataKey)::String
+    key_class === nothing && return ""
+    try
+        return String(string(key_class(key)))
+    catch e
+        e isa InterruptException && rethrow()
+        return ""
+    end
+end
+
+# JSON has no NaN: a reading that could not be taken is `nothing`.
+_finite(x::Real) = isfinite(x) ? Float64(x) : nothing
+
+# `keys` followed by the enqueued keys it does not already hold.
+function _with_extra(keys::AbstractVector{DataKey}, extra::Vector{DataKey})
+    isempty(extra) && return keys
+    have = Set(canonical(k) for k in keys)
+    return vcat(collect(keys), DataKey[k for k in extra if !(canonical(k) in have)])
+end
+
+export RunOpts, run!, run_loop!, manifest_root, load_manifest, todo_count, key_seconds

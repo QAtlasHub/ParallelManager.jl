@@ -15,11 +15,18 @@ end
 allk_rl(v) = ParamIO.expand(v.spec)
 
 @testset "run_loop!: all work done in first round, exits immediately" begin
+    wf = k -> Dict{String,Any}("x" => 1)
+    # The first `run_loop!` in a process pays for compiling the whole `run!` path, which is
+    # seconds and is not what the bound below is about. Pay it on another vault, with the same
+    # work function, so the timed call measures the loop.
+    with_vault_rl() do w, _
+        run_loop!(wf, w, allk_rl(w); max_empty_rounds=1, idle_sleep=0.1)
+    end
     with_vault_rl() do v, outdir
         keys = allk_rl(v)
         t0 = time()
         run_loop!(
-            k -> Dict{String,Any}("x" => 1),
+            wf,
             v,
             keys;
             max_empty_rounds=3,

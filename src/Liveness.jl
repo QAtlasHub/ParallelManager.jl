@@ -28,6 +28,20 @@ function owner_token()::String
     return isempty(job) ? base : string(base, ":slurm", job)
 end
 
+"""
+    owner_token(host, pid) -> String
+
+A token for an acquisition that the process `pid` on `host` is about to make, written by someone
+else: the master, naming the lock its worker will take, so that it knows the name without asking.
+Same shape as `owner_token()`, and the Slurm field is this process's — a master and its workers
+share a job.
+"""
+function owner_token(host::AbstractString, pid::Integer)::String
+    base = string(host, ':', pid, ':', string(rand(UInt32); base=16, pad=8))
+    job = _slurm_queue_id()
+    return isempty(job) ? base : string(base, ":slurm", job)
+end
+
 # The id as `squeue` PRINTS it, which is not always `SLURM_JOB_ID`. In an array task that variable
 # holds a distinct raw id per task while the queue lists `<array id>_<task index>`, so stamping it
 # makes every task but the first unfindable, and unfindable reads as `:dead`.
@@ -150,6 +164,19 @@ function _live_slurm_jobs()::Union{Set{String},Nothing}
         _squeue_cache[] = (time(), fresh)
         return fresh
     end
+end
+
+# `SLURM_JOB_CPUS_PER_NODE` (`128(x72)`, `64(x2),32`) as one count per node, or `nothing` when
+# it is not in that form. The ONE reading of it: the status, the account and the pool used to
+# parse it separately, one answering 0 and another throwing on the same value.
+function _slurm_cpus_per_node(s::AbstractString)::Union{Vector{Int},Nothing}
+    out = Int[]
+    for part in split(s, ','; keepempty=false)
+        m = match(r"^(\d+)(?:\(x(\d+)\))?$", strip(part))
+        m === nothing && return nothing
+        append!(out, fill(parse(Int, m[1]), m[2] === nothing ? 1 : parse(Int, m[2])))
+    end
+    return out
 end
 
 export owner_token, holder_liveness

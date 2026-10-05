@@ -39,6 +39,9 @@ SweepRunner.merge_and_save_manifest!
 SweepRunner.init_workers!
 SweepRunner.detect_mode
 SweepRunner.verify_workers!
+SweepRunner.srun_worker_limit
+SweepRunner.split_nodes
+SweepRunner.worker_logs!
 ```
 
 ## Run
@@ -47,6 +50,8 @@ SweepRunner.verify_workers!
 SweepRunner.RunOpts
 SweepRunner.run!
 SweepRunner.run_loop!
+SweepRunner.todo_count
+SweepRunner.key_seconds
 ```
 
 ## Artifacts
@@ -58,7 +63,8 @@ SweepRunner.artifact_affinity
 ## Liveness
 
 ```@docs
-SweepRunner.owner_token
+SweepRunner.owner_token()
+SweepRunner.owner_token(::AbstractString, ::Integer)
 SweepRunner.holder_liveness
 ```
 
@@ -75,6 +81,8 @@ SweepRunner.run_prerequisite!
 SweepRunner.Finding
 SweepRunner.PreflightReport
 SweepRunner.launchable
+SweepRunner.n_errors
+SweepRunner.n_warns
 SweepRunner.check_injective!
 SweepRunner.check_opens!
 SweepRunner.representative_keys

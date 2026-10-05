@@ -2,7 +2,7 @@
 #
 # `DataVault.observe_sources` records what the source looked like and how far THIS process's loaded
 # code was checked against it. A point's marker must carry the token of the process that computed
-# it: under `pmap` that is the worker, whose loaded code need not be the master's. So each process
+# it: with worker processes that is the worker, whose loaded code need not be the master's. So each process
 # observes for itself at `run!` start, keeps the token here, and `_run_one_with_retry!` — which runs
 # on that same process — reads it back.
 #
@@ -87,6 +87,31 @@ function _observe_processes!(vault::Vault, multi::Bool, observe::Bool, log, stag
             )
         else
             log_event(log, :observed; stage=stage, pid=pid, role=role, token=token)
+        end
+    end
+    return nothing
+end
+
+# The same, for workers that joined after the round began (see `_drive_workers!`).
+function _observe_late!(vault::Vault, pids, observe::Bool, log, stage)
+    for pid in pids
+        if !observe
+            remotecall_fetch(SweepRunner._forget_observation!, pid, vault)
+            continue
+        end
+        token, err = remotecall_fetch(SweepRunner._observe_here!, pid, vault, "worker")
+        if token === nothing
+            log_event(
+                log,
+                :observe_failed;
+                level=:warn,
+                stage=stage,
+                pid=pid,
+                role="worker",
+                err=err,
+            )
+        else
+            log_event(log, :observed; stage=stage, pid=pid, role="worker", token=token)
         end
     end
     return nothing

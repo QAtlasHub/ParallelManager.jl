@@ -1,0 +1,6 @@
+#!/bin/sh
+# sweeprunner — ask (or tell) a running sweep from a shell. See `sweeprunner --help`.
+#
+# Runs in whatever project `JULIA_PROJECT` names (or the one in the current directory), which has
+# to have SweepRunner in it — the same project the sweep itself runs in.
+exec julia --startup-file=no -e 'using SweepRunner; exit(SweepRunner.cli(ARGS))' -- "$@"

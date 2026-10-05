@@ -33,6 +33,8 @@ makedocs(;
         "Quick start" => "quickstart.md",
         "Architecture" => "architecture.md",
         "API reference" => "api.md",
+        "API: control plane" => "api_plane.md",
+        "API: pool, campaigns, jobs" => "api_campaign.md",
         "Guides" => "guides.md",
     ],
 )

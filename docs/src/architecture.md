@@ -36,7 +36,8 @@ What it does not provide is:
    the queue forever.
 4. **A structured event log** that is safe for concurrent append from
    multiple processes and hostile to per-item `println`.
-5. **A uniform worker bootstrap** for `:threads` / `:distributed` / `:slurm`.
+5. **A uniform worker bootstrap** for `:distributed` / `:slurm` (and `:threads`, which gives a
+   key threads and runs the keys on the master one at a time).
 
 Putting those in `DataVault` would turn it into a parallel runtime; this
 package keeps `DataVault` focused on "one file, one key, safely written"
@@ -52,6 +53,24 @@ and owns the coordination story separately.
 | _(per-key lock)_                                    | moved to DataVault's `.running` (`acquire_running!`, POSIX `link()`) as of v0.3; `Run.jl` calls into it                |
 | [`src/InitWorkers.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/InitWorkers.jl) | Unified `:auto` / `:sequential` / `:threads` / `:distributed` / `:slurm` bootstrap                   |
 | [`src/Run.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Run.jl)             | [`run!(work_fn, vault, keys; opts)`](@ref SweepRunner.run!) facade                               |
+| [`src/TaskTable.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/TaskTable.jl) | The master's table of a round's units (state, owner, progress) and the queue the dispatcher draws from |
+| [`src/Progress.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Progress.jl)   | `report_progress` / `resume_point`: how far a unit got, handed to the next attempt                  |
+| [`src/Master.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Master.jl)       | A master's identity and its workers'; `state_root(vault)`                                          |
+| [`src/Status.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Status.jl)       | The status file each master rewrites, and `read_status` / `print_status` to ask it from outside    |
+| [`src/Locks.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Locks.jl)         | `judge_lock`: ask the holder's master whether a `.running` is real; `locks`, `reap_dead_locks!`    |
+| [`src/Control.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Control.jl)     | `control!`: requests a running master applies (enqueue, cancel, stop, prioritise, resize, drain, pause); `should_stop` / `stop_point` |
+| [`src/Pool.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Pool.jl)           | `SizedPool`: workers sized to their keys (`KeyReq`), started where a node has room; `LocalSpawner`, `SlurmStepSpawner`; `plan_spawns` |
+| [`src/Checkpoint.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Checkpoint.jl) | A key's checkpoint inside `work_fn`: `load_checkpoint`, `save_checkpoint!`, `checkpoint_due`; `check_checkpoints` |
+| [`src/Account.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Account.jl)     | Where a job's core-hours went: computing (kept / lost), start-up, never started, idle by reason |
+| [`src/Cost.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Cost.jl)           | What a key cost: `key_costs`, `cost_summary`, the per-stage table, `measured_cost` / `measured_mem` |
+| [`src/Liveness.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Liveness.jl) | Is a holder still there: its process, its Slurm job; `owner_token` |
+| [`src/Observe.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Observe.jl) | One source observation per process per `run!`, carried by every `.done` it writes |
+| [`src/Artifacts.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Artifacts.jl) | `artifact_affinity`: keys that share an artifact go to one worker |
+| [`src/Prerequisite.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Prerequisite.jl) | A stage that has to complete before another starts (`Prerequisite`, `run_prerequisite!`) |
+| [`src/Preflight.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Preflight.jl) | `check_injective!` / `check_opens!` / `on_grid`: refuse a campaign before it burns compute |
+| [`src/Campaign.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Campaign.jl)   | A meta config naming the stages of a campaign: `load_campaign`, `validate_campaign`, `plan_campaign`, `run_campaign!`, `remaining_work` |
+| [`src/Jobs.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/Jobs.jl)           | `Scheduler` (`SlurmScheduler`, `MockScheduler`), `JobPolicy`, `Ledger`, `decide` / `manage!`: submissions decided from what is left, inside a budget |
+| [`src/CLI.jl`](https://github.com/QAtlasHub/SweepRunner.jl/blob/main/src/CLI.jl)             | `sweeprunner status|locks|costs|account|campaign|jobs|pause|resume|stop|cancel|prioritise|resize|drain|enqueue` (`bin/sweeprunner`) |
 
 ## Key identity: `canonical(::DataKey)`
 
@@ -66,15 +85,22 @@ filesystem encodings.
 When you call `run!(work_fn, vault, keys)`, it does:
 
 1. Open an [`EventLog`](@ref SweepRunner.EventLog) at
-   `joinpath(vault.outdir, "events.jsonl")`.
+   `joinpath(vault.outdir, "events_<host>_<pid>.jsonl")` — one file per master.
 2. Load the stage [`Manifest`](@ref SweepRunner.Manifest) and compute
    `todo = todo_keys(manifest, keys)`. If empty, emit `:skip_complete`
    and return.
 3. Emit `:stage_start`.
-4. For each key in `todo`:
+4. Build the [`TaskTable`](@ref SweepRunner.TaskTable) — the master's one
+   pass over the markers. A key a sibling finished since the manifest is
+   settled; a lock whose holder is provably gone is removed; a key locked by
+   a live sibling is held back (`:lock_busy`) and not dispatched; the progress
+   recorded for partly-done units is attached. What remains is the queue.
+5. Draw the queue. Each key is handed to a worker (or run on the master when
+   there are none) **with its lock token and resume point**, and the row is
+   settled with what comes back:
    - Acquire the per-key lock via `DataVault.acquire_running!` (atomic on
-     NFS, POSIX `link()`). If another master holds a fresh `.running`,
-     emit `:lock_busy` and move on.
+     NFS, POSIX `link()`), under the token the master named. If another
+     master took it in the meantime, the key comes back `:lock_busy`.
    - Re-check `DataVault.is_done(vault, key)` **after** acquiring the lock
      — another master may have finished this key between our manifest
      read and lock acquisition.
@@ -83,8 +109,40 @@ When you call `run!(work_fn, vault, keys)`, it does:
      success, `DataVault.save!` + `DataVault.mark_done!(vault, key, owner)` +
      `Manifest.add_complete!`; the owner form commits nothing if a sibling
      reclaimed the key meanwhile.
-5. `save_manifest(manifest)`.
-6. Emit `:stage_done` and return the aggregate counts.
+6. When the queue drains, ask once more about the keys that came back busy
+   (their holder may have finished or died meanwhile) and requeue the free ones.
+7. Merge the round's completions into the manifest. This also happens
+   during the round, every `opts.manifest_interval` seconds, so a job killed
+   at its wall clock leaves what it finished there.
+8. Emit `:stage_done` and return the aggregate counts.
+
+### Who holds the task state
+
+The markers on disk stay the durable record and the cross-job lock: several
+masters share one vault, and any of them can be killed at its wall clock. What
+changed in 0.6.9 is who READS them. The master reads them once per round and
+holds the table; a worker does the key it was handed and reports back. It does
+not explore.
+
+The same goes for progress inside a unit. A `work_fn` made of steps calls
+[`report_progress`](@ref SweepRunner.report_progress) after each one and
+[`resume_point`](@ref SweepRunner.resume_point) at the start, instead of
+probing its own outputs step by step:
+
+```julia
+function work_fn(key)
+    p = SweepRunner.resume_point()
+    for seg in (p === nothing ? 1 : p.step + 1):nseg
+        run_segment!(key, seg)                    # writes its own checkpoint
+        SweepRunner.report_progress(seg; of=nseg)
+    end
+    return collect_result(key)
+end
+```
+
+A worker that dies gives its key back with what it had reported, and the
+master releases the lock it named at once rather than leaving it for
+`stale_after`.
 
 ## Concurrency model
 
@@ -97,8 +155,9 @@ master B:                                      acquire(K2)  work(K2)  release(K2
 
 Both masters iterate the same `todo`. The `.running` (POSIX `link()`) lock ensures only
 one enters `work_fn` for any given key at any time. A master that tries
-to lock a key another master already owns simply logs `:lock_busy` and
-moves on — no blocking, no waiting, no central queue.
+to lock a key another master already owns counts it as busy and moves on — no
+blocking, no waiting, no central queue. (The per-key `:lock_busy` event is
+written at `log_level = :debug` only; the totals are in `stage_done`.)
 
 Two things keep this robust against crashes:
 
@@ -106,7 +165,11 @@ Two things keep this robust against crashes:
    rewrites the lock's `heartbeat_unix=` every `heartbeat_interval`, for as
    long as the holder's pid lives — also while `work_fn` never yields, which
    an in-process task did not survive. If the holder dies, the heartbeat
-   stops; after `stale_after` the next contender reclaims the lock under
+   stops. A master that starts later asks the holder's master, the scheduler
+   and the pid whether the holder is alive, and removes the lock at once when
+   the answer is no; a lock a reporting master lists as held is left alone
+   whatever its age. Only where nobody can be asked does the heartbeat's age
+   decide: after `stale_after` the next contender reclaims the lock under
    DataVault's reclaim mutex (see DataVault's README, "ロックの規約").
 2. **Post-lock `is_done` re-check.** Even on the happy path, two masters
    can start the loop with overlapping `todo`. The re-check inside the
@@ -126,6 +189,16 @@ for typical jobs.
 SweepRunner's public API **does not include a per-item `println`**.
 Adding one is considered a regression. Use [`log_event`](@ref SweepRunner.log_event)
 with one of the standard event kinds documented on [`EventLog`](@ref SweepRunner.EventLog).
+
+## Campaigns: stages are declared, not composed
+
+`run!` runs one stage. A campaign is many stages of many studies, and which of
+them run, in what order and under which filters is described in one meta
+config ([`load_campaign`](@ref SweepRunner.load_campaign)), not in an entry
+script and a set of environment variables. The dependency between stages is
+declared there (`needs`) and checked as "every key of the needed stage is
+done" before the dependent stage starts; SweepRunner still does not know which
+dependent key reads which needed key. See the campaign guide.
 
 ## Why no Stage / DAG
 
