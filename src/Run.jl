@@ -418,15 +418,29 @@ function _stop_outcome(reason::Symbol)::Symbol
     return throw(ArgumentError("no per-key outcome for stop reason $(repr(reason))"))
 end
 
-# A step of a `finally`: what it throws is not allowed to hide what is already on its way out.
-function _guarded(f)
+# A step of a `finally`: what it throws is not allowed to hide what is already on its way out —
+# and is said, where it can be (`what` names the step).
+function _guarded(f, log=nothing, what::AbstractString="")
     try
         f()
     catch e
         e isa InterruptException && rethrow()
+        try
+            log === nothing ||
+                log_event(log, :cleanup_failed; level=:warn, step=what, err=_short_err(e))
+        catch
+            # The log is what failed.
+        end
     end
     return nothing
 end
+
+# How long a worker Distributed reports as exited is given to be seen to have ended, before
+# its lock is kept as that of a process that may still be computing.
+const _EXIT_CONFIRM = Ref(10.0)
+
+# Workers left inside a unit they could not be stopped in (their lock was kept).
+const _KEPT_WORKERS = Set{Int}()
 
 # How many times a worker that joined late is readied before it is given up on. Three: once is
 # what a file system that was slow for a moment fails, and each try costs a tick.
@@ -893,11 +907,11 @@ function run!(
         # for whoever trips over them.
         # Each by itself: one that throws (the event directory full at the end of a job) must
         # not skip the ones after it, nor take the place of the exception that is propagating.
-        _guarded(() -> _release_running!(table, vault, stage, log))
+        _guarded(() -> _release_running!(table, vault, stage, log), log, "release_running")
         # A status that still says `running` after the master has left is the one thing it must
         # not say.
         master.state = after
-        _guarded(() -> master.interval > 0 && status_tick!(master, log))
+        _guarded(() -> master.interval > 0 && status_tick!(master, log), log, "status")
         # A master of its own ends here; one handed in (`run_loop!`) reports when the loop ends.
         _guarded() do
             return own && log_event(
@@ -906,7 +920,11 @@ function run!(
         end
         # A pool's workers go with the call that was given the pool (a `run_loop!` removes them
         # when IT returns).
-        _guarded(() -> (own && pool !== nothing && !pool.keep) && shutdown!(pool))
+        _guarded(
+            () -> (own && pool !== nothing && !pool.keep) && shutdown!(pool),
+            log,
+            "shutdown_pool",
+        )
         # The round's warnings in one line, however it ended: an exception, a pool that gave
         # up, a cut that failed are the rounds whose warnings matter most.
         _guarded(() -> _say_warnings(stage, _warnings_since(warned0)))
@@ -1462,8 +1480,14 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
     # and one after another a hundred of them outlast the scheduler's SIGTERM-to-SIGKILL window,
     # leaving their locks to `stale_after`.
     pids = unique(r.worker for (_, r) in cut if r.owner !== nothing && r.worker != 0)
-    filter!(p -> p != myid() && p in procs(), pids)
     remove = something(_KILL_WORKER[], _kill_hard!)
+    # What launched each, taken before anything is done to them — and the ones to remove are
+    # those whose PROCESS is not known to have ended: a worker that was asked to leave is out of
+    # `procs()` and may be computing all the same.
+    launcher_of = something(_LAUNCHER_OF[], _launcher)
+    filter!(p -> p != myid(), pids)
+    launchers = Dict(pid => launcher_of(pid) for pid in pids)
+    filter!(p -> !_worker_dead(p, launchers[p]), pids)
     @sync for pid in pids
         @async try
             remove(pid)
@@ -1479,7 +1503,9 @@ function _release_running!(table::TaskTable, vault::Vault, stage::Symbol, log::E
         # the worker).
         pid = r.worker
         if pid != 0 && pid != myid()
-            if pid in procs()
+            # Still there? Its PROCESS, not its place in `procs()` (see `_worker_dead`).
+            if haskey(launchers, pid) && !_worker_dead(pid, launchers[pid])
+                push!(_KEPT_WORKERS, pid)
                 log_event(
                     log,
                     :lock_kept;
@@ -1606,6 +1632,8 @@ function _drive_workers!(
     abandoned = Set{Task}()
 
     function _loop(pid::Int, host::String, ospid::Int)
+        # What launched this worker, while Distributed can still say.
+        launcher = something(_LAUNCHER_OF[], _launcher)(pid)
         # The round's context goes to the worker once. Sent with every key, the work function,
         # the vault (its whole spec), the log and the options were serialised again per
         # dispatch, through the master's one core.
@@ -1685,6 +1713,7 @@ function _drive_workers!(
             out[] += 1
             t0 = time()
             died = false
+            kept = false
             outcome = try
                 last(
                     remotecall_fetch(
@@ -1700,7 +1729,37 @@ function _drive_workers!(
                     ),
                 )
             catch e
-                if e isa ProcessExitedException
+                # The round stopped waiting for this task; what its worker does now is not the
+                # round's (no death counted, no memory raised for a key it gave up on).
+                current_task() in abandoned && return nothing
+                # Distributed reports the exit when its side closes, which can be a moment
+                # before the process is seen to have ended: that moment is waited for.
+                gone =
+                    e isa ProcessExitedException &&
+                    timedwait(
+                        () -> _worker_dead(pid, launcher), _EXIT_CONFIRM[]; pollint=0.05
+                    ) === :ok
+                if e isa ProcessExitedException && !gone
+                    # Distributed has closed its side (the worker was asked to leave, or the
+                    # connection dropped) and the PROCESS is not known to have ended: it may be
+                    # computing. Its lock is not released under it; the key is held, by it.
+                    kept = true
+                    _out_keep!(tok)
+                    push!(_KEPT_WORKERS, pid)
+                    log_event(
+                        log,
+                        :lock_kept;
+                        level=:warn,
+                        stage=stage,
+                        key=row.kstr,
+                        owner=tok,
+                        worker=pid,
+                        why="the connection to the worker is closed and its process is not " *
+                            "known to have ended",
+                    )
+                    died = true                          # this dispatch task is over
+                    :lock_busy
+                elseif e isa ProcessExitedException
                     died = true
                     _release_dead!(vault, row, tok, stage, log)
                     # The worker cannot say what the attempt cost; the master knows how long.
@@ -1741,8 +1800,10 @@ function _drive_workers!(
                 end
             finally
                 out[] -= 1
-                _out_remove!(tok)
-                _out_unkeep!(tok)
+                if !kept
+                    _out_remove!(tok)
+                    _out_unkeep!(tok)
+                end
             end
             # A task the round stopped waiting for (its worker could not be removed): the round
             # has reported without it. What comes back now changes nothing it reported.
@@ -1780,7 +1841,12 @@ function _drive_workers!(
     # round began were prepared by `run!`; later ones are prepared here.
     function _adopt!()
         # `workers()` is `[1]` when there are none: the master is not one of its own workers.
-        fresh = [p for p in workers() if !(p in started) && p != myid() && !(p in rejected)]
+        # (A worker whose lock was kept is still inside the unit it could not be stopped in:
+        # it gets no key from a later round in this process.)
+        fresh = [
+            p for p in workers() if
+            !(p in started) && p != myid() && !(p in rejected) && !(p in _KEPT_WORKERS)
+        ]
         # A worker the pool is still starting is visible here before the pool knows its size;
         # it gets a dispatch task once it is registered, not before.
         pool === nothing || filter!(p -> _pool_adoptable(pool, p), fresh)

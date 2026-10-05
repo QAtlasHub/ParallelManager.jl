@@ -106,6 +106,7 @@ stay within that guarantee.
 | `lock_kept`     | the master is leaving and a worker could not be removed: its lock  |
 |                 | stays with it                                                      |
 | `lock_not_ours` | a lock the master meant to release was already released or taken   |
+| `cleanup_failed` | a step of `run!`'s way out threw (`step`, `err`); the others ran  |
 | `lock_unreadable` | a unit could not read its own lock file; it goes on              |
 | `low_utilisation` | fewer than `min_utilisation` of this master's cores have a key,  |
 |                 | with keys queued, for ten minutes (`why`)                          |
