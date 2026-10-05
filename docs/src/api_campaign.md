@@ -48,6 +48,8 @@ SweepRunner.cancel
 SweepRunner.job_states
 SweepRunner.remaining_time
 SweepRunner.shrink
+SweepRunner.job_gone
+SweepRunner.job_elapsed
 SweepRunner.SlurmScheduler
 SweepRunner.MockScheduler
 SweepRunner.PartitionPolicy
