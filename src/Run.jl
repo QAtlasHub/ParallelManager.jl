@@ -2642,6 +2642,18 @@ function _say_ignored(
         affinity === nothing || said("affinity", why)
         spawn === nothing || said("spawn", why)
     end
+    # With no status tick, the checks that run in it do not run. Said when one of them was
+    # asked for by name; the alarm, on by default, is said at info.
+    if opts.status_interval == 0
+        why = "status_interval = 0: no status is written and nothing that runs in its tick runs"
+        opts.stuck_after > 0 && said("stuck_after", why)
+        log_event(
+            log,
+            :status_off;
+            stage=stage,
+            why=why * " (the low-utilisation alarm, the stuck check, workers_short)",
+        )
+    end
     # Options only the worker loop acts on. In one process nothing cuts a unit, nothing leaves
     # an under-used allocation, and keys are visited in order.
     if !multi

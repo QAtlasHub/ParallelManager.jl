@@ -212,6 +212,8 @@ mutable struct Master
     # then the job's cores less what the other masters of the job report as theirs.
     own_cores::Int
     util_unknown_said::Bool
+    util_guess_said::Bool
+    low_good::Int           # ticks in a row at or above the threshold
 end
 
 function Master()
@@ -251,6 +253,8 @@ function Master()
         0.0,
         0,
         false,
+        false,
+        0,
     )
 end
 

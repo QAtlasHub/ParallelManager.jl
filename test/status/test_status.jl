@@ -435,7 +435,18 @@ end
                 )
                 write(joinpath(dir, "status.json"), JSON3.write(st))
             end
+            empty!(SweepRunner._ALLOC_CACHE)                     # (the answer is kept for 30 s)
             @test SweepRunner._master_alloc_cores(m) == 128      # 512 less 3 × 128; job 888 is not ours
+            # A share worked out that way is said, once: the alarm's basis is a subtraction.
+            m.multi = true
+            m.table = TaskTable(DataVault.keys(v))
+            log = SweepRunner.EventLog(joinpath(state_root(v), "events_guess.jsonl"))
+            SweepRunner._check_utilisation!(m, log)
+            SweepRunner._check_utilisation!(m, log)
+            guess = [JSON3.read(l) for l in readlines(log.path)]
+            guess = [e for e in guess if e.kind == "utilisation_guess"]
+            @test length(guess) == 1
+            @test (guess[1].cores, guess[1].other_masters) == (128, 3)
         end
     end
 end
@@ -465,5 +476,87 @@ end
         @test occursin("this check is broken", ev[1].err)
         # The step after them still ran: the status was written.
         @test isfile(SweepRunner.status_path(v, m))
+    end
+end
+
+# ── fourth review (#172) ─────────────────────────────────────────────────────────────────────────
+
+@testset "the alarm that is not running says so; the echo survives log_level and an off switch (#172)" begin
+    # An allocation that cannot be read, inside a job: said once.
+    _st_vault() do v, outdir
+        m = SweepRunner.Master()
+        m.vault = v
+        m.stage = "st"
+        m.multi = true
+        m.table = TaskTable(DataVault.keys(v))
+        log = SweepRunner.EventLog(joinpath(outdir, "events_x.jsonl"))
+        withenv("SLURM_JOB_ID" => "9", "SLURM_JOB_CPUS_PER_NODE" => "many") do
+            SweepRunner._check_utilisation!(m, log)
+            SweepRunner._check_utilisation!(m, log)
+        end
+        @test count(e -> e.kind == "utilisation_unknown", _st_events(outdir)) == 1
+        # `min_utilisation = 0` is "off": nothing is compared and nothing is said.
+        m2 = SweepRunner.Master()
+        m2.vault = v
+        m2.multi = true
+        m2.table = m.table
+        m2.min_utilisation = 0.0
+        withenv("SLURM_JOB_ID" => "9", "SLURM_JOB_CPUS_PER_NODE" => "many") do
+            SweepRunner._check_utilisation!(m2, log)
+        end
+        @test count(e -> e.kind == "utilisation_unknown", _st_events(outdir)) == 1
+    end
+    # No status tick: the checks that run in it are off, and the round says so.
+    _st_vault() do v, outdir
+        run!(
+            k -> Dict{String,Any}("x" => 1),
+            v,
+            DataVault.keys(v);
+            opts=RunOpts(; status_interval=0, stuck_after=60.0),
+        )
+        ev = _st_events(outdir)
+        @test count(e -> e.kind == "status_off", ev) == 1
+        @test any(e -> e.kind == "option_ignored" && e.option == "stuck_after", ev)
+        # The round's own summary of its warnings.
+        done = only([e for e in ev if e.kind == "stage_done"])
+        @test done.warnings[:option_ignored] == 1
+    end
+    # A warning below the file's threshold is still counted and echoed; QUIET turns the echo off.
+    dir = mktempdir()
+    io = IOBuffer()
+    SweepRunner.echo_warnings!(io)
+    try
+        quiet = SweepRunner.EventLog(joinpath(dir, "events_q.jsonl"); min_level=:error)
+        before = SweepRunner.warning_counts()
+        SweepRunner.log_event(quiet, :test_warning_172; level=:warn, node="n1")
+        @test occursin("test_warning_172", String(take!(io)))
+        @test SweepRunner._warnings_since(before)["test_warning_172"] == 1
+        @test !isfile(quiet.path)                                # not in the file, as asked
+        # The quiet minute is per subject: another node inside it is news, the same is not.
+        SweepRunner.log_event(quiet, :test_warning_172; level=:warn, node="n2")
+        @test occursin("node=n2", String(take!(io)))
+        SweepRunner.log_event(quiet, :test_warning_172; level=:warn, node="n2")
+        @test isempty(String(take!(io)))
+        withenv("SWEEPRUNNER_QUIET_WARNINGS" => "1") do
+            SweepRunner.log_event(quiet, :test_quiet_172; level=:warn)
+        end
+        @test isempty(String(take!(io)))
+    finally
+        SweepRunner.echo_warnings!(:stderr)
+    end
+end
+
+@testset "run! tells the master which cores are its own (#172)" begin
+    _st_vault() do v, outdir
+        env = (
+            "SLURM_JOB_NODELIST" => "c[001-004]",
+            "SLURM_JOB_CPUS_PER_NODE" => "128(x4)",
+            "SWEEPRUNNER_NODELIST" => "c[001-002]",
+        )
+        withenv(env...) do
+            run!(k -> Dict{String,Any}("x" => 1), v, DataVault.keys(v))
+        end
+        st = only(read_status(v))
+        @test st["workers"]["cores_allocated"] == 256            # its group, not the job's 512
     end
 end

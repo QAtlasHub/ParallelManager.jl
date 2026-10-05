@@ -411,18 +411,34 @@ function _master_alloc_cores(m::Master)
     m.own_cores > 0 && return m.own_cores
     alloc = _slurm_alloc_cores()
     (alloc == 0 || m.vault === nothing || isempty(m.job)) && return alloc
+    # The others' status files are read once for a while, not three times a tick (the alarm,
+    # the snapshot and the account each ask).
+    cached = get(_ALLOC_CACHE, m.id, nothing)
+    (cached !== nothing && time() - cached[1] < _ALLOC_CACHE_SECS) && return cached[2]
     others = 0
+    seen = 0
     try
         for d in read_status(m.vault)
             (d["master"] == m.id || d["stale"] || get(d, "job", "") != m.job) && continue
             d["state"] in ("running", "waiting") || continue
             others += Int(get(d["workers"], "cores_joined", 0))
+            seen += 1
         end
     catch e
         e isa InterruptException && rethrow()
+        # The others could not be read: this master's share is NOT KNOWN. Taken as the whole
+        # job, a read error was the false alarm on every healthy master again.
+        _ALLOC_CACHE[m.id] = (time(), 0, -1)
+        return 0
     end
-    return max(alloc - others, 0)
+    own = max(alloc - others, 0)
+    _ALLOC_CACHE[m.id] = (time(), own, seen)
+    return own
 end
+
+# master id => (when, its cores, how many other masters of the job were counted).
+const _ALLOC_CACHE = Dict{String,Tuple{Float64,Int,Int}}()
+const _ALLOC_CACHE_SECS = 30.0
 
 # The cores of a node group (`SWEEPRUNNER_NODELIST`) out of the job's allocation, or 0 when the
 # environment does not say.
@@ -468,10 +484,33 @@ function _check_utilisation!(m::Master, log::EventLog)
     joined = [p for p in workers() if haskey(who, p)]
     cores_joined = sum((who[p].cores for p in joined); init=0)
     cores_busy = sum((who[p].cores for p in joined if p in on); init=0)
+    # Sharing the job with other masters and not told which nodes are its own: the figure is a
+    # subtraction of what the others report. Said once, so the alarm's basis is known.
+    if m.own_cores == 0 && !m.util_guess_said
+        others = get(_ALLOC_CACHE, m.id, (0.0, 0, 0))[3]
+        if others > 0
+            m.util_guess_said = true
+            log_event(
+                log,
+                :utilisation_guess;
+                level=:warn,
+                stage=m.stage,
+                cores=alloc,
+                other_masters=others,
+                why="this master was not told which nodes are its own (a pool, or " *
+                    "SWEEPRUNNER_NODELIST); its share is the job's cores less what the " *
+                    "other masters report",
+            )
+        end
+    end
     if queued == 0 || cores_busy >= m.min_utilisation * alloc
-        m.low_since = 0.0
+        # One good tick does not start the ten minutes over: a job hovering at the threshold,
+        # or whose queue is empty for a moment, was never said. Three in a row do.
+        m.low_good += 1
+        m.low_good >= 3 && (m.low_since = 0.0)
         return nothing
     end
+    m.low_good = 0
     m.low_since == 0.0 && (m.low_since = time())
     lasted = time() - m.low_since
     lasted >= _LOW_UTIL_AFTER[] || return nothing
